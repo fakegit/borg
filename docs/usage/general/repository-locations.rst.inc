@@ -1,13 +1,14 @@
-Repository / Archive Locations
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Repository Locations / Archive Names
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Many commands want either a repository (just give the repo URL, see above) or
-an archive location, which is a repo URL followed by ``::archive_name``.
+Many commands need to know the repository location; specify it via ``-r``/``--repo``
+or use the ``BORG_REPO`` environment variable.
+
+Commands that need one or two archive names usually take them as positional arguments.
+
+Commands that work with an arbitrary number of archives usually accept ``-a ARCH_GLOB``.
 
 Archive names must not contain the ``/`` (slash) character. For simplicity,
-maybe also avoid blanks or other characters that have special meaning on the
-shell or in a filesystem (borg mount will use the archive name as directory
+also avoid spaces or other characters that have special meaning to the
+shell or in a filesystem (``borg mount`` uses the archive name as a directory
 name).
-
-If you have set BORG_REPO (see above) and an archive location is needed, use
-``::archive_name`` - the repo URL part is then read from BORG_REPO.

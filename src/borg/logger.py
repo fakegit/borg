@@ -1,33 +1,56 @@
-"""logging facilities
+"""Logging facilities.
 
-The way to use this is as follows:
+Usage:
 
-* each module declares its own logger, using:
+- Each module declares its own logger using:
 
-    from .logger import create_logger
-    logger = create_logger()
+      from .logger import create_logger
+      logger = create_logger()
 
-* then each module uses logger.info/warning/debug/etc according to the
-  level it believes is appropriate:
+- Then each module uses logger.info/warning/debug/etc. according to the
+  appropriate level:
 
-    logger.debug('debugging info for developers or power users')
-    logger.info('normal, informational output')
-    logger.warning('warn about a non-fatal error or sth else')
-    logger.error('a fatal error')
+      logger.debug('debugging info for developers or power users')
+      logger.info('normal, informational output')
+      logger.warning('warn about a non-fatal error or something else')
+      logger.error('a fatal error')
 
-  ... and so on. see the `logging documentation
+  See the `logging documentation
   <https://docs.python.org/3/howto/logging.html#when-to-use-logging>`_
-  for more information
+  for more information.
 
-* console interaction happens on stderr, that includes interactive
-  reporting functions like `help`, `info` and `list`
+- Console interaction happens on stderr; that includes interactive
+  reporting functions like `help`, `info`, and `list`.
 
-* ...except ``input()`` is special, because we can't control the
-  stream it is using, unfortunately. we assume that it won't clutter
-  stdout, because interaction would be broken then anyways
+- ``input()`` is special because we cannot control the stream it uses.
+  We assume it will not clutter stdout, because interaction would be broken
+  otherwise.
 
-* what is output on INFO level is additionally controlled by commandline
-  flags
+- What is output at INFO level is additionally controlled by command-line
+  flags.
+
+Logging setup in Borg needs to work under various conditions:
+- Purely local, not client/server (easy).
+- Client/server, legacy RPC mode: the "borg serve" process writes log records into a global
+  queue (borg_serve_log_queue), which is then sent to the client side by the main serve loop
+  (via the RPC protocol on stdout, usually through SSH). On the client side, the log records
+  are fed into the client-side logging system. When remote_repo.close() is called, the server
+  side must send all queued log records via the RPC channel before returning the close()
+  call's return value (as the client will then shut down the connection). Log records still
+  queued when the server process exits (e.g. logged while reporting a "borg serve" startup
+  error, before the serve loop was even reached) are written to stderr by
+  flush_serve_log_queue(), so SSH can forward them to the client.
+- Client/server, rest mode: "borg serve --rest" has no in-band log channel, it logs to
+  stderr like any other command (SSH forwards stderr to the client side, where borgstore
+  keeps the recent tail and surfaces it as error detail when the server fails).
+- Progress output is always given as JSON to the logger (including the plain text inside
+  the JSON), but then formatted by the logging system's formatter as either plain text or
+  JSON depending on the CLI args given (--log-json?).
+- Tests: potentially running in parallel via pytest-xdist, capturing Borg output into a
+  given stream.
+- Logging might be short-lived (e.g., when invoking a single Borg command via the CLI)
+  or long-lived (e.g., borg serve or when running the tests).
+- Logging is global and exists only once per process.
 """
 
 import inspect
@@ -36,24 +59,133 @@ import logging
 import logging.config
 import logging.handlers  # needed for handlers defined there being configurable in logging.conf file
 import os
+import queue
+import sys
+import time
 import warnings
+from pathlib import Path
+
+logging_debugging_path: Path | None = None  # if set, write borg.logger debugging log to that_path/borg-*.log
 
 configured = False
+borg_serve_log_queue: queue.SimpleQueue = queue.SimpleQueue()
+
+
+class BorgQueueHandler(logging.handlers.QueueHandler):
+    """Borg serve writes log record dicts to a borg_serve_log_queue."""
+
+    def prepare(self, record: logging.LogRecord) -> dict:
+        return dict(
+            # kwargs needed for LogRecord constructor:
+            name=record.name,
+            level=record.levelno,
+            pathname=record.pathname,
+            lineno=record.lineno,
+            msg=record.msg,
+            args=record.args,
+            exc_info=record.exc_info,
+            func=record.funcName,
+            sinfo=record.stack_info,
+        )
+
+
+class StderrHandler(logging.StreamHandler):
+    """
+    This class is like a StreamHandler using sys.stderr, but always uses
+    whatever sys.stderr is currently set to rather than the value of
+    sys.stderr at handler construction time.
+
+    before_emit is a single slot shared by all StderrHandler instances. A ProgressIndicatorSpinner
+    stores its clear() there while its line is painted and resets the slot to None in finish(),
+    so the slot serves one spinner at a time.
+    """
+
+    before_emit = None  # callable or None, called before each record is written
+
+    def __init__(self, stream=None):
+        logging.Handler.__init__(self)
+
+    @property
+    def stream(self):
+        return sys.stderr
+
+    def emit(self, record):
+        if self.before_emit is not None:
+            self.before_emit()
+        super().emit(record)
+
+
+class TextProgressFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        # record.msg contains json (because we always do json for progress log)
+        j = json.loads(record.msg)
+        # inside the json, the text log line can be found under "message"
+        return f"{j['message']}"
+
+
+class JSONProgressFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        # record.msg contains json (because we always do json for progress log)
+        return f"{record.msg}"
+
 
 # use something like this to ignore warnings:
 # warnings.filterwarnings('ignore', r'... regex for warning message to ignore ...')
 
 
+# we do not want that urllib spoils test output with LibreSSL related warnings on OpenBSD.
+# NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+,
+#                    currently the 'ssl' module is compiled with 'LibreSSL 3.8.2'.
+warnings.filterwarnings("ignore", message=r".*urllib3 v2 only supports OpenSSL.*")
+
+
 def _log_warning(message, category, filename, lineno, file=None, line=None):
     # for warnings, we just want to use the logging system, not stderr or other files
-    msg = "{0}:{1}: {2}: {3}".format(filename, lineno, category.__name__, message)
+    msg = f"{filename}:{lineno}: {category.__name__}: {message}"
     logger = create_logger(__name__)
     # Note: the warning will look like coming from here,
     # but msg contains info about where it really comes from
     logger.warning(msg)
 
 
-def setup_logging(stream=None, conf_fname=None, env_var='BORG_LOGGING_CONF', level='info', is_serve=False, json=False):
+def remove_handlers(logger):
+    for handler in logger.handlers[:]:
+        handler.flush()
+        handler.close()
+        logger.removeHandler(handler)
+
+
+def flush_logging():
+    # make sure all log output is flushed,
+    # this is especially important for the "borg serve" RemoteRepository logging:
+    # all log output needs to be sent via the ssh / socket connection before closing it.
+    for logger_name in "borg.output.progress", "":
+        logger = logging.getLogger(logger_name)
+        for handler in logger.handlers:
+            handler.flush()
+
+
+def flush_serve_log_queue():
+    """Write all log records still in borg_serve_log_queue to sys.stderr.
+
+    In legacy RPC mode, "borg serve" routes its log output into borg_serve_log_queue (see
+    setup_logging) and relies on the serve loop to forward the queued records in-band to the
+    client. Records still queued when the process is about to exit - e.g. logged while
+    reporting a "borg serve" startup error, before the serve loop was even reached - would
+    get lost silently, thus we write them to stderr, which SSH forwards to the client.
+    """
+    formatter = logging.Formatter("%(message)s")
+    while True:
+        try:
+            lr_dict = borg_serve_log_queue.get_nowait()  # lr_dict contents: see BorgQueueHandler
+        except queue.Empty:
+            break
+        print(formatter.format(logging.LogRecord(**lr_dict)), file=sys.stderr)
+
+
+def setup_logging(
+    stream=None, conf_fname=None, env_var="BORG_LOGGING_CONF", level="info", is_serve=False, log_json=False, func=None
+):
     """setup logging module according to the arguments provided
 
     if conf_fname is given (or the config file name can be determined via
@@ -62,8 +194,9 @@ def setup_logging(stream=None, conf_fname=None, env_var='BORG_LOGGING_CONF', lev
     otherwise, set up a stream handler logger on stderr (by default, if no
     stream is provided).
 
-    if is_serve == True, we configure a special log format as expected by
-    the borg client log message interceptor.
+    is_serve: route log output into borg_serve_log_queue instead of using a stream handler
+    (used by the legacy RPC mode of "borg serve", whose serve loop sends the queued records
+    in-band to the client).
     """
     global configured
     err_msg = None
@@ -71,47 +204,76 @@ def setup_logging(stream=None, conf_fname=None, env_var='BORG_LOGGING_CONF', lev
         conf_fname = os.environ.get(env_var, conf_fname)
     if conf_fname:
         try:
-            conf_fname = os.path.abspath(conf_fname)
+            conf_path = Path(conf_fname).absolute()
             # we open the conf file here to be able to give a reasonable
             # error message in case of failure (if we give the filename to
             # fileConfig(), it silently ignores unreadable files and gives
             # unhelpful error msgs like "No section: 'formatters'"):
-            with open(conf_fname) as f:
+            with conf_path.open() as f:
                 logging.config.fileConfig(f)
             configured = True
             logger = logging.getLogger(__name__)
-            borg_logger = logging.getLogger('borg')
-            borg_logger.json = json
-            logger.debug('using logging configuration read from "{0}"'.format(conf_fname))
+            # the yes() prompt function reads this attribute to decide whether to emit
+            # question_* JSON objects or plain text, see helpers/yes_no.py.
+            logging.getLogger("borg").json = log_json
+            logger.debug(f'using logging configuration read from "{conf_fname}"')
             warnings.showwarning = _log_warning
             return None
         except Exception as err:  # XXX be more precise
             err_msg = str(err)
+
     # if we did not / not successfully load a logging configuration, fallback to this:
-    logger = logging.getLogger('')
-    handler = logging.StreamHandler(stream)
-    if is_serve and not json:
-        fmt = '$LOG %(levelname)s %(name)s Remote: %(message)s'
-    else:
-        fmt = '%(message)s'
-    formatter = JsonFormatter(fmt) if json else logging.Formatter(fmt)
+    level = level.upper()
+    fmt = "%(message)s"
+    formatter = JsonFormatter(fmt) if log_json else logging.Formatter(fmt)
+    SHandler = StderrHandler if stream is None else logging.StreamHandler
+    handler = BorgQueueHandler(borg_serve_log_queue) if is_serve else SHandler(stream)
     handler.setFormatter(formatter)
-    borg_logger = logging.getLogger('borg')
-    borg_logger.formatter = formatter
-    borg_logger.json = json
-    if configured and logger.handlers:
-        # The RepositoryServer can call setup_logging a second time to adjust the output
-        # mode from text-ish is_serve to json is_serve.
-        # Thus, remove the previously installed handler, if any.
-        logger.handlers[0].close()
-        logger.handlers.clear()
-    logger.addHandler(handler)
-    logger.setLevel(level.upper())
+    logger = logging.getLogger()
+    remove_handlers(logger)
+    logger.setLevel(level)
+
+    # the yes() prompt function reads this attribute to decide whether to emit
+    # question_* JSON objects or plain text, see helpers/yes_no.py.
+    logging.getLogger("borg").json = log_json
+
+    if logging_debugging_path is not None:
+        # add an addtl. root handler for debugging purposes
+        log_path = logging_debugging_path / (f"borg-{'serve' if is_serve else 'client'}-root.log")
+        handler2 = logging.StreamHandler(log_path.open("a"))
+        handler2.setFormatter(formatter)
+        logger.addHandler(handler2)
+        logger.warning(f"--- {func} ---")  # only handler2 shall get this
+
+    logger.addHandler(handler)  # do this late, so handler is not added while debug handler is set up
+
+    bop_formatter = JSONProgressFormatter() if log_json else TextProgressFormatter()
+    bop_handler = BorgQueueHandler(borg_serve_log_queue) if is_serve else SHandler(stream)
+    bop_handler.setFormatter(bop_formatter)
+    bop_logger = logging.getLogger("borg.output.progress")
+    remove_handlers(bop_logger)
+    bop_logger.setLevel("INFO")
+    bop_logger.propagate = False
+
+    if logging_debugging_path is not None:
+        # add an addtl. progress handler for debugging purposes
+        log_path = logging_debugging_path / (f"borg-{'serve' if is_serve else 'client'}-progress.log")
+        bop_handler2 = logging.StreamHandler(log_path.open("a"))
+        bop_handler2.setFormatter(bop_formatter)
+        bop_logger.addHandler(bop_handler2)
+        json_dict = dict(
+            message=f"--- {func} ---", operation=0, msgid="", type="progress_message", finished=False, time=time.time()
+        )
+        bop_logger.warning(json.dumps(json_dict))  # only bop_handler2 shall get this
+
+    bop_logger.addHandler(bop_handler)  # do this late, so bop_handler is not added while debug handler is set up
+
     configured = True
+
     logger = logging.getLogger(__name__)
     if err_msg:
-        logger.warning('setup_logging for "{0}" failed with "{1}".'.format(conf_fname, err_msg))
-    logger.debug('using builtin fallback logging configuration')
+        logger.warning(f'setup_logging for "{conf_fname}" failed with "{err_msg}".')
+    logger.debug("using builtin fallback logging configuration")
     warnings.showwarning = _log_warning
     return handler
 
@@ -135,7 +297,64 @@ def find_parent_module():
         return __name__
 
 
-def create_logger(name=None):
+class LazyLogger:
+    def __init__(self, name=None):
+        self.__name = name or find_parent_module()
+        self.__real_logger = None
+
+    @property
+    def __logger(self):
+        if self.__real_logger is None:
+            if not configured:
+                raise Exception("tried to call a logger before setup_logging() was called")
+            self.__real_logger = logging.getLogger(self.__name)
+            if self.__name.startswith("borg.debug.") and self.__real_logger.level == logging.NOTSET:
+                self.__real_logger.setLevel("WARNING")
+        return self.__real_logger
+
+    def getChild(self, suffix):
+        return LazyLogger(self.__name + "." + suffix)
+
+    def setLevel(self, level):
+        return self.__logger.setLevel(level)
+
+    def log(self, level, msg, *args, **kwargs):
+        if "msgid" in kwargs:
+            kwargs.setdefault("extra", {})["msgid"] = kwargs.pop("msgid")
+        return self.__logger.log(level, msg, *args, **kwargs)
+
+    def exception(self, msg, *args, exc_info=True, **kwargs):
+        if "msgid" in kwargs:
+            kwargs.setdefault("extra", {})["msgid"] = kwargs.pop("msgid")
+        return self.__logger.exception(msg, *args, exc_info=exc_info, **kwargs)
+
+    def debug(self, msg, *args, **kwargs):
+        if "msgid" in kwargs:
+            kwargs.setdefault("extra", {})["msgid"] = kwargs.pop("msgid")
+        return self.__logger.debug(msg, *args, **kwargs)
+
+    def info(self, msg, *args, **kwargs):
+        if "msgid" in kwargs:
+            kwargs.setdefault("extra", {})["msgid"] = kwargs.pop("msgid")
+        return self.__logger.info(msg, *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        if "msgid" in kwargs:
+            kwargs.setdefault("extra", {})["msgid"] = kwargs.pop("msgid")
+        return self.__logger.warning(msg, *args, **kwargs)
+
+    def error(self, msg, *args, **kwargs):
+        if "msgid" in kwargs:
+            kwargs.setdefault("extra", {})["msgid"] = kwargs.pop("msgid")
+        return self.__logger.error(msg, *args, **kwargs)
+
+    def critical(self, msg, *args, **kwargs):
+        if "msgid" in kwargs:
+            kwargs.setdefault("extra", {})["msgid"] = kwargs.pop("msgid")
+        return self.__logger.critical(msg, *args, **kwargs)
+
+
+def create_logger(name: str = None) -> LazyLogger:
     """lazily create a Logger object with the proper path, which is returned by
     find_parent_module() by default, or is provided via the commandline
 
@@ -151,72 +370,17 @@ def create_logger(name=None):
     be careful not to call any logger methods before the setup_logging() call.
     If you try, you'll get an exception.
     """
-    class LazyLogger:
-        def __init__(self, name=None):
-            self.__name = name or find_parent_module()
-            self.__real_logger = None
-
-        @property
-        def __logger(self):
-            if self.__real_logger is None:
-                if not configured:
-                    raise Exception("tried to call a logger before setup_logging() was called")
-                self.__real_logger = logging.getLogger(self.__name)
-                if self.__name.startswith('borg.debug.') and self.__real_logger.level == logging.NOTSET:
-                    self.__real_logger.setLevel('WARNING')
-            return self.__real_logger
-
-        def getChild(self, suffix):
-            return LazyLogger(self.__name + '.' + suffix)
-
-        def setLevel(self, *args, **kw):
-            return self.__logger.setLevel(*args, **kw)
-
-        def log(self, *args, **kw):
-            if 'msgid' in kw:
-                kw.setdefault('extra', {})['msgid'] = kw.pop('msgid')
-            return self.__logger.log(*args, **kw)
-
-        def exception(self, *args, **kw):
-            if 'msgid' in kw:
-                kw.setdefault('extra', {})['msgid'] = kw.pop('msgid')
-            return self.__logger.exception(*args, **kw)
-
-        def debug(self, *args, **kw):
-            if 'msgid' in kw:
-                kw.setdefault('extra', {})['msgid'] = kw.pop('msgid')
-            return self.__logger.debug(*args, **kw)
-
-        def info(self, *args, **kw):
-            if 'msgid' in kw:
-                kw.setdefault('extra', {})['msgid'] = kw.pop('msgid')
-            return self.__logger.info(*args, **kw)
-
-        def warning(self, *args, **kw):
-            if 'msgid' in kw:
-                kw.setdefault('extra', {})['msgid'] = kw.pop('msgid')
-            return self.__logger.warning(*args, **kw)
-
-        def error(self, *args, **kw):
-            if 'msgid' in kw:
-                kw.setdefault('extra', {})['msgid'] = kw.pop('msgid')
-            return self.__logger.error(*args, **kw)
-
-        def critical(self, *args, **kw):
-            if 'msgid' in kw:
-                kw.setdefault('extra', {})['msgid'] = kw.pop('msgid')
-            return self.__logger.critical(*args, **kw)
 
     return LazyLogger(name)
 
 
 class JsonFormatter(logging.Formatter):
     RECORD_ATTRIBUTES = (
-        'levelname',
-        'name',
-        'message',
+        "levelname",
+        "name",
+        "message",
         # msgid is an attribute we made up in Borg to expose a non-changing handle for log messages
-        'msgid',
+        "msgid",
     )
 
     # Other attributes that are not very useful but do exist:
@@ -229,12 +393,7 @@ class JsonFormatter(logging.Formatter):
 
     def format(self, record):
         super().format(record)
-        data = {
-            'type': 'log_message',
-            'time': record.created,
-            'message': '',
-            'levelname': 'CRITICAL',
-        }
+        data = {"type": "log_message", "time": record.created, "message": "", "levelname": "CRITICAL"}
         for attr in self.RECORD_ATTRIBUTES:
             value = getattr(record, attr, None)
             if value:

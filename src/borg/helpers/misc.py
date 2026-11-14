@@ -1,74 +1,37 @@
 import logging
 import io
 import os
-import os.path
-import platform
+import platform  # python stdlib import - if this fails, check that cwd != src/borg/
 import sys
-from collections import deque, OrderedDict
-from datetime import datetime, timezone, timedelta
+from collections import deque
+from getpass import getuser
 from itertools import islice
-from operator import attrgetter
 
 from ..logger import create_logger
+
 logger = create_logger()
 
-from .time import to_localtime
 from . import msgpack
 from .. import __version__ as borg_version
-from .. import chunker
+from ..constants import ROBJ_FILE_STREAM
 
 
-def prune_within(archives, hours, kept_because):
-    target = datetime.now(timezone.utc) - timedelta(seconds=hours * 3600)
-    kept_counter = 0
-    result = []
-    for a in archives:
-        if a.ts > target:
-            kept_counter += 1
-            kept_because[a.id] = ("within", kept_counter)
-            result.append(a)
-    return result
+def archive_hostname():
+    """Return the hostname a new archive is stamped with."""
+    from ..platform import get_hostname
+
+    return os.environ.get("BORG_HOSTNAME") or get_hostname()
 
 
-PRUNING_PATTERNS = OrderedDict([
-    ("secondly", '%Y-%m-%d %H:%M:%S'),
-    ("minutely", '%Y-%m-%d %H:%M'),
-    ("hourly", '%Y-%m-%d %H'),
-    ("daily", '%Y-%m-%d'),
-    ("weekly", '%G-%V'),
-    ("monthly", '%Y-%m'),
-    ("yearly", '%Y'),
-])
-
-
-def prune_split(archives, rule, n, kept_because=None):
-    last = None
-    keep = []
-    pattern = PRUNING_PATTERNS[rule]
-    if kept_because is None:
-        kept_because = {}
-    if n == 0:
-        return keep
-    for a in sorted(archives, key=attrgetter('ts'), reverse=True):
-        period = to_localtime(a.ts).strftime(pattern)
-        if period != last:
-            last = period
-            if a.id not in kept_because:
-                keep.append(a)
-                kept_because[a.id] = (rule, len(keep))
-                if len(keep) == n:
-                    break
-    # Keep oldest archive if we didn't reach the target retention count
-    if len(keep) < n and a.id not in kept_because:
-        keep.append(a)
-        kept_because[a.id] = (rule+"[oldest]", len(keep))
-    return keep
+def archive_username():
+    """Return the username a new archive is stamped with."""
+    return os.environ.get("BORG_USERNAME") or getuser()
 
 
 def sysinfo():
-    show_sysinfo = os.environ.get('BORG_SHOW_SYSINFO', 'yes').lower()
-    if show_sysinfo == 'no':
-        return ''
+    show_sysinfo = os.environ.get("BORG_SHOW_SYSINFO", "yes").lower()
+    if show_sysinfo == "no":
+        return ""
 
     python_implementation = platform.python_implementation()
     python_version = platform.python_version()
@@ -78,41 +41,44 @@ def sysinfo():
         uname = os.uname()
     except AttributeError:
         uname = None
-    if sys.platform.startswith('linux'):
-        try:
-            linux_distribution = platform.linux_distribution()  # noqa
-        except:
-            # platform.linux_distribution() is deprecated since py 3.5 and removed in 3.7.
-            linux_distribution = ('Unknown Linux', '', '')
+    if sys.platform.startswith("linux"):
+        linux_distribution = ("Unknown Linux", "", "")
     else:
         linux_distribution = None
     try:
-        msgpack_version = '.'.join(str(v) for v in msgpack.version)
-    except:
-        msgpack_version = 'unknown'
-    from ..fuse_impl import llfuse, BORG_FUSE_IMPL
-    llfuse_name = llfuse.__name__ if llfuse else 'None'
-    llfuse_version = (' %s' % llfuse.__version__) if llfuse else ''
-    llfuse_info = '%s%s [%s]' % (llfuse_name, llfuse_version, BORG_FUSE_IMPL)
+        msgpack_version = ".".join(str(v) for v in msgpack.version)
+    except:  # noqa
+        msgpack_version = "unknown"
+    from ..fuse_impl import hlfuse, llfuse, BORG_FUSE_IMPL, fuse_import_errors
+
+    fuse_mod = hlfuse or llfuse
+    fuse_name = fuse_mod.__name__ if fuse_mod else "None"
+    fuse_version = getattr(fuse_mod, "__version__", "") if fuse_mod else ""
+    fuse_version = " %s" % fuse_version if fuse_version else ""
+    fuse_errors = "".join(f" {impl}: {err}." for impl, err in fuse_import_errors.items()) if not fuse_mod else ""
+    fuse_info = f"{fuse_name}{fuse_version} [{BORG_FUSE_IMPL}]{fuse_errors}"
     info = []
     if uname is not None:
-        info.append('Platform: %s' % (' '.join(uname), ))
+        info.append("Platform: {}".format(" ".join(uname)))
     if linux_distribution is not None:
-        info.append('Linux: %s %s %s' % linux_distribution)
-    info.append('Borg: %s  Python: %s %s msgpack: %s fuse: %s' % (
-                borg_version, python_implementation, python_version, msgpack_version, llfuse_info))
-    info.append('PID: %d  CWD: %s' % (os.getpid(), os.getcwd()))
-    info.append('sys.argv: %r' % sys.argv)
-    info.append('SSH_ORIGINAL_COMMAND: %r' % os.environ.get('SSH_ORIGINAL_COMMAND'))
-    info.append('')
-    return '\n'.join(info)
+        info.append("Linux: %s %s %s" % linux_distribution)
+    info.append(
+        "Borg: {}  Python: {} {} msgpack: {} fuse: {}".format(
+            borg_version, python_implementation, python_version, msgpack_version, fuse_info
+        )
+    )
+    info.append("PID: %d  CWD: %s" % (os.getpid(), os.getcwd()))
+    info.append("sys.argv: %r" % sys.argv)
+    info.append("SSH_ORIGINAL_COMMAND: %r" % os.environ.get("SSH_ORIGINAL_COMMAND"))
+    info.append("")
+    return "\n".join(info)
 
 
 def log_multi(*msgs, level=logging.INFO, logger=logger):
     """
-    log multiple lines of text, each line by a separate logging call for cosmetic reasons
+    Log multiple lines of text, emitting each line via a separate logging call for cosmetic reasons.
 
-    each positional argument may be a single or multiple lines (separated by newlines) of text.
+    Each positional argument may be a single or multiple lines (separated by newlines) of text.
     """
     lines = []
     for msg in msgs:
@@ -122,20 +88,20 @@ def log_multi(*msgs, level=logging.INFO, logger=logger):
 
 
 class ChunkIteratorFileWrapper:
-    """File-like wrapper for chunk iterators"""
+    """File-like wrapper for chunk iterators."""
 
     def __init__(self, chunk_iterator, read_callback=None):
         """
         *chunk_iterator* should be an iterator yielding bytes. These will be buffered
         internally as necessary to satisfy .read() calls.
 
-        *read_callback* will be called with one argument, some byte string that has
-        just been read and will be subsequently returned to a caller of .read().
-        It can be used to update a progress display.
+        *read_callback* will be called with one argument, a byte string that has
+        just been read and will subsequently be returned to a caller of .read().
+        The callback can be used to update a progress display.
         """
         self.chunk_iterator = chunk_iterator
         self.chunk_offset = 0
-        self.chunk = b''
+        self.chunk = b""
         self.exhausted = False
         self.read_callback = read_callback
 
@@ -154,11 +120,11 @@ class ChunkIteratorFileWrapper:
 
     def _read(self, nbytes):
         if not nbytes:
-            return b''
+            return b""
         remaining = self._refill()
         will_read = min(remaining, nbytes)
         self.chunk_offset += will_read
-        return self.chunk[self.chunk_offset - will_read:self.chunk_offset]
+        return self.chunk[self.chunk_offset - will_read : self.chunk_offset]
 
     def read(self, nbytes):
         parts = []
@@ -168,20 +134,20 @@ class ChunkIteratorFileWrapper:
             parts.append(read_data)
             if self.read_callback:
                 self.read_callback(read_data)
-        return b''.join(parts)
+        return b"".join(parts)
 
 
 def open_item(archive, item):
     """Return file-like object for archived item (with chunks)."""
-    chunk_iterator = archive.pipeline.fetch_many([c.id for c in item.chunks])
+    chunk_iterator = archive.pipeline.fetch_many(item.chunks, ro_type=ROBJ_FILE_STREAM)
     return ChunkIteratorFileWrapper(chunk_iterator)
 
 
 def chunkit(it, size):
     """
-    Chunk an iterator <it> into pieces of <size>.
+    Chunk an iterator into pieces of the given size.
 
-    >>> list(chunker('ABCDEFG', 3))
+    >>> list(chunkit('ABCDEFG', 3))
     [['A', 'B', 'C'], ['D', 'E', 'F'], ['G']]
     """
     iterable = iter(it)
@@ -189,7 +155,7 @@ def chunkit(it, size):
 
 
 def consume(iterator, n=None):
-    """Advance the iterator n-steps ahead. If n is none, consume entirely."""
+    """Advance the iterator n steps. If n is None, consume it entirely."""
     # Use functions that consume iterators at C speed.
     if n is None:
         # feed the entire iterator into a zero-length deque
@@ -209,7 +175,7 @@ class ErrorIgnoringTextIOWrapper(io.TextIOWrapper):
                     super().close()
                 except OSError:
                     pass
-        return ''
+        return ""
 
     def write(self, s):
         if not self.closed:
@@ -224,17 +190,17 @@ class ErrorIgnoringTextIOWrapper(io.TextIOWrapper):
 
 
 def iter_separated(fd, sep=None, read_size=4096):
-    """Iter over chunks of open file ``fd`` delimited by ``sep``. Doesn't trim."""
+    """Iterate over chunks of the open file ``fd`` delimited by ``sep``. Does not trim."""
     buf = fd.read(read_size)
     is_str = isinstance(buf, str)
-    part = '' if is_str else b''
-    sep = sep or ('\n' if is_str else b'\n')
+    part = "" if is_str else b""
+    sep = sep or ("\n" if is_str else b"\n")
     while len(buf) > 0:
         part2, *items = buf.split(sep)
-        *full, part = (part + part2, *items)
+        *full, part = (part + part2, *items)  # type: ignore
         yield from full
         buf = fd.read(read_size)
     # won't yield an empty part if stream ended with `sep`
     # or if there was no data before EOF
-    if len(part) > 0:
+    if len(part) > 0:  # type: ignore[arg-type]
         yield part

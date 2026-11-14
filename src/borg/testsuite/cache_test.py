@@ -1,0 +1,1242 @@
+import hashlib
+import io
+import logging
+import os
+import time
+from datetime import UTC, datetime
+
+import pytest
+from borghash import HashTableNT
+
+from ..crypto.key import store_hash
+from .hashindex_test import H
+from .repository_test import make_store_obj_key
+from .crypto.key_test import TestKey
+from ..archive import Statistics
+from .. import cache as cache_mod
+from ..cache import (
+    AdHocWithFilesCache,
+    ChunkIndexRebuildInterrupted,
+    ChunksMixin,
+    CorruptChunkIndexFragment,
+    FileCacheEntry,
+    build_chunkindex_from_repo,
+    chunkindex_is_invalid,
+    delete_chunkindex_from_repo,
+    list_chunkindex_fragments,
+    list_chunkindex_hashes,
+    read_chunkindex_from_repo,
+    repack_chunkindex,
+    write_chunkindex_invalid,
+    write_chunkindex_to_repo,
+)
+from ..hashindex import ChunkIndex, ChunkIndexEntry
+from ..crypto.key import AESOCBKey, AuthenticatedKey
+from ..crypto import sealed_stream
+from ..crypto.sealed_stream import SealedStreamWriter, read_sealed_stream
+from ..helpers import CorruptPack, Error, bin_to_hex, progress, safe_ns
+from ..helpers import msgpack
+from ..helpers.msgpack import int_to_timestamp
+from ..manifest import Manifest
+from ..repository import PackReader, Repository
+from . import set_test_key_on_open
+
+
+@pytest.fixture(autouse=True)
+def use_test_key_on_open(monkeypatch):
+    # the index/ and cache/ objects need a key, see Repository.set_key.
+    set_test_key_on_open(monkeypatch)
+
+
+class TestAdHocWithFilesCache:
+    @pytest.fixture
+    def repository(self, tmpdir):
+        self.repository_location = os.path.join(str(tmpdir), "repository")
+        with Repository(self.repository_location, exclusive=True, create=True) as repository:
+            repository.put(H(1), b"1234")
+            repository.flush()  # the lone put would stay buffered; make it durable
+            yield repository
+            repository.flush()  # flush anything a test buffered via the cache before close()
+
+    @pytest.fixture
+    def key(self, repository, monkeypatch):
+        monkeypatch.setenv("BORG_PASSPHRASE", "test")
+        key = AESOCBKey.create(repository, TestKey.MockArgs())
+        return key
+
+    @pytest.fixture
+    def manifest(self, repository, key):
+        repository.save_config(key)
+        return Manifest.load(repository, key=key)
+
+    @pytest.fixture
+    def cache(self, repository, key, manifest):
+        return AdHocWithFilesCache(manifest)
+
+    def test_seen_chunk_add_chunk_size(self, cache):
+        assert cache.add_chunk(H(1), {}, b"5678", stats=Statistics()) == (H(1), 4)
+
+    def test_reuse_after_add_chunk(self, cache):
+        assert cache.add_chunk(H(3), {}, b"5678", stats=Statistics()) == (H(3), 4)
+        assert cache.reuse_chunk(H(3), 4, Statistics()) == (H(3), 4)
+
+    def test_existing_reuse_after_add_chunk(self, cache):
+        assert cache.add_chunk(H(1), {}, b"5678", stats=Statistics()) == (H(1), 4)
+        assert cache.reuse_chunk(H(1), 4, Statistics()) == (H(1), 4)
+
+    def test_periodic_index_write_flushes_pending(self, repository, cache):
+        # #9900: the periodic index write must flush the pack writer first, so a buffered chunk is
+        # persisted with its real pack location rather than the unresolved F_PENDING placeholder.
+        cache.add_chunk(H(7), {}, b"h1-payload", stats=Statistics())
+        assert repository.chunks.is_pending(H(7))  # H(7) is buffered, not yet in a pack
+        # force=True runs the same write the 600s timer triggers:
+        cache._maybe_write_chunks_index(datetime.now(UTC), force=True)
+        # rebuild the index from the persisted fragments and check H(7)'s stored location matches
+        # the real (flushed) location, not the placeholder:
+        index = build_chunkindex_from_repo(repository)
+        assert H(7) in index
+        # the flush resolved H(7)'s location, so it is no longer pending/placeholder:
+        assert not repository.chunks.is_pending(H(7))
+        assert index[H(7)].pack_id == repository.chunks[H(7)].pack_id
+
+    def test_files_cache(self, cache):
+        st = os.stat(".")
+        assert cache.file_known_and_unchanged(b"foo", bytes(32), st) == (False, None, None)
+        assert cache.cache_mode == "d"
+        assert cache.files == {}
+
+    def test_no_change_backup_keeps_files_cache(self, repository, key, manifest):
+        # Regression test for #9749: a backup that does not chunk any new file leaves
+        # _newest_cmtime unset. The writer must treat "unset" as "keep everything" and
+        # must NOT discard the current (age == 0) entries with an epoch cutoff.
+        # "cis" == normalized form of the "borg create" default "ctime,size,inode"
+        cache = AdHocWithFilesCache(manifest, cache_mode="cis", archive_name="test")
+        # the chunk that our cached file references (needed so the entry can be (de)compressed):
+        cache.add_chunk(H(5), {}, b"5678", stats=Statistics())
+        # a "current" files cache entry as left behind by a no-change backup: the file was found
+        # unchanged (so its age was reset to 0), but nothing got chunked, so memorize_file() was
+        # never called and _newest_cmtime stayed at its initial value.
+        now_ns = safe_ns(time.time_ns())
+        entry = FileCacheEntry(
+            age=0, inode=1, size=4, ctime=int_to_timestamp(now_ns), mtime=int_to_timestamp(now_ns), chunks=[(H(5), 4)]
+        )
+        path_hash = H(42)
+        files = {path_hash: cache.compress_entry(entry)}
+        assert cache._newest_cmtime is None  # nothing was chunked in this backup
+        cache._write_files_cache(files)
+        # with the bug (initial value 0 instead of None) the cutoff would be the epoch and the
+        # entry would be dropped; after the fix the entry must still be there:
+        loaded = cache._read_files_cache()
+        assert path_hash in loaded
+
+    def write_files_cache(self, manifest, *, archive_name="test", count=3):
+        """Write a files cache with *count* entries, return the cache and the entries (path_hash -> entry)."""
+        cache = AdHocWithFilesCache(manifest, cache_mode="cis", archive_name=archive_name)
+        # the chunk that the cached files reference (needed so the entries can be (de)compressed):
+        cache.add_chunk(H(5), {}, b"5678", stats=Statistics())
+        ts = int_to_timestamp(safe_ns(time.time_ns()))
+        entries = {
+            H(1000 + i): FileCacheEntry(
+                age=0, inode=i, size=4, ctime=ts, mtime=ts, chunks=[(H(5), 4)], digests={"sha256": H(2000 + i)}
+            )
+            for i in range(count)
+        }
+        cache._write_files_cache({path_hash: cache.compress_entry(entry) for path_hash, entry in entries.items()})
+        return cache, entries
+
+    def files_cache_path(self, cache):
+        return cache.path / cache.files_cache_name()
+
+    def test_files_cache_roundtrip(self, manifest, monkeypatch):
+        monkeypatch.setattr(sealed_stream, "FRAME_SIZE", 100)  # many frames, entries straddle frames
+        cache, entries = self.write_files_cache(manifest, count=50)
+        with open(self.files_cache_path(cache), "rb") as fd:
+            assert len(list(read_sealed_stream(fd, cache.key, cache._files_cache_context()))) > 10
+        loaded = cache._read_files_cache()
+        assert {path_hash: cache.decompress_entry(entry) for path_hash, entry in loaded.items()} == {
+            path_hash: entry._replace(age=1) for path_hash, entry in entries.items()
+        }
+
+    def test_files_cache_empty(self, manifest):
+        cache, _ = self.write_files_cache(manifest, count=0)
+        assert cache._read_files_cache() == {}
+
+    def test_files_cache_missing(self, manifest, caplog):
+        cache = AdHocWithFilesCache(manifest, cache_mode="cis", archive_name="test")
+        with caplog.at_level(logging.WARNING, logger="borg.cache"):
+            assert cache._read_files_cache() is None
+        assert caplog.text == ""  # no files cache yet is normal
+
+    def test_files_cache_encrypted(self, manifest):
+        cache, entries = self.write_files_cache(manifest)
+        data = self.files_cache_path(cache).read_bytes()
+        assert H(5) not in data
+        for path_hash, entry in entries.items():
+            assert path_hash not in data
+            assert entry.digests["sha256"] not in data
+
+    def check_ignored(self, cache, caplog, reason="corrupted"):
+        with caplog.at_level(logging.WARNING, logger="borg.cache"):
+            assert cache._read_files_cache() is None
+        assert f"Ignoring {reason} files cache {cache.files_cache_name()}" in caplog.text
+
+    def test_files_cache_tampered(self, manifest, caplog):
+        cache, _ = self.write_files_cache(manifest)
+        path = self.files_cache_path(cache)
+        data = bytearray(path.read_bytes())
+        data[len(data) // 2] ^= 0x01
+        path.write_bytes(bytes(data))
+        self.check_ignored(cache, caplog)
+
+    def test_files_cache_other_series(self, manifest, caplog):
+        cache_a, _ = self.write_files_cache(manifest, archive_name="series-a")
+        cache_b = AdHocWithFilesCache(manifest, cache_mode="cis", archive_name="series-b")
+        self.files_cache_path(cache_b).write_bytes(self.files_cache_path(cache_a).read_bytes())
+        self.check_ignored(cache_b, caplog)
+
+    def test_files_cache_other_repository(self, manifest, monkeypatch, caplog):
+        cache, _ = self.write_files_cache(manifest)
+        # a files cache written for another repository using the same key material:
+        monkeypatch.setattr(cache.repository, "id", bytes(32))
+        self.check_ignored(cache, caplog)
+
+    def test_files_cache_plaintext(self, manifest, caplog):
+        cache, entries = self.write_files_cache(manifest)
+        # a files cache in the format of borg versions without sealed files caches: a plain msgpack stream.
+        with open(self.files_cache_path(cache), "wb") as fd:
+            for path_hash, entry in entries.items():
+                msgpack.pack((path_hash, entry), fd)
+        self.check_ignored(cache, caplog)
+
+    def test_files_cache_invalid_content(self, manifest, caplog):
+        cache = AdHocWithFilesCache(manifest, cache_mode="cis", archive_name="test")
+        # authentic, but not a stream of (path_hash, entry) tuples:
+        with open(self.files_cache_path(cache), "wb") as fd:
+            writer = SealedStreamWriter(fd, cache.key, cache._files_cache_context())
+            msgpack.pack([1, 2, 3], writer)
+            writer.finish()
+        self.check_ignored(cache, caplog, reason="invalid")
+
+    def test_cache_config(self, manifest):
+        cache, _ = self.write_files_cache(manifest)
+        config_path = cache.path / "config"
+        config = config_path.read_text()
+        assert "[cache]" in config and "[integrity]" not in config
+        st = config_path.stat()
+        cache.close()
+        # nothing in the config changes after its creation, so close() does not rewrite it:
+        assert config_path.stat().st_ino == st.st_ino and config_path.stat().st_mtime_ns == st.st_mtime_ns
+        assert config_path.read_text() == config
+
+
+def test_delete_chunkindex_from_repo_missing(tmp_path):
+    """delete_chunkindex_from_repo handles StoreObjectNotFound when index entries do not exist."""
+    from borgstore.store import ObjectNotFound as StoreObjectNotFound
+
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        # Create an index entry so list_chunkindex_hashes finds it.
+        repository.store_store(f"index/{'a' * 64}", b"data")
+        # Patch store_delete to raise StoreObjectNotFound (simulates a race or already-deleted entry).
+        original_store_delete = repository.store_delete
+
+        def failing_store_delete(name):
+            raise StoreObjectNotFound(name)
+
+        repository.store_delete = failing_store_delete
+        # Should not raise — the except StoreObjectNotFound catches it.
+        delete_chunkindex_from_repo(repository)
+        repository.store_delete = original_store_delete
+
+
+def test_read_chunkindex_from_repo_missing(tmp_path):
+    """read_chunkindex_from_repo handles StoreObjectNotFound when the index object does not exist."""
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        # Try to load a non-existent index entry — should return None, not raise.
+        result = read_chunkindex_from_repo(repository, "f" * 64)
+        assert result is None
+
+
+def test_read_chunkindex_from_repo_corrupt(tmp_path):
+    """A fragment that matches its name and is authentic, but does not deserialize, raises."""
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        content = b"not a serialized chunk index"
+        index_name = repository.store_encrypt_store("index", content, hashed_name=True)
+        with pytest.raises(CorruptChunkIndexFragment):
+            read_chunkindex_from_repo(repository, index_name.removeprefix("index/"))
+
+
+@pytest.mark.parametrize("tamper", ["plaintext", "flipped_byte", "other_name"])
+def test_read_chunkindex_from_repo_not_authentic(tmp_path, tamper):
+    """A fragment that is not the key's envelope of its content raises, although its name may match.
+
+    "plaintext" is the fragment format of older borg 2 betas: the serialized index, stored raw under its store hash.
+    """
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        ci = ChunkIndex()
+        ci[H(1)] = ChunkIndexEntry(ChunkIndex.F_NONE, 0, H(1), 0, 4)
+        with io.BytesIO() as f:
+            ci.write(f)
+            content = f.getvalue()
+        if tamper == "plaintext":
+            name = store_hash(content).hexdigest()  # a valid name (borg check accepts it)
+            repository.store_store(f"index/{name}", content)
+        elif tamper == "flipped_byte":
+            index_name = repository.store_encrypt_store("index", content, hashed_name=True)
+            data = bytearray(repository.store_load(index_name))
+            data[-1] ^= 0x01
+            repository.store_delete(index_name)
+            name = store_hash(bytes(data)).hexdigest()  # a valid name (borg check accepts it)
+            repository.store_store(f"index/{name}", bytes(data))
+        else:  # an envelope made for a different object name
+            data = repository.store_load(repository.store_encrypt_store("cache/other", content))
+            name = store_hash(data).hexdigest()
+            repository.store_store(f"index/{name}", data)
+        with pytest.raises(CorruptChunkIndexFragment):
+            read_chunkindex_from_repo(repository, name)
+
+
+@pytest.mark.parametrize("plaintext", [False, True])
+def test_build_chunkindex_aborts_on_corrupt_fragment(tmp_path, caplog, plaintext):
+    """A corrupt fragment (valid name, unreadable content) aborts, no retry and no partial index.
+
+    Only write_immediately (the caller rewrites the whole index anyway) rebuilds the index from the packs,
+    and the rebuilt index replaces all fragments, the corrupt one included.
+    plaintext: the fragment is stored raw, as older borg 2 betas did, so it fails the authentication.
+    """
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        ci = ChunkIndex()
+        ci[H(1)] = ChunkIndexEntry(ChunkIndex.F_NEW, 0, H(1), 0, 4)
+        write_chunkindex_to_repo(repository, ci, incremental=False, force_write=True)
+        content = b"not a serialized chunk index"
+        if plaintext:
+            corrupt_name = f"index/{store_hash(content).hexdigest()}"
+            repository.store_store(corrupt_name, content)
+        else:
+            corrupt_name = repository.store_encrypt_store("index", content, hashed_name=True)
+        for kwargs in ({}, {"fragments_only": True}):
+            with pytest.raises(CorruptChunkIndexFragment) as excinfo:
+                build_chunkindex_from_repo(repository, **kwargs)
+            assert excinfo.value.args[0] == corrupt_name
+            assert 'Run "borg check --repair"' in str(excinfo.value)
+        assert corrupt_name.removeprefix("index/") in list_chunkindex_hashes(repository)  # nothing was written
+        with caplog.at_level(logging.WARNING, logger="borg.cache"):
+            chunks = build_chunkindex_from_repo(repository, write_immediately=True)
+        assert "is corrupt, rebuilding the chunk index from the packs" in caplog.text
+        # the rebuild reads the (empty) packs namespace, so H(1) from the other fragment is absent
+        assert H(1) not in chunks
+        assert len(chunks) == 0
+        # the rebuilt index replaced all fragments, the corrupt one included
+        assert corrupt_name.removeprefix("index/") not in list_chunkindex_hashes(repository)
+        assert build_chunkindex_from_repo(repository, fragments_only=True) is not None
+
+
+def test_build_chunkindex_retries_on_vanished_fragment(tmp_path):
+    """build_chunkindex_from_repo must re-list and retry when a fragment vanishes mid-merge.
+
+    A concurrent repack_chunkindex (another client closing its cache, shared lock) stores a merged
+    replacement fragment and then deletes the small source fragments. A reader that listed the
+    fragments before the replacement existed and loads them after the deletion must not silently
+    skip the vanished fragment (that would yield an incomplete index: spurious ObjectNotFound for
+    existing chunks, lost deduplication) - it must restart from a fresh listing.
+    """
+    from borgstore.store import ObjectNotFound as StoreObjectNotFound
+
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        # two fragments, as left behind by two incremental backups
+        for h in (H(1), H(2)):
+            ci = ChunkIndex()
+            ci[h] = ChunkIndexEntry(ChunkIndex.F_NEW, 0, h, 0, 4)
+            write_chunkindex_to_repo(repository, ci, incremental=False, force_write=True)
+        fragment_names = list_chunkindex_hashes(repository)
+        original_store_load = repository.store_load
+        raced = False
+
+        def racing_store_load(name, **kwargs):
+            nonlocal raced
+            if not raced and name.startswith("index/"):
+                raced = True
+                # simulate a concurrent repack: store the merged replacement fragment first,
+                # then delete the sources, then fail this load (the fragment has vanished).
+                merged = ChunkIndex()
+                for h in (H(1), H(2)):
+                    merged[h] = ChunkIndexEntry(ChunkIndex.F_NEW, 0, h, 0, 4)
+                write_chunkindex_to_repo(repository, merged, incremental=False, force_write=True)
+                for frag in fragment_names:
+                    repository.store_delete(f"index/{frag}")
+                raise StoreObjectNotFound(name)
+            return original_store_load(name, **kwargs)
+
+        repository.store_load = racing_store_load
+        try:
+            chunks = build_chunkindex_from_repo(repository)
+        finally:
+            repository.store_load = original_store_load
+        assert raced  # the simulated repack fired
+        # the retry picked up the replacement fragment: the index is complete
+        assert H(1) in chunks
+        assert H(2) in chunks
+
+
+def test_build_chunkindex_no_partial_merge(tmp_path):
+    """An unreadable fragment must abort the build, never yield a partial index."""
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        # a valid fragment ...
+        ci = ChunkIndex()
+        ci[H(1)] = ChunkIndexEntry(ChunkIndex.F_NEW, 0, H(1), 0, 4)
+        write_chunkindex_to_repo(repository, ci, incremental=False, force_write=True)
+        # ... and a corrupt one (not an envelope, so it fails the authentication), which never loads successfully
+        repository.store_store(f"index/{'e' * 64}", b"garbage")
+        # with a skip-and-continue behavior, an index with just H(1) would be returned here.
+        with pytest.raises(CorruptChunkIndexFragment):
+            build_chunkindex_from_repo(repository)
+
+
+def test_chunkindex_cache_not_consolidated_on_access(tmp_path):
+    """ChunksMixin.chunks binds the repository index without collapsing the cached fragments.
+
+    Each backup leaves a small incremental index/* fragment; collapsing them all into one
+    on every access would re-upload the whole index and, with delete_other, invalidate every other
+    client's fragments. Fragment count is reclaimed by `borg compact`, not on every read here.
+    """
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        # seed two fragments
+        for h in (H(1), H(2)):
+            ci = ChunkIndex()
+            ci[h] = ChunkIndexEntry(ChunkIndex.F_NEW, 0, h, 0, 4)
+            write_chunkindex_to_repo(repository, ci, incremental=False, force_write=True)
+        before = len(list_chunkindex_hashes(repository))
+        assert before > 1
+
+        cache = ChunksMixin()
+        cache.repository = repository
+        index = cache.chunks  # binds the repository index; must NOT collapse the fragments
+
+        # fragments are left intact (no consolidation side effect) ...
+        assert len(list_chunkindex_hashes(repository)) == before
+        # ... and the in-memory index still resolves every seeded chunk
+        assert H(1) in index and H(2) in index
+
+
+def _ci_key(i):
+    """A distinct 32-byte chunk id for entry number i."""
+    return i.to_bytes(32, "big")
+
+
+def _make_chunkindex(keys):
+    ci = ChunkIndex()
+    for k in keys:
+        ci[k] = ChunkIndexEntry(ChunkIndex.F_NEW, 0, k, 0, 4)
+    return ci
+
+
+def _seed_fragment(repository, first, count):
+    """Write a fresh index fragment holding entries [first, first+count) and return its keys."""
+    keys = [_ci_key(i) for i in range(first, first + count)]
+    write_chunkindex_to_repo(repository, _make_chunkindex(keys), incremental=False, force_write=True)
+    return keys
+
+
+def test_write_chunkindex_splits_full_write(tmp_path, monkeypatch):
+    """A non-incremental (full) write splits the index into fragments of at most MAX entries."""
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MAX", 3000)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MIN", 1000)
+
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        delete_chunkindex_from_repo(repository)  # start from a known-empty fragment set
+        keys = [_ci_key(i) for i in range(7000)]
+        write_chunkindex_to_repo(
+            repository, _make_chunkindex(keys), incremental=False, force_write=True, delete_other=True
+        )
+        frags = list_chunkindex_fragments(repository)
+        # 7000 entries split by MAX=3000 -> 3 fragments (3000 + 3000 + 1000)
+        counts = sorted(len(read_chunkindex_from_repo(repository, name)) for name, _ in frags)
+        assert counts == [1000, 3000, 3000]
+        assert all(c <= 3000 for c in counts)
+
+
+def test_repack_defers_when_below_min_and_few_fragments(tmp_path, monkeypatch):
+    """Deferred merging: small fragments summing to < MIN and not exceeding the cap are left alone."""
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MIN", 1000)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MAX", 3000)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_SMALL_FRAGMENT_CAP", 5)
+
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        delete_chunkindex_from_repo(repository)
+        for j in range(3):  # 3 fragments * 100 = 300 entries < MIN, count 3 <= cap 5
+            _seed_fragment(repository, j * 100, 100)
+        before = {name for name, _ in list_chunkindex_fragments(repository)}
+        repack_chunkindex(repository)
+        after = {name for name, _ in list_chunkindex_fragments(repository)}
+        assert after == before  # nothing merged
+
+
+def test_repack_seals_when_smalls_reach_min(tmp_path, monkeypatch):
+    """When small fragments sum to >= MIN they are merged into a sealed fragment."""
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MIN", 1000)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MAX", 3000)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_SMALL_FRAGMENT_CAP", 100)
+
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        delete_chunkindex_from_repo(repository)
+        all_keys = []
+        for j in range(5):  # 5 * 300 = 1500 >= MIN
+            all_keys += _seed_fragment(repository, j * 300, 300)
+        assert len(list_chunkindex_fragments(repository)) == 5
+        repack_chunkindex(repository)
+        frags = list_chunkindex_fragments(repository)
+        assert len(frags) == 1  # 1500 entries, one fragment (< MAX)
+        merged = read_chunkindex_from_repo(repository, frags[0][0])
+        assert len(merged) == 1500
+        assert set(merged) == set(all_keys)
+
+
+def test_repack_cap_forces_merge_below_min(tmp_path, monkeypatch):
+    """More than SMALL_FRAGMENT_CAP tiny fragments are merged even though they sum to < MIN."""
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MIN", 1000)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MAX", 3000)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_SMALL_FRAGMENT_CAP", 5)
+
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        delete_chunkindex_from_repo(repository)
+        all_keys = []
+        for j in range(6):  # 6 * 50 = 300 < MIN, but count 6 > cap 5
+            all_keys += _seed_fragment(repository, j * 50, 50)
+        assert len(list_chunkindex_fragments(repository)) == 6
+        repack_chunkindex(repository)
+        frags = list_chunkindex_fragments(repository)
+        assert len(frags) == 1  # merged into a single sub-MIN remainder
+        merged = read_chunkindex_from_repo(repository, frags[0][0])
+        assert len(merged) == 300
+        assert set(merged) == set(all_keys)
+
+
+def test_write_chunkindex_splits_incremental_write(tmp_path, monkeypatch):
+    """Even an incremental write (a single backup's new chunks) is split into <= MAX fragments."""
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MAX", 500)
+
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        delete_chunkindex_from_repo(repository)
+        keys = [_ci_key(i) for i in range(1200)]  # all F_NEW -> written by the incremental path
+        write_chunkindex_to_repo(repository, _make_chunkindex(keys), incremental=True)
+        counts = sorted(
+            len(read_chunkindex_from_repo(repository, name)) for name, _ in list_chunkindex_fragments(repository)
+        )
+        assert counts == [200, 500, 500]  # 1200 split by MAX=500
+
+
+def test_write_chunkindex_deterministic_fragments(tmp_path, monkeypatch):
+    """Identical entry sets always produce identical fragments, regardless of insertion order.
+
+    The write path sorts the keys before partitioning them into batches, so the fragment set
+    (content hashes) only depends on the entries, not on the hash table's iteration order.
+    This makes writing/repacking idempotent and convergent across clients.
+    """
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MAX", 500)
+
+    key_ints = list(range(1200))
+    hashes = []
+    # one repository: the fragment names also depend on the repository id (see store_encrypt_store).
+    repository = Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True)
+    for reverse in (False, True):  # build the same index with different insertion orders
+        with repository:
+            delete_chunkindex_from_repo(repository)
+            keys = [_ci_key(i) for i in (reversed(key_ints) if reverse else key_ints)]
+            write_chunkindex_to_repo(repository, _make_chunkindex(keys), incremental=False, force_write=True)
+            frags = list_chunkindex_fragments(repository)
+            hashes.append({name for name, _ in frags})
+            # keys are big-endian ints, so sorted key order == numeric order: the batches must
+            # hold exactly the ranges [0..499], [500..999], [1000..1199].
+            ranges = sorted(sorted(read_chunkindex_from_repo(repository, name)) for name, _ in frags)
+            assert ranges == [
+                [_ci_key(i) for i in range(0, 500)],
+                [_ci_key(i) for i in range(500, 1000)],
+                [_ci_key(i) for i in range(1000, 1200)],
+            ]
+    assert hashes[0] == hashes[1]  # identical fragment sets from differently-ordered inputs
+
+
+def _u_key(i):
+    """A pseudo-random (uniformly distributed) 32-byte chunk id for entry number i."""
+    return hashlib.sha256(i.to_bytes(4, "big")).digest()
+
+
+def test_write_chunkindex_partitioned_write(tmp_path, monkeypatch):
+    """A big write with uniformly distributed keys is partitioned by leading key bits.
+
+    When more than MAX entries are selected, the write path processes the keys one key-prefix
+    partition at a time instead of building one huge all-keys list (#9886). The resulting
+    fragments must still be bounded by MAX and together hold every entry exactly once; as the
+    partitions compare the keys' leading bits, the fragments are contiguous ranges of the
+    globally sorted key space.
+    """
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MAX", 100)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MIN", 50)
+
+    keys = [_u_key(i) for i in range(1000)]
+    for incremental in (False, True):
+        repository_location = os.fspath(tmp_path / f"repository{incremental}")
+        with Repository(repository_location, exclusive=True, create=True) as repository:
+            delete_chunkindex_from_repo(repository)  # start from a known-empty fragment set
+            write_chunkindex_to_repo(
+                repository, _make_chunkindex(keys), incremental=incremental, force_write=not incremental
+            )
+            fragment_keys = [
+                sorted(read_chunkindex_from_repo(repository, name)) for name, _ in list_chunkindex_fragments(repository)
+            ]
+            # 1000 uniformly distributed entries with MAX=100 must have been really partitioned:
+            assert len(fragment_keys) >= 10
+            assert all(len(fk) <= 100 for fk in fragment_keys)
+            # ordering the fragments by their first key must yield the globally sorted key sequence,
+            # so the fragments are disjoint, complete and contiguous:
+            fragment_keys.sort(key=lambda fk: fk[0])
+            assert [k for fk in fragment_keys for k in fk] == sorted(keys)
+            # the index rebuilt from the fragments is complete:
+            chunks = build_chunkindex_from_repo(repository)
+            assert len(chunks) == 1000
+            assert set(chunks) == set(keys)
+
+
+def test_write_chunkindex_partitioned_deterministic(tmp_path, monkeypatch):
+    """Partitioned writes are convergent, too: identical entries -> identical fragments."""
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MAX", 100)
+
+    keys = [_u_key(i) for i in range(1000)]
+    shuffled = keys[311:] + keys[:311]  # same set, different insertion order
+    hashes = []
+    # one repository: the fragment names also depend on the repository id (see store_encrypt_store).
+    repository = Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True)
+    for key_list in (keys, shuffled):
+        with repository:
+            delete_chunkindex_from_repo(repository)
+            write_chunkindex_to_repo(repository, _make_chunkindex(key_list), incremental=False, force_write=True)
+            hashes.append({name for name, _ in list_chunkindex_fragments(repository)})
+    assert hashes[0] == hashes[1]  # identical fragment sets from differently-ordered inputs
+
+
+def test_close_consolidates_fragments_across_sessions(tmp_path, monkeypatch):
+    """End-to-end: repeated create-like sessions leave a bounded, consolidated set of fragments."""
+    monkeypatch.setenv("BORG_PASSPHRASE", "test")
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MIN", 200)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MAX", 500)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_SMALL_FRAGMENT_CAP", 1000)
+
+    loc = os.fspath(tmp_path / "repository")
+    with Repository(loc, exclusive=True, create=True) as repository:
+        key = AESOCBKey.create(repository, TestKey.MockArgs())
+        repository.save_config(key)
+
+    all_ids = []
+    for s in range(5):  # each session adds 100 new chunks (< MIN), so fragments must be consolidated
+        with Repository(loc, exclusive=True) as repository:
+            manifest = Manifest.load(repository, key=key)
+            cache = AdHocWithFilesCache(manifest)
+            try:
+                for i in range(s * 100, s * 100 + 100):
+                    cid = H(i)
+                    all_ids.append(cid)
+                    cache.add_chunk(cid, {}, b"data-%d" % i, stats=Statistics())
+            finally:
+                cache.close()
+            repository.flush()
+
+    with Repository(loc, exclusive=True) as repository:
+        repository.set_key(key)  # the fragments were written with the real key
+        frags = list_chunkindex_fragments(repository)
+        # without repack there would be one incremental fragment per session;
+        # repack consolidates the small ones as they accumulate, so we end up with fewer.
+        assert len(frags) < 5
+        assert any(approx >= 200 for _, approx in frags)  # at least one sealed (>= MIN) fragment
+        assert all(approx <= 500 + 8 for _, approx in frags)  # none exceeds MAX (+ header slack)
+        index = build_chunkindex_from_repo(repository)
+        for cid in all_ids:
+            assert cid in index
+
+
+def test_build_chunkindex_repair_resyncs_after_corrupt_header(tmp_path):
+    """A corrupt object header aborts the rebuild; with validate, the objects after it are indexed."""
+    from .repository_test import accept_all, fchunk
+
+    obj1 = bytearray(fchunk(b"first", chunk_id=H(90)))
+    obj2 = fchunk(b"second", chunk_id=H(91))
+    obj1[0] ^= 0xFF  # break the magic of the first object's header
+    pack_id = H(92)
+    with Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True) as repository:
+        repository.store_store("packs/" + bin_to_hex(pack_id), bytes(obj1) + obj2)
+        with pytest.raises(CorruptPack, match="borg check --repair"):  # no validator: abort, #10122
+            build_chunkindex_from_repo(repository, slow_rebuild=True)
+        # accept_all takes any candidate, so this covers the plumbing, not the authentication.
+        index = build_chunkindex_from_repo(repository, slow_rebuild=True, validate=accept_all)
+        assert H(91) in index  # found by resyncing past the damaged header
+        assert H(90) not in index  # its header is damaged, so its id is unknown
+        assert index[H(91)].pack_id == pack_id
+        assert index[H(91)].obj_offset == len(obj1)
+
+
+def test_build_chunkindex_aborts_when_nothing_validates(tmp_path):
+    """The rebuild aborts when object headers parse but no object validates."""
+    from .repository_test import fchunk
+
+    pack = fchunk(b"first", chunk_id=H(90)) + fchunk(b"second", chunk_id=H(91))
+    with Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True) as repository:
+        repository.store_store("packs/" + bin_to_hex(H(92)), pack)
+        with pytest.raises(Error, match="not one object passed validation"):
+            build_chunkindex_from_repo(repository, slow_rebuild=True, validate=lambda chunk_id, obj: False)
+
+
+def test_build_chunkindex_reports_duplicates(tmp_path):
+    """on_duplicate gets the pack of the copy the index named before, for each further copy of a chunk id."""
+    from .repository_test import accept_all, fchunk
+
+    duplicates = []
+    with Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True) as repository:
+        # the packs are walked in pack id order.
+        repository.store_store("packs/" + bin_to_hex(H(1)), fchunk(b"x", chunk_id=H(90)) + fchunk(b"y", chunk_id=H(91)))
+        repository.store_store("packs/" + bin_to_hex(H(2)), fchunk(b"x", chunk_id=H(90)))
+        repository.store_store("packs/" + bin_to_hex(H(3)), fchunk(b"x", chunk_id=H(90)) + fchunk(b"x", chunk_id=H(90)))
+        index = build_chunkindex_from_repo(
+            repository, slow_rebuild=True, validate=accept_all, on_duplicate=lambda *args: duplicates.append(args)
+        )
+        assert duplicates == [(H(90), H(1)), (H(90), H(2)), (H(90), H(3))]
+        assert index[H(90)].pack_id == H(3)
+        assert index[H(90)].obj_offset == len(fchunk(b"x", chunk_id=H(90)))
+        assert index[H(91)].pack_id == H(1)
+
+
+def test_build_chunkindex_reports_a_pack_without_any_object_header(tmp_path):
+    """A pack whose bytes hold no object header is reported through on_drop and yields no entries."""
+    drops = []
+    with Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True) as repository:
+        repository.store_store("packs/" + bin_to_hex(H(92)), b"x" * 512)  # the pack was overwritten
+        index = build_chunkindex_from_repo(
+            repository, slow_rebuild=True, validate=lambda chunk_id, obj: False, on_drop=lambda: drops.append(True)
+        )
+        assert len(index) == 0
+        assert len(drops) == 1
+
+
+def test_build_chunkindex_drops_a_pack_that_validates_nothing_when_others_do(tmp_path):
+    """A single pack of which nothing validates is dropped, the objects of the other packs are indexed."""
+    from .repository_test import fchunk
+
+    good = fchunk(b"good", chunk_id=H(93))
+    bad = fchunk(b"bad", chunk_id=H(94))
+
+    def accept_good(chunk_id, obj):
+        return chunk_id == H(93)
+
+    with Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True) as repository:
+        repository.store_store("packs/" + bin_to_hex(H(95)), good)
+        repository.store_store("packs/" + bin_to_hex(H(96)), bad)
+        index = build_chunkindex_from_repo(repository, slow_rebuild=True, validate=accept_good)
+        assert H(93) in index
+        assert H(94) not in index
+
+
+def two_fragment_repo(tmp_path):
+    """A repository with two chunk index fragments: H(1) in one, H(2) in the other."""
+    repository = Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True)
+    with repository:
+        for i in 1, 2:
+            ci = ChunkIndex()
+            ci[H(i)] = ChunkIndexEntry(ChunkIndex.F_NEW, 0, H(i), 0, 4)
+            write_chunkindex_to_repo(repository, ci, incremental=False, force_write=True)
+        assert len(list_chunkindex_hashes(repository)) == 2
+    return repository
+
+
+@pytest.fixture
+def progress_output(monkeypatch):
+    """Progress output as --progress gives it, and nothing else: all loggers at INFO level, restored afterwards."""
+    # "borg" and "borgstore" inherit the root logger level, which is DEBUG after an in-process borg --debug run.
+    loggers = [logging.getLogger(name) for name in ("borg.output.progress", "borg", "borgstore")]
+    levels = [logger.level for logger in loggers]
+    for logger in loggers:
+        logger.setLevel(logging.INFO)
+    monkeypatch.setattr(progress, "get_progress_dt", lambda: 0.0)  # no rate limit, every step is output
+    yield
+    for logger, level in zip(loggers, levels):
+        logger.setLevel(level)
+
+
+def test_build_chunkindex_fragment_merge_progress(tmp_path, capfd, progress_output):
+    with two_fragment_repo(tmp_path) as repository:
+        capfd.readouterr()
+        chunks = build_chunkindex_from_repo(repository)
+    assert H(1) in chunks and H(2) in chunks
+    out, err = capfd.readouterr()
+    # the last line is the "finished" record
+    assert err == "Loading chunk index   0%\nLoading chunk index  50%\nLoading chunk index 100%\n\n"
+
+
+def test_build_chunkindex_slow_rebuild_progress(tmp_path, capfd, progress_output):
+    with two_pack_repo(tmp_path) as repository:
+        capfd.readouterr()
+        build_chunkindex_from_repo(repository, slow_rebuild=True)
+    out, err = capfd.readouterr()
+    assert err == "Rebuilding chunk index   0%\nRebuilding chunk index  50%\nRebuilding chunk index 100%\n\n"
+
+
+class RecordingSpinner:
+    """Stands in for ProgressIndicatorSpinner, records the calls of all instances."""
+
+    instances: list = []
+
+    def __init__(self, message, msgid=None):
+        self.message = message
+        self.msgid = msgid
+        self.shown = 0
+        self.finished = 0
+        self.instances.append(self)
+
+    def show(self):
+        assert not self.finished
+        self.shown += 1
+
+    def finish(self):
+        self.finished += 1
+
+
+@pytest.fixture
+def spinners(monkeypatch):
+    """The spinners build_chunkindex_from_repo creates without --progress."""
+    monkeypatch.setattr(RecordingSpinner, "instances", [])
+    monkeypatch.setattr(cache_mod, "ProgressIndicatorSpinner", RecordingSpinner)
+    monkeypatch.setattr(cache_mod, "progress_wanted", lambda: False)
+    return RecordingSpinner.instances
+
+
+def test_build_chunkindex_fragment_merge_spinner(tmp_path, spinners):
+    with two_fragment_repo(tmp_path) as repository:
+        build_chunkindex_from_repo(repository)
+    [spinner] = spinners
+    assert (spinner.message, spinner.msgid) == ("Loading chunk index", "cache.merge_chunkindex_fragments")
+    assert spinner.shown == 2  # once per fragment
+    assert spinner.finished == 1
+
+
+def test_build_chunkindex_fragment_merge_spinner_finished_on_corrupt_fragment(tmp_path, spinners):
+    with two_fragment_repo(tmp_path) as repository:
+        repository.store_encrypt_store("index", b"not a serialized chunk index", hashed_name=True)
+        with pytest.raises(CorruptChunkIndexFragment):
+            build_chunkindex_from_repo(repository)
+    [spinner] = spinners
+    assert spinner.finished == 1
+
+
+def test_build_chunkindex_slow_rebuild_spinner(tmp_path, spinners):
+    with two_pack_repo(tmp_path) as repository:
+        build_chunkindex_from_repo(repository, slow_rebuild=True)
+    [spinner] = spinners
+    assert (spinner.message, spinner.msgid) == ("Rebuilding chunk index", "cache.build_chunkindex_from_repo")
+    assert spinner.shown == 6  # once per pack and once per object
+    assert spinner.finished == 1
+
+
+def test_build_chunkindex_slow_rebuild_spinner_finished_on_interrupt(tmp_path, monkeypatch, spinners):
+    from .repository_test import Interrupter
+
+    interrupter = Interrupter()
+    monkeypatch.setattr(cache_mod, "sig_int", interrupter)
+    interrupt_after(monkeypatch, interrupter, objects=1)
+    with two_pack_repo(tmp_path) as repository:
+        with pytest.raises(ChunkIndexRebuildInterrupted):
+            build_chunkindex_from_repo(repository, slow_rebuild=True, interruptible=True)
+    [spinner] = spinners
+    assert spinner.finished == 1
+
+
+def two_pack_repo(tmp_path):
+    """A repository with two packs of two objects each: H(90) and H(92) in one, H(91) and H(93) in the other."""
+    from .repository_test import fchunk
+
+    repository = Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True)
+    with repository:
+        pack1 = fchunk(b"one", chunk_id=H(90)) + fchunk(b"three", chunk_id=H(92))
+        pack2 = fchunk(b"two", chunk_id=H(91)) + fchunk(b"four", chunk_id=H(93))
+        repository.store_store("packs/" + bin_to_hex(H(95)), pack1)
+        repository.store_store("packs/" + bin_to_hex(H(96)), pack2)
+    return repository
+
+
+def interrupt_after(monkeypatch, interrupter, objects):
+    """Trip interrupter once the walk yielded that many objects of a pack, or at the end of the pack if
+    objects is None. Return the list the walk appends each pack id to."""
+    packs_read = []
+    orig_iter_headers = PackReader.iter_headers
+
+    def iter_headers(self, **kwargs):
+        packs_read.append(self.pack_id)
+        for n, header in enumerate(orig_iter_headers(self, **kwargs)):
+            if n == objects:
+                interrupter.triggered = True
+            yield header
+        interrupter.triggered = True
+
+    monkeypatch.setattr(PackReader, "iter_headers", iter_headers)
+    return packs_read
+
+
+def test_build_chunkindex_slow_rebuild_ignores_sigint_by_default(tmp_path, monkeypatch):
+    """Without interruptible, the rebuild walks every pack and returns a complete index, also after a
+    Ctrl-C. ArchiveChecker.finish() relies on that, #9850."""
+    from .repository_test import Interrupter
+
+    interrupter = Interrupter()
+    monkeypatch.setattr(cache_mod, "sig_int", interrupter)
+    packs_read = interrupt_after(monkeypatch, interrupter, objects=1)
+    with two_pack_repo(tmp_path) as repository:
+        index = build_chunkindex_from_repo(repository, slow_rebuild=True)
+    assert len(packs_read) == 2  # the interrupt did not stop the walk
+    assert all(H(i) in index for i in (90, 91, 92, 93))
+
+
+@pytest.mark.parametrize(
+    "objects, packs_done",
+    [(None, 1), (1, 0)],  # a Ctrl-C at the end of the first pack, or after its first object
+    ids=["between-packs", "within-pack"],
+)
+def test_build_chunkindex_slow_rebuild_interruptible_discards_the_partial_index(
+    tmp_path, monkeypatch, caplog, objects, packs_done
+):
+    """With interruptible, a Ctrl-C stops the rebuild before the next object and raises; the index built
+    so far reaches neither the caller nor the repo, #10042."""
+    from .repository_test import Interrupter
+
+    interrupter = Interrupter()
+    monkeypatch.setattr(cache_mod, "sig_int", interrupter)
+    packs_read = interrupt_after(monkeypatch, interrupter, objects=objects)
+    with two_pack_repo(tmp_path) as repository:
+        stored_before = set(list_chunkindex_hashes(repository))
+        with caplog.at_level(logging.INFO, logger="borg.cache"):
+            with pytest.raises(ChunkIndexRebuildInterrupted, match="Got Ctrl-C"):
+                build_chunkindex_from_repo(repository, slow_rebuild=True, write_immediately=True, interruptible=True)
+        assert f"Chunk index rebuild interrupted after {packs_done} of 2 packs." in caplog.text
+        assert len(packs_read) == 1  # the second pack was not read
+        assert set(list_chunkindex_hashes(repository)) == stored_before  # nothing was stored
+
+
+def test_repack_leaves_sealed_untouched_and_reconstructs(tmp_path, monkeypatch):
+    """Sealed (>= MIN) fragments survive a repack; build_chunkindex_from_repo reconstructs the index."""
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MIN", 1000)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MAX", 3000)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_SMALL_FRAGMENT_CAP", 100)
+
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        delete_chunkindex_from_repo(repository)
+        sealed_keys = _seed_fragment(repository, 0, 2000)  # >= MIN -> sealed
+        sealed_hashes = {name for name, _ in list_chunkindex_fragments(repository)}
+        assert len(sealed_hashes) == 1
+        small_keys = []
+        for j in range(3):  # 3 * 400 = 1200 >= MIN -> will be merged
+            small_keys += _seed_fragment(repository, 2000 + j * 400, 400)
+
+        repack_chunkindex(repository)
+
+        frags = {name for name, _ in list_chunkindex_fragments(repository)}
+        assert sealed_hashes <= frags  # the sealed fragment was not rewritten or deleted
+        assert len(frags) == 2  # sealed one + the merged small ones
+
+        index = build_chunkindex_from_repo(repository)
+        assert len(index) == 2000 + 1200
+        assert set(index) == set(sealed_keys + small_keys)
+
+
+def test_repack_idempotent_deletes_sources_when_merged_exists(tmp_path, monkeypatch):
+    """A repack whose merged fragment already exists (dedupe-skipped) still deletes the small sources.
+
+    This is the crash / concurrent-repack recovery case: a prior repack may have stored the merged
+    fragment but not gotten to delete the small sources. The next repack re-derives the same merged
+    content, dedupe-skips the upload (force_write=False), and must still remove the now-superseded
+    sources -- otherwise they would pile up and be re-merged on every run. Deletion is therefore gated
+    on the merged fragment being present in the repo, not on a fresh upload having happened.
+    """
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MIN", 1000)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MAX", 3000)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_SMALL_FRAGMENT_CAP", 100)
+
+    repository_location = os.fspath(tmp_path / "repository")
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        delete_chunkindex_from_repo(repository)
+        all_keys = []
+        for j in range(5):  # 5 * 300 = 1500 >= MIN -> merges into one sealed fragment
+            all_keys += _seed_fragment(repository, j * 300, 300)
+        repack_chunkindex(repository)
+        sealed = {name for name, _ in list_chunkindex_fragments(repository)}
+        assert len(sealed) == 1  # the merged, sealed fragment
+
+        # simulate a repack that stored the merged fragment but crashed before deleting the sources:
+        # the sealed fragment is present, and the same small sources exist again alongside it.
+        for j in range(5):
+            _seed_fragment(repository, j * 300, 300)
+        assert len(list_chunkindex_fragments(repository)) == 6  # sealed + 5 re-seeded small
+
+        repack_chunkindex(repository)  # merged content already exists -> upload is dedupe-skipped
+
+        frags = {name for name, _ in list_chunkindex_fragments(repository)}
+        assert frags == sealed  # sources deleted; only the (unchanged) sealed fragment remains
+        merged = read_chunkindex_from_repo(repository, next(iter(frags)))
+        assert set(merged) == set(all_keys)
+
+
+def test_invalid_marker_forces_rebuild(tmp_path):
+    """With the marker present, build discards leftover fragments instead of trusting them."""
+    loc = os.fspath(tmp_path / "repository")
+    with Repository(loc, exclusive=True, create=True) as repository:
+        # a leftover fragment plus the marker, as an interrupted deletion would leave them.
+        _seed_fragment(repository, 5000, 3)
+        write_chunkindex_invalid(repository)
+        assert chunkindex_is_invalid(repository)
+
+        chunks = build_chunkindex_from_repo(repository)
+        # the leftover entry is not merged (the repo has no packs, so a correct rebuild is empty).
+        assert _ci_key(5000) not in chunks
+        # the roll-forward removed both the leftover fragments and the marker.
+        assert not chunkindex_is_invalid(repository)
+        assert list_chunkindex_fragments(repository) == []
+
+
+def test_delete_chunkindex_writes_then_removes_marker(tmp_path):
+    """An interrupted delete_chunkindex_from_repo leaves the invalid marker behind."""
+    loc = os.fspath(tmp_path / "repository")
+    with Repository(loc, exclusive=True, create=True) as repository:
+        _seed_fragment(repository, 0, 3)
+        _seed_fragment(repository, 100, 3)
+        assert not chunkindex_is_invalid(repository)
+
+        real_delete = repository.store.delete
+        calls = {"n": 0}
+
+        def failing_delete(name, **kwargs):
+            # let the marker write happen, then fail on the first fragment deletion.
+            if name.startswith("index/"):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise OSError("simulated crash mid-delete")
+            return real_delete(name, **kwargs)
+
+        repository.store.delete = failing_delete
+        with pytest.raises(OSError):
+            delete_chunkindex_from_repo(repository)
+        repository.store.delete = real_delete
+        # the marker was written before the (failed) deletion and is still present.
+        assert chunkindex_is_invalid(repository)
+
+        # a fresh build sees the marker, rolls the deletion forward, and rebuilds cleanly.
+        build_chunkindex_from_repo(repository)
+        assert not chunkindex_is_invalid(repository)
+
+
+def test_repack_skips_when_invalid(tmp_path, monkeypatch):
+    """Repack does nothing while the index is invalid (a rebuild will supersede it)."""
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_FRAGMENT_ENTRIES_MIN", 1000)
+    monkeypatch.setattr(cache_mod, "CHUNKINDEX_SMALL_FRAGMENT_CAP", 2)
+    loc = os.fspath(tmp_path / "repository")
+    with Repository(loc, exclusive=True, create=True) as repository:
+        delete_chunkindex_from_repo(repository)
+        for j in range(4):
+            _seed_fragment(repository, j * 100, 100)
+        write_chunkindex_invalid(repository)
+        before = {name for name, _ in list_chunkindex_fragments(repository)}
+        repack_chunkindex(repository)
+        after = {name for name, _ in list_chunkindex_fragments(repository)}
+        assert before == after  # unchanged: repack bailed out
+
+
+def test_files_cache_save_tolerates_missing_chunk(tmp_path, monkeypatch):
+    """A files-cache entry whose chunk vanished from the index is dropped, not fatal.
+
+    When a backup runs out of space and aborts, pending chunks get rolled back out of the chunks
+    index. A files-cache entry memorized earlier still references such a chunk by its (now stale)
+    hash-table index position, so decompress_entry's `self.chunks[id]` raises KeyError. That must not
+    crash a cache lookup or the files-cache save (which runs during close(), while cleaning up the
+    already-failed backup) -- the entry is simply discarded and the file re-chunked next time.
+    Regression test for the ENOSPC 'Key not found' crash in decompress_entry.
+    """
+    monkeypatch.setenv("BORG_PASSPHRASE", "test")
+    loc = os.fspath(tmp_path / "repository")
+    with Repository(loc, exclusive=True, create=True) as repository:
+        key = AESOCBKey.create(repository, TestKey.MockArgs())
+        repository.save_config(key)
+
+    with Repository(loc, exclusive=True) as repository:
+        manifest = Manifest.load(repository, key=key)
+        # size+inode+ctime cache mode -> files cache active; archive_name -> names the cache file
+        cache = AdHocWithFilesCache(manifest, cache_mode="cis", archive_name="test")
+        try:
+            cid = H(1)
+            cache.chunks[cid] = ChunkIndexEntry(ChunkIndex.F_NEW, 4, cid, 0, 4)
+            realfile = tmp_path / "f"
+            realfile.write_bytes(b"data")
+            st = os.stat(realfile)
+            path_hash = H(100)
+            cache.memorize_file(os.fspath(realfile), path_hash, st, [(cid, 4)])
+
+            # while the chunk is present, the file resolves as known/unchanged
+            known, chunks, digests = cache.file_known_and_unchanged(os.fspath(realfile), path_hash, st)
+            assert known and chunks
+
+            # simulate the out-of-space rollback: the referenced chunk is gone from the index
+            del cache.chunks[cid]
+
+            # a lookup must now report the file as unknown (re-chunk it), not raise KeyError
+            known, chunks, digests = cache.file_known_and_unchanged(os.fspath(realfile), path_hash, st)
+            assert known is False and chunks is None
+
+            # saving the files cache must drop the broken entry rather than raise KeyError
+            cache._write_files_cache(cache._files)
+        finally:
+            cache.close()
+        repository.flush()
+
+
+def test_archive_group_patterns(monkeypatch):
+    from ..cache import archive_group_patterns
+
+    monkeypatch.setenv("BORG_HOSTNAME", "myhost")
+    monkeypatch.setenv("BORG_USERNAME", "myuser")
+    assert archive_group_patterns("home", ()) == []
+    assert archive_group_patterns("home", ("name",)) == ["name:home"]
+    assert archive_group_patterns("home", ("name", "host")) == ["name:home", "host:myhost"]
+    assert archive_group_patterns("home", ("name", "host", "user")) == ["name:home", "host:myhost", "user:myuser"]
+    with pytest.raises(ValueError, match="invalid group-by key: tags"):
+        archive_group_patterns("home", ("tags",))
+
+
+def test_files_cache_group_by_spec():
+    from argparse import ArgumentTypeError
+
+    from ..helpers import FilesCacheGroupBySpec
+
+    assert FilesCacheGroupBySpec("name,host") == "name,host"
+    assert FilesCacheGroupBySpec("name") == "name"
+    # the parsed value is fed through the spec again by the argument parser, so it must be stable:
+    assert FilesCacheGroupBySpec(FilesCacheGroupBySpec("name,host")) == FilesCacheGroupBySpec("name,host")
+    # tags are not usable here: a new archive is not known to belong to the tag group of an existing one.
+    with pytest.raises(ArgumentTypeError, match="Invalid group-by key: tags"):
+        FilesCacheGroupBySpec("name,tags")
+    # a new archive must not continue an arbitrary unrelated archive:
+    for text in ("", "none"):
+        with pytest.raises(ArgumentTypeError, match="At least one group-by key is required"):
+            FilesCacheGroupBySpec(text)
+
+
+@pytest.mark.parametrize("key_class", [AESOCBKey, AuthenticatedKey])
+def test_chunkindex_fragments_in_the_key_envelope(tmp_path, key_class):
+    """The index/ fragments are protected like the objects in the packs, see Repository.store_encrypt_store.
+
+    The encrypting modes hide the chunk ids and give each fragment a new name, even for identical entries.
+    The authenticated-* modes store the ids in the clear and give identical entries the same name.
+    """
+    repository_location = os.fspath(tmp_path / "repository")
+    ids = [H(i) for i in range(10)]
+    with Repository(repository_location, exclusive=True, create=True) as repository:
+        repository.set_key(make_store_obj_key(key_class, repository))
+        ci = ChunkIndex()
+        for i, id in enumerate(ids):
+            ci[id] = ChunkIndexEntry(ChunkIndex.F_NEW, 0, H(100), i * 10, 10)
+        first = write_chunkindex_to_repo(repository, ci, incremental=False, force_write=True)
+        second = write_chunkindex_to_repo(repository, ci, incremental=False, force_write=True)
+        (first_hash,) = first
+        (second_hash,) = second
+        stored = repository.store_load(f"index/{first_hash}")
+        if issubclass(key_class, AESOCBKey):
+            assert not any(id in stored for id in ids)
+            assert first_hash != second_hash
+            assert len(list_chunkindex_hashes(repository)) == 2
+        else:
+            assert all(id in stored for id in ids)
+            assert first_hash == second_hash
+            assert len(list_chunkindex_hashes(repository)) == 1
+        # whatever the names, the fragments hold the same entries.
+        first_ci = read_chunkindex_from_repo(repository, first_hash)
+        second_ci = read_chunkindex_from_repo(repository, second_hash)
+        assert dict(first_ci.items()) == dict(second_ci.items())
+        assert sorted(k for k, _ in first_ci.items()) == sorted(ids)
+
+
+def make_archive_references(ids):
+    table = HashTableNT(
+        key_size=32, value_type=cache_mod.ArchiveReferenceEntry, value_format=cache_mod.ArchiveReferenceEntryFormat
+    )
+    for id in ids:
+        table[id] = cache_mod.ArchiveReferenceEntry(size=len(id))
+    return cache_mod.ArchiveReferences(file_count=len(ids), content_size=32 * len(ids), ids=table)
+
+
+@pytest.mark.parametrize("key_class", [AESOCBKey, AuthenticatedKey])
+def test_archive_references_in_the_key_envelope(tmp_path, key_class):
+    ids = [H(i) for i in range(5)]
+    with Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True) as repository:
+        repository.set_key(make_store_obj_key(key_class, repository))
+        cache_mod.store_archive_references(repository, H(100), make_archive_references(ids))
+        loaded = cache_mod.load_archive_references(repository, H(100))
+        assert (loaded.file_count, loaded.content_size) == (5, 5 * 32)
+        assert sorted(k for k, _ in loaded.ids.items()) == sorted(ids)
+        stored = repository.store_load(cache_mod.archive_reference_cache_name(H(100)))
+        if issubclass(key_class, AESOCBKey):
+            assert not any(id in stored for id in ids)
+        else:
+            assert all(id in stored for id in ids)
+
+
+def test_known_chunkindex_fragment_not_stored_again(tmp_path):
+    """A fragment whose content was read in this session is not stored again, also in the encrypting modes.
+
+    E.g. a repack that crashed after storing the merged fragment, but before deleting the small sources:
+    the next repack re-derives the same merged fragment, does not upload it again and deletes the sources.
+    """
+    with Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True) as repository:
+        repository.set_key(make_store_obj_key(AESOCBKey, repository))
+        ci = ChunkIndex()
+        for i in range(10):
+            ci[H(i)] = ChunkIndexEntry(ChunkIndex.F_NEW, 0, H(100), i * 10, 10)
+        (first,) = write_chunkindex_to_repo(repository, ci, incremental=False, force_write=True)
+        repository.chunkindex_fragment_hashes.clear()  # like a new session: nothing read yet
+        assert read_chunkindex_from_repo(repository, first) is not None
+        (second,) = write_chunkindex_to_repo(repository, ci, incremental=False, force_write=False)
+        assert second == first  # not stored again
+        assert list_chunkindex_hashes(repository) == [first]
+        # force_write stores it anyway (a new envelope, so a new name)
+        (third,) = write_chunkindex_to_repo(repository, ci, incremental=False, force_write=True)
+        assert third != first
+        assert sorted(list_chunkindex_hashes(repository)) == sorted([first, third])
+
+
+@pytest.mark.parametrize("tamper", ["flipped_byte", "other_archive", "plaintext"])
+def test_archive_references_not_authentic(tmp_path, caplog, tamper):
+    # a corrupted cache, the cache of another archive (e.g. copied by a hostile store, which would make
+    # compact drop chunks this archive uses) and a plaintext cache of an older borg 2 beta are ignored.
+    with Repository(os.fspath(tmp_path / "repository"), exclusive=True, create=True) as repository:
+        name = cache_mod.archive_reference_cache_name(H(100))
+        if tamper == "flipped_byte":
+            cache_mod.store_archive_references(repository, H(100), make_archive_references([H(1)]))
+            data = bytearray(repository.store_load(name))
+            data[-1] ^= 0x01
+            repository.store_store(name, bytes(data))
+        elif tamper == "other_archive":
+            cache_mod.store_archive_references(repository, H(101), make_archive_references([H(1)]))
+            repository.store_store(name, repository.store_load(cache_mod.archive_reference_cache_name(H(101))))
+        else:
+            with io.BytesIO() as f:
+                references = make_archive_references([H(1)])
+                f.write((1).to_bytes(8, "little") + (32).to_bytes(8, "little"))
+                references.ids.write(f)
+                data = f.getvalue()
+            repository.store_store(name, data + store_hash(data).digest())
+        with caplog.at_level(logging.WARNING, logger="borg.cache"):
+            assert cache_mod.load_archive_references(repository, H(100)) is None
+        assert f"Ignoring corrupted references cache of archive {bin_to_hex(H(100))}." in caplog.text

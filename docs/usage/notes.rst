@@ -1,41 +1,41 @@
 Additional Notes
 ----------------
 
-Here are misc. notes about topics that are maybe not covered in enough detail in the usage section.
+Here are miscellaneous notes about topics that may not be covered in enough detail in the usage section.
 
 .. _chunker-params:
 
 ``--chunker-params``
 ~~~~~~~~~~~~~~~~~~~~
 
-The chunker params influence how input files are cut into pieces (chunks)
+The chunker parameters influence how input files are cut into pieces (chunks)
 which are then considered for deduplication. They also have a big impact on
 resource usage (RAM and disk space) as the amount of resources needed is
-(also) determined by the total amount of chunks in the repository (see
+(also) determined by the total number of chunks in the repository (see
 :ref:`cache-memory-usage` for details).
 
-``--chunker-params=buzhash,10,23,16,4095`` results in a fine-grained deduplication|
-and creates a big amount of chunks and thus uses a lot of resources to manage
+``--chunker-params=fastcdc,10,23,16,2`` results in a fine-grained deduplication
+and creates a large number of chunks and thus uses a lot of resources to manage
 them. This is good for relatively small data volumes and if the machine has a
 good amount of free RAM and disk space.
 
-``--chunker-params=buzhash,19,23,21,4095`` (default) results in a coarse-grained
-deduplication and creates a much smaller amount of chunks and thus uses less
+``--chunker-params=fastcdc,19,23,21,2`` (default) results in a coarse-grained
+deduplication and creates a much smaller number of chunks and thus uses less
 resources. This is good for relatively big data volumes and if the machine has
 a relatively low amount of free RAM and disk space.
 
-``--chunker-params=fixed,4194304`` results in fixed 4MiB sized block
-deduplication and is more efficient than the previous example when used for
+``--chunker-params=fixed,4194304`` results in fixed 4 MiB-sized block
+deduplication and is more efficient than the previous example when used with
 for block devices (like disks, partitions, LVM LVs) or raw disk image files.
 
-``--chunker-params=fixed,4096,512`` results in fixed 4kiB sized blocks,
+``--chunker-params=fixed,4096,512`` results in fixed 4 KiB-sized blocks,
 but the first header block will only be 512B long. This might be useful to
-dedup files with 1 header + N fixed size data blocks. Be careful to not
-produce a too big amount of chunks (like using small block size for huge
+dedup files with 1 header + N fixed size data blocks. Be careful not to
+produce too many chunks (for example, using a small block size for huge
 files).
 
-If you already have made some archives in a repository and you then change
-chunker params, this of course impacts deduplication as the chunks will be
+If you have already created some archives in a repository and then change
+chunker parameters, this of course impacts deduplication as the chunks will be
 cut differently.
 
 In the worst case (all files are big and were touched in between backups), this
@@ -45,41 +45,63 @@ Usually, it is not that bad though:
 
 - usually most files are not touched, so it will just re-use the old chunks
   it already has in the repo
-- files smaller than the (both old and new) minimum chunksize result in only
-  one chunk anyway, so the resulting chunks are same and deduplication will apply
+- files smaller than the (both old and new) minimum chunk size result in only
+  one chunk anyway, so the resulting chunks are the same and deduplication will apply
 
-If you switch chunker params to save resources for an existing repo that
+If you switch chunker parameters to save resources for an existing repository that
 already has some backup archives, you will see an increasing effect over time,
 when more and more files have been touched and stored again using the bigger
-chunksize **and** all references to the smaller older chunks have been removed
+chunk size **and** all references to the smaller, older chunks have been removed
 (by deleting / pruning archives).
 
-If you want to see an immediate big effect on resource usage, you better start
-a new repository when changing chunker params.
+If you want to see an immediate, significant effect on resource usage, you should start
+a new repository when changing chunker parameters.
 
 For more details, see :ref:`chunker_details`.
 
 
-``--noatime / --noctime``
-~~~~~~~~~~~~~~~~~~~~~~~~~
+``--atime / --noctime / --nobirthtime``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-You can use these ``borg create`` options to not store the respective timestamp
-into the archive, in case you do not really need it.
+``borg create`` does not store atime by default — use ``--atime`` if you do
+need it. ctime and birthtime are stored by default and can be omitted with
+``--noctime`` and ``--nobirthtime``.
 
-Besides saving a little space for the not archived timestamp, it might also
-affect metadata stream deduplication: if only this timestamp changes between
-backups and is stored into the metadata stream, the metadata stream chunks
-won't deduplicate just because of that.
+Besides saving a little space by omitting a timestamp, storing fewer timestamps
+might also help metadata stream deduplication: if only such a timestamp changes
+between backups and is stored into the metadata stream, the metadata stream
+chunks will not deduplicate just because of that.
 
-``--nobsdflags / --noflags``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``--noflags``
+~~~~~~~~~~~~~
 
-You can use this to not query and store (or not extract and set) flags - in case
-you don't need them or if they are broken somehow for your fs.
+You can use this to avoid querying and storing (or extracting and setting) flags — in case
+you don't need them or if they are broken for your filesystem.
 
 On Linux, dealing with the flags needs some additional syscalls. Especially when
 dealing with lots of small files, this causes a noticeable overhead, so you can
 use this option also for speeding up operations.
+
+File flags (bsdflags) between platforms
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Borg archives file flags as BSD-style ``chflags(2)`` values, on all platforms.
+On Linux, the file attributes nodump, immutable and append-only (see
+``ioctl_iflags(2)`` / ``chattr(1)``) are translated to/from the corresponding
+BSD-style flags; other Linux attributes are not archived.
+
+The available flags differ between platforms, so when extracting, borg only
+sets the flags known to be settable from userspace on the destination platform —
+unsupported flags are dropped individually, the supported ones are still set.
+Flag bits that are not settable from userspace (like macOS's ``UF_COMPRESSED``
+or ``SF_DATALESS``, or unknown/future flags) are never modified: the extracted
+file keeps whatever the OS gives it.
+
+Some flags need special privileges to set (the super-user-only ``SF_*`` flags
+on BSD/macOS, immutable/append-only on Linux). If setting them is not
+permitted, borg still restores the remaining flags (like nodump) and skips the
+privileged ones. If the flags of a file cannot be set at all, borg issues a
+warning and sets the exit code to warning status.
 
 ``--umask``
 ~~~~~~~~~~~
@@ -119,6 +141,18 @@ block devices, like e.g. LVM snapshots or inactive LVs or disk partitions.
 You need to be careful about what you include when using ``--read-special``,
 e.g. if you include ``/dev/zero``, your backup will never terminate.
 
+Reading from a FIFO blocks until a writer connects and sends data - if that
+never happens (e.g. due to a broken producer script), ``borg create`` would
+appear to hang. Thus, when no data arrives from a FIFO or character device
+for ``--read-special-timeout SECONDS`` (default: 1800, i.e. 30 minutes; this
+includes waiting for a FIFO's writer to connect), borg gives up on that file:
+it is skipped with an error and the backup continues with the remaining
+files. Choose a timeout larger than the pauses a legitimate (slow) producer
+makes while sending data - or give 0 to disable the timeout and wait forever.
+Note: with the timeout active, a writer that connects, but closes without
+sending anything, is reported as a timeout, too (instead of storing a file
+with empty content).
+
 Restoring such files' content is currently only supported one at a time via
 ``--stdout`` option (and you have to redirect stdout to where ever it shall go,
 maybe directly into an existing device file of your choice or indirectly via
@@ -132,7 +166,7 @@ scale and perform better if you do not work via the FUSE mount.
 Example
 +++++++
 
-Imagine you have made some snapshots of logical volumes (LVs) you want to backup.
+Imagine you have made some snapshots of logical volumes (LVs) you want to back up.
 
 .. note::
 
@@ -155,18 +189,38 @@ After the backup has completed, you remove the snapshots again.
 
     $ # create snapshots here
     $ lvdisplay > lvdisplay.txt
-    $ borg create --read-special /path/to/repo::arch lvdisplay.txt /dev/vg0/*-snapshot
+    $ borg create --read-special arch lvdisplay.txt /dev/vg0/*-snapshot
     $ # remove snapshots here
 
 Now, let's see how to restore some LVs from such a backup.
 
 ::
 
-    $ borg extract /path/to/repo::arch lvdisplay.txt
+    $ borg extract arch lvdisplay.txt
     $ # create empty LVs with correct sizes here (look into lvdisplay.txt).
     $ # we assume that you created an empty root and home LV and overwrite it now:
-    $ borg extract --stdout /path/to/repo::arch dev/vg0/root-snapshot > /dev/vg0/root
-    $ borg extract --stdout /path/to/repo::arch dev/vg0/home-snapshot > /dev/vg0/home
+    $ borg extract --stdout arch dev/vg0/root-snapshot > /dev/vg0/root
+    $ borg extract --stdout arch dev/vg0/home-snapshot > /dev/vg0/home
+
+Efficient backups of LVM thin volume snapshots
+++++++++++++++++++++++++++++++++++++++++++++++
+
+Backing up a block device as shown above reads the whole device every time.
+For snapshots of LVM *thin* volumes, the thin pool's metadata already knows
+which ranges are allocated and which ranges changed between two snapshots,
+so most of the reading can be skipped: see the ``--map`` and ``--reuse-from``
+options of ``borg create`` (section *Input maps* in ``borg create --help``)
+and the ``scripts/lvm-thin-map.py`` converter in the borg sources, which
+turns ``thin_dump`` / ``thin_delta`` XML into borg input maps. The script's
+docstring shows the complete workflow: an initial full backup using the
+allocation map (unallocated ranges are stored as holes without reading them),
+then incremental backups that only read the ranges that changed since the
+previous snapshot, while reusing the previous archive's chunks for everything
+else. Use ``--chunker-params fixed,4194304`` (or similar) for such backups.
+
+Note that borg trusts these maps - it cannot detect a wrong or stale map, so
+keep the snapshot discipline described in the script's docstring and consider
+doing a periodic full read backup (without ``--map``).
 
 
 .. _separate_compaction:
@@ -174,157 +228,21 @@ Now, let's see how to restore some LVs from such a backup.
 Separate compaction
 ~~~~~~~~~~~~~~~~~~~
 
-Borg does not auto-compact the segment files in the repository at commit time
-(at the end of each repository-writing command) any more.
-
-This is new since borg 1.2.0 and requires borg >= 1.2.0 on client and server.
-
-This causes a similar behaviour of the repository as if it was in append-only
-mode (see below) most of the time (until ``borg compact`` is invoked or an
-old client triggers auto-compaction).
+Borg does not automatically compact the files in the repository when doing
+borg operations.
 
 This has some notable consequences:
 
 - repository space is not freed immediately when deleting / pruning archives
-- commands finish quicker
-- repository is more robust and might be easier to recover after damages (as
-  it contains data in a more sequential manner, historic manifests, multiple
-  commits - until you run ``borg compact``)
+- commands finish quicker, less I/O
+- it is possible to undelete deleted archives as long as no compaction has been
+  invoked.
 - user can choose when to run compaction (it should be done regularly, but not
   necessarily after each single borg command)
-- user can choose from where to invoke ``borg compact`` to do the compaction
-  (from client or from server, it does not need a key)
 - less repo sync data traffic in case you create a copy of your repository by
   using a sync tool (like rsync, rclone, ...)
 
-You can manually run compaction by invoking the ``borg compact`` command.
-
-.. _append_only_mode:
-
-Append-only mode (forbid compaction)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-A repository can be made "append-only", which means that Borg will never
-overwrite or delete committed data (append-only refers to the segment files,
-but borg will also reject to delete the repository completely).
-
-If ``borg compact`` command is used on a repo in append-only mode, there
-will be no warning or error, but no compaction will happen.
-
-append-only is useful for scenarios where a backup client machine backups
-remotely to a backup server using ``borg serve``, since a hacked client machine
-cannot delete backups on the server permanently.
-
-To activate append-only mode, set ``append_only`` to 1 in the repository config:
-
-::
-
-    borg config /path/to/repo append_only 1
-
-Note that you can go back-and-forth between normal and append-only operation with
-``borg config``; it's not a "one way trip."
-
-In append-only mode Borg will create a transaction log in the ``transactions`` file,
-where each line is a transaction and a UTC timestamp.
-
-In addition, ``borg serve`` can act as if a repository is in append-only mode with
-its option ``--append-only``. This can be very useful for fine-tuning access control
-in ``.ssh/authorized_keys``:
-
-::
-
-    command="borg serve --append-only ..." ssh-rsa <key used for not-always-trustable backup clients>
-    command="borg serve ..." ssh-rsa <key used for backup management>
-
-Running ``borg init`` via a ``borg serve --append-only`` server will *not* create
-an append-only repository. Running ``borg init --append-only`` creates an append-only
-repository regardless of server settings.
-
-Example
-+++++++
-
-Suppose an attacker remotely deleted all backups, but your repository was in append-only
-mode. A transaction log in this situation might look like this:
-
-::
-
-    transaction 1, UTC time 2016-03-31T15:53:27.383532
-    transaction 5, UTC time 2016-03-31T15:53:52.588922
-    transaction 11, UTC time 2016-03-31T15:54:23.887256
-    transaction 12, UTC time 2016-03-31T15:55:54.022540
-    transaction 13, UTC time 2016-03-31T15:55:55.472564
-
-From your security logs you conclude the attacker gained access at 15:54:00 and all
-the backups where deleted or replaced by compromised backups. From the log you know
-that transactions 11 and later are compromised. Note that the transaction ID is the
-name of the *last* file in the transaction. For example, transaction 11 spans files 6
-to 11.
-
-In a real attack you'll likely want to keep the compromised repository
-intact to analyze what the attacker tried to achieve. It's also a good idea to make this
-copy just in case something goes wrong during the recovery. Since recovery is done by
-deleting some files, a hard link copy (``cp -al``) is sufficient.
-
-The first step to reset the repository to transaction 5, the last uncompromised transaction,
-is to remove the ``hints.N``, ``index.N`` and ``integrity.N`` files in the repository (these
-files are always expendable). In this example N is 13.
-
-Then remove or move all segment files from the segment directories in ``data/`` starting
-with file 6::
-
-    rm data/**/{6..13}
-
-That's all to do in the repository.
-
-If you want to access this rollbacked repository from a client that already has
-a cache for this repository, the cache will reflect a newer repository state
-than what you actually have in the repository now, after the rollback.
-
-Thus, you need to clear the cache::
-
-    borg delete --cache-only repo
-
-The cache will get rebuilt automatically. Depending on repo size and archive
-count, it may take a while.
-
-You also will need to remove ~/.config/borg/security/REPOID/manifest-timestamp.
-
-Drawbacks
-+++++++++
-
-As data is only appended, and nothing removed, commands like ``prune`` or ``delete``
-won't free disk space, they merely tag data as deleted in a new transaction.
-
-Be aware that as soon as you write to the repo in non-append-only mode (e.g. prune,
-delete or create archives from an admin machine), it will remove the deleted objects
-permanently (including the ones that were already marked as deleted, but not removed,
-in append-only mode). Automated edits to the repository (such as a cron job running
-``borg prune``) will render append-only mode moot if data is deleted.
-
-Even if an archive appears to be available, it is possible an attacker could delete
-just a few chunks from an archive and silently corrupt its data. While in append-only
-mode, this is reversible, but ``borg check`` should be run before a writing/pruning
-operation on an append-only repository to catch accidental or malicious corruption::
-
-    # run without append-only mode
-    borg check --verify-data repo && borg compact repo
-
-Aside from checking repository & archive integrity you may want to also manually check
-backups to ensure their content seems correct.
-
-Further considerations
-++++++++++++++++++++++
-
-Append-only mode is not respected by tools other than Borg. ``rm`` still works on the
-repository. Make sure that backup client machines only get to access the repository via
-``borg serve``.
-
-Ensure that no remote access is possible if the repository is temporarily set to normal mode
-for e.g. regular pruning.
-
-Further protections can be implemented, but are outside of Borg's scope. For example,
-file system snapshots or wrapping ``borg serve`` to set special permissions or ACLs on
-new data files.
+You can run compaction by invoking the ``borg compact`` command.
 
 SSH batch mode
 ~~~~~~~~~~~~~~
@@ -333,3 +251,4 @@ When running Borg using an automated script, ``ssh`` might still ask for a passw
 even if there is an SSH key for the target server. Use this to make scripts more robust::
 
     export BORG_RSH='ssh -oBatchMode=yes'
+

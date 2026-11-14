@@ -14,13 +14,13 @@ systemd and udev.
 Overview
 --------
 
-An udev rule is created to trigger on the addition of block devices. The rule contains a tag
-that triggers systemd to start a oneshot service. The oneshot service executes a script in
+A udev rule is created to trigger on the addition of a filesystem on one of your registered
+backup drives. The rule contains a tag that triggers systemd to start a one-shot service. The one-shot service executes a script in
 the standard systemd service environment, which automatically captures stdout/stderr and
 logs it to the journal.
 
-The script mounts the added block device, if it is a registered backup drive, and creates
-backups on it. When done, it optionally unmounts the file system and spins the drive down,
+The script mounts the added block device if it is a registered backup drive and creates
+backups on it. When done, it optionally unmounts the filesystem and spins the drive down,
 so that it may be physically disconnected.
 
 Configuring the system
@@ -29,26 +29,16 @@ Configuring the system
 First, create the ``/etc/backups`` directory (as root).
 All configuration goes into this directory.
 
-Then, create ``/etc/backups/40-backup.rules`` with the following content (all on one line)::
+Then, create an empty ``/etc/backups/80-backup.rules`` file. It will contain one line per
+backup drive, which you will add when adding backup drives (see below). Each line looks like
+this (all on one line)::
 
-    ACTION=="add", SUBSYSTEM=="bdi", DEVPATH=="/devices/virtual/bdi/*",
-    TAG+="systemd", ENV{SYSTEMD_WANTS}="automatic-backup.service"
+    ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_UUID}=="<filesystem UUID>", TAG+="systemd", ENV{SYSTEMD_WANTS}+="automatic-backup.service"
 
-.. topic:: Finding a more precise udev rule
-
-    If you always connect the drive(s) to the same physical hardware path, e.g. the same
-    eSATA port, then you can make a more precise udev rule.
-
-    Execute ``udevadm monitor`` and connect a drive to the port you intend to use.
-    You should see a flurry of events, find those regarding the `block` subsystem.
-    Pick the event whose device path ends in something similar to a device file name,
-    typically`sdX/sdXY`. Use the event's device path and replace `sdX/sdXY` after the
-    `/block/` part in the path with a star (\*). For example:
-    `DEVPATH=="/devices/pci0000:00/0000:00:11.0/ata3/host2/target2:0:0/2:0:0:0/block/*"`.
-
-    Reboot a few times to ensure that the hardware path does not change: on some motherboards
-    components of it can be random. In these cases you cannot use a more accurate rule,
-    or need to insert additional stars for matching the path.
+The rule matches the filesystem on the backup drive by its UUID, which is the same UUID
+that you will also record in ``/etc/backups/backup.disks``. A single line can also match
+several backup drives, if you separate their UUIDs with ``|``, e.g.
+``ENV{ID_FS_UUID}=="<UUID 1>|<UUID 2>"``.
 
 The "systemd" tag in conjunction with the SYSTEMD_WANTS environment variable has systemd
 launch the "automatic-backup" service, which we will create next, as the
@@ -60,19 +50,14 @@ launch the "automatic-backup" service, which we will create next, as the
     Type=oneshot
     ExecStart=/etc/backups/run.sh
 
-Now, create the main backup script, ``/etc/backups/run.sh``. Below is a template,
-modify it to suit your needs (e.g. more backup sets, dumping databases etc.).
+Now, create the main backup script, ``/etc/backups/run.sh``. Below is a template;
+modify it to suit your needs (e.g., more backup sets, dumping databases, etc.).
 
 .. code-block:: bash
 
     #!/bin/bash -ue
 
-    # The udev rule is not terribly accurate and may trigger our service before
-    # the kernel has finished probing partitions. Sleep for a bit to ensure
-    # the kernel is done.
-    #
-    # This can be avoided by using a more precise udev rule, e.g. matching
-    # a specific hardware path and partition.
+    # Give the system a moment to settle after the backup drive was connected.
     sleep 5
 
     #
@@ -85,7 +70,7 @@ modify it to suit your needs (e.g. more backup sets, dumping databases etc.).
     # This is the location of the Borg repository
     TARGET=$MOUNTPOINT/borg-backups/backup.borg
 
-    # Archive name schema
+    # Timestamp for the log messages below
     DATE=$(date --iso-8601)-$(hostname)
 
     # This is the file that will later contain UUIDs of registered backup drives
@@ -107,10 +92,10 @@ modify it to suit your needs (e.g. more backup sets, dumping databases etc.).
 
     echo "Disk $uuid is a backup disk"
     partition_path=/dev/disk/by-uuid/$uuid
-    # Mount file system if not already done. This assumes that if something is already
-    # mounted at $MOUNTPOINT, it is the backup drive. It won't find the drive if
+    # Mount filesystem if not already done. This assumes that if something is already
+    # mounted at $MOUNTPOINT, it is the backup drive. It will not find the drive if
     # it was mounted somewhere else.
-    (mount | grep $MOUNTPOINT) || mount $partition_path $MOUNTPOINT
+    findmnt $MOUNTPOINT >/dev/null || mount $partition_path $MOUNTPOINT
     drive=$(lsblk --inverse --noheadings --list --paths --output name $partition_path | head --lines 1)
     echo "Drive path: $drive"
 
@@ -119,13 +104,13 @@ modify it to suit your needs (e.g. more backup sets, dumping databases etc.).
     #
 
     # Options for borg create
-    BORG_OPTS="--stats --one-file-system --compression lz4 --checkpoint-interval 86400"
+    BORG_OPTS="--stats --one-file-system --compression lz4"
 
     # Set BORG_PASSPHRASE or BORG_PASSCOMMAND somewhere around here, using export,
     # if encryption is used.
 
-    # No one can answer if Borg asks these questions, it is better to just fail quickly
-    # instead of hanging.
+    # Because no one can answer these questions non-interactively, it is better to
+    # fail quickly instead of hanging.
     export BORG_RELOCATED_REPO_ACCESS_IS_OK=no
     export BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=no
 
@@ -134,19 +119,26 @@ modify it to suit your needs (e.g. more backup sets, dumping databases etc.).
 
     echo "Starting backup for $DATE"
 
-    # This is just an example, change it however you see fit
+    # This is just an example, change it however you see fit.
+    # The archive name is fixed (no date or PID in it): every run adds an
+    # archive to the "system" series, letting Borg's files cache speed up
+    # unchanged files on the next run. Use "borg repo-list" to see each run's
+    # own archive ID and timestamp.
     borg create $BORG_OPTS \
-      --exclude /root/.cache \
-      --exclude /var/lib/docker/devicemapper \
-      $TARGET::$DATE-$$-system \
+      --repo $TARGET \
+      --exclude root/.cache \
+      --exclude var/lib/docker/devicemapper \
+      system \
       / /boot
 
-    # /home is often a separate partition / file system.
-    # Even if it isn't (add --exclude /home above), it probably makes sense
+    # /home is often a separate partition/filesystem.
+    # Even if it is not (add --exclude /home above), it probably makes sense
     # to have /home in a separate archive.
+    # As above, use a fixed archive name so all runs form one "home" series.
     borg create $BORG_OPTS \
-      --exclude 'sh:/home/*/.cache' \
-      $TARGET::$DATE-$$-home \
+      --repo $TARGET \
+      --exclude 'sh:home/*/.cache' \
+      home \
       /home/
 
     echo "Completed backup for $DATE"
@@ -164,21 +156,20 @@ modify it to suit your needs (e.g. more backup sets, dumping databases etc.).
     fi
 
 Create the ``/etc/backups/autoeject`` file to have the script automatically eject the drive
-after creating the backup. Rename the file to something else (e.g. ``/etc/backup/autoeject-no``)
-when you want to do something with the drive after creating backups (e.g running check).
+after creating the backup. Rename the file to something else (e.g., ``/etc/backups/autoeject-no``)
+when you want to do something with the drive after creating backups (e.g., running checks).
 
 Create the ``/etc/backups/backup-suspend`` file if the machine should suspend after completing
-the backup. Don't forget to physically disconnect the device before resuming,
+the backup. Don't forget to disconnect the device physically before resuming,
 otherwise you'll enter a cycle. You can also add an option to power down instead.
 
-Create an empty ``/etc/backups/backup.disks`` file, you'll register your backup drives
-there.
+Create an empty ``/etc/backups/backup.disks`` file, in which you will register your backup drives.
 
-The last part is to actually enable the udev rules and services:
+Finally, enable the udev rules and services:
 
 .. code-block:: bash
 
-    ln -s /etc/backups/40-backup.rules /etc/udev/rules.d/40-backup.rules
+    ln -s /etc/backups/80-backup.rules /etc/udev/rules.d/80-backup.rules
     ln -s /etc/backups/automatic-backup.service /etc/systemd/system/automatic-backup.service
     systemctl daemon-reload
     udevadm control --reload
@@ -187,17 +178,24 @@ Adding backup hard drives
 -------------------------
 
 Connect your backup hard drive. Format it, if not done already.
-Find the UUID of the file system that backups should be stored on::
+Find the UUID of the filesystem on which backups should be stored::
 
     lsblk -o+uuid,label
 
-Note the UUID into the ``/etc/backup/backup.disks`` file.
+Record the UUID in the ``/etc/backups/backup.disks`` file.
 
-Mount the drive to /mnt/backup.
+Add a line for this UUID to ``/etc/backups/80-backup.rules`` (see above), so that connecting
+the drive starts the ``automatic-backup`` service, and reload the udev rules::
 
-Initialize a Borg repository at the location indicated by ``TARGET``::
+    udevadm control --reload
 
-    borg init --encryption ... /mnt/backup/borg-backups/backup.borg
+Every backup drive needs both: its UUID in ``backup.disks`` and a matching udev rule.
+
+Mount the drive at /mnt/backup.
+
+Create a Borg repository at the location indicated by ``TARGET``::
+
+    borg repo-create -r /mnt/backup/borg-backups/backup.borg --encryption ...
 
 Unmount and reconnect the drive, or manually start the ``automatic-backup`` service
 to start the first backup::
@@ -208,17 +206,24 @@ See backup logs using journalctl::
 
     journalctl -fu automatic-backup [-n number-of-lines]
 
+Each run adds one archive to the ``system`` series and one to the ``home``
+series (the archive name is the same on every run; see the script above).
+List the archives, including each one's archive ID and timestamp, using
+``borg repo-list`` (see :ref:`borg_repo-list`)::
+
+    borg repo-list -r /mnt/backup/borg-backups/backup.borg
+
 Security considerations
 -----------------------
 
-The script as shown above will mount any file system with an UUID listed in
-``/etc/backup/backup.disks``. The UUID check is a safety / annoyance-reduction
+The script as shown above will mount any filesystem with a UUID listed in
+``/etc/backups/backup.disks``. The UUID check is a safety/annoyance-reduction
 mechanism to keep the script from blowing up whenever a random USB thumb drive is connected.
-It is not meant as a security mechanism. Mounting file systems and reading repository
-data exposes additional attack surfaces (kernel file system drivers,
-possibly user space services and Borg itself). On the other hand, someone
+It is not meant as a security mechanism. Mounting filesystems and reading repository
+data exposes additional attack surfaces (kernel filesystem drivers,
+possibly userspace services, and Borg itself). On the other hand, someone
 standing right next to your computer can attempt a lot of attacks, most of which
-are easier to do than e.g. exploiting file systems (installing a physical key logger,
+are easier to do than, e.g., exploiting filesystems (installing a physical keylogger,
 DMA attacks, stealing the machine, ...).
 
 Borg ensures that backups are not created on random drives that "just happen"

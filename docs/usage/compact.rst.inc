@@ -6,27 +6,25 @@ borg compact
 ------------
 .. code-block:: none
 
-    borg [common options] compact [options] [REPOSITORY]
+    borg [common options] compact [options]
 
 .. only:: html
 
     .. class:: borg-options-table
 
-    +-------------------------------------------------------+-------------------------+----------------------------------------------------------------+
-    | **positional arguments**                                                                                                                         |
-    +-------------------------------------------------------+-------------------------+----------------------------------------------------------------+
-    |                                                       | ``REPOSITORY``          | repository to compact                                          |
-    +-------------------------------------------------------+-------------------------+----------------------------------------------------------------+
-    | **optional arguments**                                                                                                                           |
-    +-------------------------------------------------------+-------------------------+----------------------------------------------------------------+
-    |                                                       | ``--cleanup-commits``   | cleanup commit-only 17-byte segment files                      |
-    +-------------------------------------------------------+-------------------------+----------------------------------------------------------------+
-    |                                                       | ``--threshold PERCENT`` | set minimum threshold for saved space in PERCENT (Default: 10) |
-    +-------------------------------------------------------+-------------------------+----------------------------------------------------------------+
-    | .. class:: borg-common-opt-ref                                                                                                                   |
-    |                                                                                                                                                  |
-    | :ref:`common_options`                                                                                                                            |
-    +-------------------------------------------------------+-------------------------+----------------------------------------------------------------+
+    +-------------------------------------------------------+-------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | **options**                                                                                                                                                                                                                                             |
+    +-------------------------------------------------------+-------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``-n``, ``--dry-run``   | do not change the repository, just show what compact would free                                                                                                       |
+    +-------------------------------------------------------+-------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``-s``, ``--stats``     | print repository size statistics                                                                                                                                      |
+    +-------------------------------------------------------+-------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--threshold PERCENT`` | rewrite a pack when at least PERCENT of its bytes are unused; also gates whether to compact at all (see the all-packs gate above), 0 disables that gate (default: 10) |
+    +-------------------------------------------------------+-------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | .. class:: borg-common-opt-ref                                                                                                                                                                                                                          |
+    |                                                                                                                                                                                                                                                         |
+    | :ref:`common_options`                                                                                                                                                                                                                                   |
+    +-------------------------------------------------------+-------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 
     .. raw:: html
 
@@ -38,13 +36,12 @@ borg compact
 
 .. only:: latex
 
-    REPOSITORY
-        repository to compact
 
 
-    optional arguments
-        --cleanup-commits       cleanup commit-only 17-byte segment files
-        --threshold PERCENT     set minimum threshold for saved space in PERCENT (Default: 10)
+    options
+        -n, --dry-run    do not change the repository, just show what compact would free
+        -s, --stats     print repository size statistics
+        --threshold PERCENT    rewrite a pack when at least PERCENT of its bytes are unused; also gates whether to compact at all (see the all-packs gate above), 0 disables that gate (default: 10)
 
 
     :ref:`common_options`
@@ -53,24 +50,59 @@ borg compact
 Description
 ~~~~~~~~~~~
 
-This command frees repository space by compacting segments.
+Free repository space by deleting unused chunks.
 
-Use this regularly to avoid running out of space - you do not need to use this
-after each borg command though. It is especially useful after deleting archives,
-because only compaction will really free repository space.
+``borg compact`` analyzes all existing archives to determine which repository
+objects are actually used (referenced). It then deletes all unused objects
+from the repository to free space.
 
-borg compact does not need a key, so it is possible to invoke it from the
-client or also from the server.
+Unused objects may result from:
 
-Depending on the amount of segments that need compaction, it may take a while,
-so consider using the ``--progress`` option.
+- use of ``borg delete`` or ``borg prune``
+- interrupted backups (consider retrying the backup before running compact)
+- backups of source files that encountered an I/O error mid-transfer and were skipped
+- corruption of the repository (e.g., the archives directory lost entries; see notes below)
 
-A segment is compacted if the amount of saved space is above the percentage value
-given by the ``--threshold`` option. If omitted, a threshold of 10% is used.
-When using ``--verbose``, borg will output an estimate of the freed space.
+``borg compact`` reclaims objects the chunk index knows about, plus redundant copies of
+indexed chunks (e.g. written by concurrent backups) that it finds while rewriting a pack.
+Other bytes no index entry covers, such as packs left behind by a backup that crashed
+before recording its objects, are re-indexed by ``borg check --repair`` and reclaimed by
+the next ``borg compact``.
 
-After upgrading borg (server) to 1.2+, you can use ``borg compact --cleanup-commits``
-to clean up the numerous 17byte commit-only segments that borg 1.1 did not clean up
-due to a bug. It is enough to do that once per repository.
+``borg compact`` does not rewrite or merge packs that ``borg check`` recorded as corrupt
+and warns about them. ``borg check --repair --verify-data`` deletes the corrupt chunks by
+rewriting their packs. It does not remove damage outside any chunk (e.g. bytes appended to a
+pack): a pack with such damage and no corrupt chunk stays recorded corrupt and ``borg compact``
+warns about it on every run, a pack that also has a corrupt chunk is rewritten with that damage
+copied into the new pack (refs #10026).
 
-See :ref:`separate_compaction` in Additional Notes for more details.
+You usually do not want to run ``borg compact`` after every write operation, but
+either regularly (e.g., once a month, possibly together with ``borg check``) or
+when disk space needs to be freed.
+
+Compacting anything rewrites the whole chunk index and invalidates every client's
+cached copy of it, so ``borg compact`` only acts when the gain is worth that cost:
+
+- All-packs gate: it drops or rewrites packs only when the space they would free
+  reaches ``--threshold`` divided by 5 percent (2% at the default threshold) of the
+  total pack size. Below that floor it leaves the repository (and the chunk index)
+  untouched. Use ``--threshold 0`` to disable the gate and always compact.
+- Tiny-pack merging: incremental backups tend to leave one small, fully-used pack per
+  run. ``borg compact`` combines such tiny packs into larger ones, but only once their
+  combined size is large enough to fill at least one full-size pack, so a merge always
+  produces a pack that will not be a merge candidate again.
+
+**Important:**
+
+After compacting, it is no longer possible to use ``borg undelete`` to recover
+previously soft-deleted archives.
+
+``borg compact`` might also delete data from archives that were "lost" due to
+archives directory corruption. Such archives could potentially be restored with
+``borg check --find-lost-archives [--repair]``, which is slow. You therefore
+might not want to do that unless there are signs of lost archives (e.g., when
+seeing fatal errors when creating backups or when archives are missing in
+``borg repo-list``).
+
+With ``--stats``, borg additionally reports the on-disk size of the pack files
+before and after compaction (the reported compression factor is based on that size).

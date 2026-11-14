@@ -1,0 +1,72 @@
+.. IMPORTANT: this file is auto-generated from borg's built-in help, do not edit!
+
+.. _borg_repo-delete:
+
+borg repo-delete
+----------------
+.. code-block:: none
+
+    borg [common options] repo-delete [options]
+
+.. only:: html
+
+    .. class:: borg-options-table
+
+    +-------------------------------------------------------+--------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | **options**                                                                                                                                                                                                                                       |
+    +-------------------------------------------------------+--------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``-n``, ``--dry-run``    | do not change the repository                                                                                                                                   |
+    +-------------------------------------------------------+--------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--list``               | output a verbose list of archives                                                                                                                              |
+    +-------------------------------------------------------+--------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--force``              | do not ask for confirmation, just delete the repository. this also works if the repository is damaged to a point where its archives can not be listed anymore. |
+    +-------------------------------------------------------+--------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--cache-only``         | delete only the local cache for the given repository                                                                                                           |
+    +-------------------------------------------------------+--------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--keep-security-info`` | keep the local security info when deleting a repository                                                                                                        |
+    +-------------------------------------------------------+--------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | .. class:: borg-common-opt-ref                                                                                                                                                                                                                    |
+    |                                                                                                                                                                                                                                                   |
+    | :ref:`common_options`                                                                                                                                                                                                                             |
+    +-------------------------------------------------------+--------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------+
+
+    .. raw:: html
+
+        <script type='text/javascript'>
+        $(document).ready(function () {
+            $('.borg-options-table colgroup').remove();
+        })
+        </script>
+
+.. only:: latex
+
+
+
+    options
+        -n, --dry-run     do not change the repository
+        --list            output a verbose list of archives
+        --force           do not ask for confirmation, just delete the repository. this also works if the repository is damaged to a point where its archives can not be listed anymore.
+        --cache-only      delete only the local cache for the given repository
+        --keep-security-info    keep the local security info when deleting a repository
+
+
+    :ref:`common_options`
+        |
+
+Description
+~~~~~~~~~~~
+
+This command deletes a complete repository.
+
+When you delete a complete repository, the security info and local cache for it
+(if any) are also deleted. Alternatively, you can delete just the local cache
+with the ``--cache-only`` option, or keep the security info with the
+``--keep-security-info`` option.
+
+``--force`` also destroys a store that has no repository config, provided it looks
+like a borg store (it has the packs, archives, index and config namespaces).
+
+Deleting a repository needs its key, as locking it needs the key. If the key is lost,
+the repository is useless and has to be deleted with the storage's own tools.
+
+Always first use ``--dry-run --list`` to see what would be deleted.

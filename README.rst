@@ -1,6 +1,19 @@
-|screencast_basic|
+This is borg2!
+--------------
 
-More screencasts: `installation`_, `advanced usage`_
+Please note that this is the README for (unstable) Borg2 / master branch.
+
+For general project infos, versioned docs, screen casts, please see there:
+
+https://www.borgbackup.org/
+
+Borg2 is currently in beta testing and might get major and/or
+breaking changes between beta releases (and there is no beta to
+next-beta upgrade code, so you will have to delete and re-create repos).
+
+Thus, **DO NOT USE BORG2 FOR YOUR PRODUCTION BACKUPS!** Please help with
+testing it, but set it up *additionally* to your production backups.
+
 
 What is BorgBackup?
 -------------------
@@ -8,18 +21,16 @@ What is BorgBackup?
 BorgBackup (short: Borg) is a deduplicating backup program.
 Optionally, it supports compression and authenticated encryption.
 
-The main goal of Borg is to provide an efficient and secure way to backup data.
+The main goal of Borg is to provide an efficient and secure way to back up data.
 The data deduplication technique used makes Borg suitable for daily backups
 since only changes are stored.
-The authenticated encryption technique makes it suitable for backups to not
-fully trusted targets.
+The authenticated encryption technique makes it suitable for backups to targets not
+fully trusted.
 
 See the `installation manual`_ or, if you have already
 downloaded Borg, ``docs/installation.rst`` to get started with Borg.
-There is also an `offline documentation`_ available, in multiple formats.
 
-.. _installation manual: https://borgbackup.readthedocs.org/en/stable/installation.html
-.. _offline documentation: https://readthedocs.org/projects/borgbackup/downloads
+.. _installation manual: https://borgbackup.readthedocs.io/en/master/installation.html
 
 Main features
 ~~~~~~~~~~~~~
@@ -30,8 +41,8 @@ Main features
   and only chunks that have never been seen before are added to the repository.
 
   A chunk is considered duplicate if its id_hash value is identical.
-  A cryptographically strong hash or MAC function is used as id_hash, e.g.
-  (hmac-)sha256.
+  A cryptographically strong hash or MAC function is used as id_hash,
+  e.g. (hmac-)sha256 or (keyed) blake3.
 
   To deduplicate, all the chunks in the same repository are considered, no
   matter whether they come from different machines, from previous backups,
@@ -49,18 +60,34 @@ Main features
   * The absolute position of a data chunk inside a file: Stuff may get shifted
     and will still be found by the deduplication algorithm.
 
+  Supported chunkers:
+
+  * fastcdc (the default)
+  * buzhash64 (improved), buzhash (as in borg 1.x)
+  * toeplitz-aes / rabin-aes / goldilocks-aes (keyed, AES-based; they make
+    chunk-boundary fingerprinting attacks much harder)
+  * fixed (fixed blocksize, optionally with a differently sized header)
+
 **Speed**
   * performance-critical code (chunking, compression, encryption) is
-    implemented in C/Cython
-  * local caching of files/chunks index data
+    implemented in C/Cython, using SIMD (NEON / AVX2 / AVX-512) where that
+    is a win - the scan kernel is picked per platform
+  * local caching
   * quick detection of unmodified files
 
 **Data encryption**
-    All data can be protected using 256-bit AES encryption, data integrity and
-    authenticity is verified using HMAC-SHA256. Data is encrypted clientside.
+    All data can be protected client-side using 256-bit authenticated encryption
+    (AES-OCB or chacha20-poly1305), ensuring data confidentiality, integrity and
+    authenticity.
+
+    If you do not need confidentiality, there are also modes that only
+    authenticate (``authenticated-sha256`` / ``authenticated-blake3``).
+
+**Hashing**
+    You can choose between HMAC-SHA256 and Blake3.
 
 **Obfuscation**
-    Optionally, borg can actively obfuscate e.g. the size of files / chunks to
+    Optionally, Borg can actively obfuscate, e.g., the size of files/chunks to
     make fingerprinting attacks more difficult.
 
 **Compression**
@@ -73,24 +100,36 @@ Main features
     * lzma (low speed, high compression)
 
 **Off-site backups**
-    Borg can store data on any remote host accessible over SSH.  If Borg is
-    installed on the remote host, big performance gains can be achieved
-    compared to using a network filesystem (sshfs, nfs, ...).
+    Borg can store data on any remote host accessible via misc. protocols:
 
-**Backups mountable as filesystems**
-    Backup archives are mountable as userspace filesystems for easy interactive
-    backup examination and restores (e.g. by using a regular file manager).
+    * ``ssh://`` (REST-http-over-stdio-over-ssh) and ``http(s)://``
+      (REST-http-over-tcp). Significant performance gains can be achieved with
+      these by having a remote agent (borg must be installed on the repo server).
+    * ``sftp://``
+    * ``s3://`` / ``b2://``
+    * ``rclone:`` - lots of protocols / providers supported by rclone
+
+**Backups mountable as file systems**
+    Backup archives are mountable as user-space file systems for easy interactive
+    backup examination and restores (e.g., by using a regular file manager).
 
 **Easy installation on multiple platforms**
     We offer single-file binaries that do not require installing anything -
     you can just run them on these platforms:
 
-    * Linux
-    * Mac OS X
-    * FreeBSD
-    * OpenBSD and NetBSD (no xattrs/ACLs support or binaries yet)
-    * Cygwin (experimental, no binaries yet)
-    * Linux Subsystem of Windows 10 (experimental)
+    * Linux (x86_64, arm64)
+    * macOS (arm64, x86_64)
+    * FreeBSD (x86_64)
+    * Windows (x86_64, MSYS2/MINGW borg.exe, experimental)
+
+    Borg also runs on these platforms, but you need to install it from a
+    package or from source:
+
+    * NetBSD (xattrs, but no ACLs)
+    * OpenBSD (no xattrs/ACLs support)
+    * illumos / Solaris (xattrs, but no ACLs)
+    * Cygwin (experimental)
+    * Windows Subsystem for Linux (WSL) on Windows 10/11 (experimental)
 
 **Free and Open Source Software**
   * security and functionality can be audited independently
@@ -100,61 +139,69 @@ Main features
 Easy to use
 ~~~~~~~~~~~
 
-Initialize a new backup repository (see ``borg init --help`` for encryption options)::
+For ease of use, set the BORG_REPO environment variable::
 
-    $ borg init -e repokey /path/to/repo
+    $ export BORG_REPO=/path/to/repo
 
-Create a backup archive::
+Create a new backup repository (see ``borg repo-create --help`` for encryption options)::
 
-    $ borg create /path/to/repo::Saturday1 ~/Documents
+    $ borg repo-create --encryption=aes256-ocb --key-location=repokey
 
-Now doing another backup, just to show off the great deduplication::
+Create a new backup archive::
 
-    $ borg create -v --stats /path/to/repo::Saturday2 ~/Documents
-    -----------------------------------------------------------------------------
-    Archive name: Saturday2
-    Archive fingerprint: 622b7c53c...
-    Time (start): Sat, 2016-02-27 14:48:13
-    Time (end):   Sat, 2016-02-27 14:48:14
-    Duration: 0.88 seconds
-    Number of files: 163
-    -----------------------------------------------------------------------------
-                   Original size      Compressed size    Deduplicated size
-    This archive:        6.85 MB              6.85 MB             30.79 kB  <-- !
-    All archives:       13.69 MB             13.71 MB              6.88 MB
+    $ borg create docs ~/Documents
 
-                   Unique chunks         Total chunks
-    Chunk index:             167                  330
-    -----------------------------------------------------------------------------
+Now do another backup, just to show off the great deduplication::
+
+    $ borg create -v --stats docs ~/Documents
+    Creating archive "docs" in repository /path/to/repo
+    Repository: /path/to/repo
+    Archive name: docs
+    Archive fingerprint: 7714aef97c1a24539cc3dc73f79b060f14af04e2541da33d54c7ee8e81a00089
+    Time (nominal): Mon, 2026-08-03 19:57:35 +0200
+    Time (start):   Mon, 2026-08-03 19:57:35 +0200
+    Time (end):     Mon, 2026-08-03 19:57:35 +0200
+    Duration: 0.01 seconds
+    Number of files: 24
+    Original size: 29.73 MB
+    Deduplicated size: 520 B
+    ...
 
 
-For a graphical frontend refer to our complementary project `BorgWeb <https://borgweb.readthedocs.io/>`_.
+For demo videos, check out our homepage: https://www.borgbackup.org/#demo
 
-Helping, Donations and Bounties, becoming a Patron
+Helping, donations and bounties, becoming a Patron
 --------------------------------------------------
 
 Your help is always welcome!
 
 Spread the word, give feedback, help with documentation, testing or development.
 
-You can also give monetary support to the project, see there for details:
+You can also give monetary support to the project, see here for details:
 
-https://www.borgbackup.org/support/fund.html
+https://www.borgbackup.org/#fund
+
+Thanks to everyone who has helped so far - these are the people with the most
+commits, see `FAME.md <https://github.com/borgbackup/borg/blob/master/FAME.md>`_
+for the full list:
+
+.. image:: https://raw.githubusercontent.com/borgbackup/borg/master/FAME.svg
+   :alt: Borg contributors by commit count
+   :target: https://github.com/borgbackup/borg/blob/master/FAME.md
 
 Links
 -----
 
-* `Main Web Site <https://borgbackup.readthedocs.org/>`_
+* `Main website <https://www.borgbackup.org/>`_
 * `Releases <https://github.com/borgbackup/borg/releases>`_,
-  `PyPI packages <https://pypi.python.org/pypi/borgbackup>`_ and
-  `ChangeLog <https://github.com/borgbackup/borg/blob/master/docs/changes.rst>`_
-* `Offline Documentation <https://readthedocs.org/projects/borgbackup/downloads>`_
+  `PyPI packages <https://pypi.org/project/borgbackup/>`_ and
+  `Changelog <https://github.com/borgbackup/borg/blob/master/docs/changes.rst>`_
 * `GitHub <https://github.com/borgbackup/borg>`_ and
-  `Issue Tracker <https://github.com/borgbackup/borg/issues>`_.
-* `Web-Chat (IRC) <https://webchat.freenode.net/?randomnick=1&channels=%23borgbackup&uio=MTY9dHJ1ZSY5PXRydWUa8>`_ and
-  `Mailing List <https://mail.python.org/mailman/listinfo/borgbackup>`_
-* `License <https://borgbackup.readthedocs.org/en/stable/authors.html#license>`_
-* `Security contact <https://borgbackup.readthedocs.io/en/latest/support.html#security-contact>`_
+  `Issue tracker <https://github.com/borgbackup/borg/issues>`_.
+* `Web chat (IRC) <https://web.libera.chat/#borgbackup>`_ and
+  `Mailing list <https://mail.python.org/mailman/listinfo/borgbackup>`_
+* `License <https://borgbackup.readthedocs.io/en/master/authors.html#license>`_
+* `Security contact <https://borgbackup.readthedocs.io/en/master/support.html#security-contact>`_
 
 Compatibility notes
 -------------------
@@ -164,24 +211,20 @@ CHANGES (like when going from 0.x.y to 1.0.0 or from 1.x.y to 2.0.0).
 
 NOT RELEASED DEVELOPMENT VERSIONS HAVE UNKNOWN COMPATIBILITY PROPERTIES.
 
-THIS IS SOFTWARE IN DEVELOPMENT, DECIDE YOURSELF WHETHER IT FITS YOUR NEEDS.
+THIS IS SOFTWARE IN DEVELOPMENT, DECIDE FOR YOURSELF WHETHER IT FITS YOUR NEEDS.
 
 Security issues should be reported to the `Security contact`_ (or
 see ``docs/support.rst`` in the source distribution).
 
 .. start-badges
 
-|doc| |build| |coverage| |bestpractices| |bounties|
+|doc| |build| |coverage| |bestpractices|
 
-.. |bounties| image:: https://api.bountysource.com/badge/team?team_id=78284&style=bounties_posted
-        :alt: Bounty Source
-        :target: https://www.bountysource.com/teams/borgbackup
-
-.. |doc| image:: https://readthedocs.org/projects/borgbackup/badge/?version=stable
+.. |doc| image:: https://readthedocs.org/projects/borgbackup/badge/?version=master
         :alt: Documentation
-        :target: https://borgbackup.readthedocs.org/en/stable/
+        :target: https://borgbackup.readthedocs.io/en/master/
 
-.. |build| image:: https://github.com/borgbackup/borg/workflows/CI/badge.svg?branch=master
+.. |build| image:: https://github.com/borgbackup/borg/actions/workflows/ci.yml/badge.svg?branch=master
         :alt: Build Status (master)
         :target: https://github.com/borgbackup/borg/actions
 
@@ -189,17 +232,8 @@ see ``docs/support.rst`` in the source distribution).
         :alt: Test Coverage
         :target: https://codecov.io/github/borgbackup/borg?branch=master
 
-.. |screencast_basic| image:: https://asciinema.org/a/133292.png
-        :alt: BorgBackup Basic Usage
-        :target: https://asciinema.org/a/133292?autoplay=1&speed=1
-        :width: 100%
-
-.. _installation: https://asciinema.org/a/133291?autoplay=1&speed=1
-
-.. _advanced usage: https://asciinema.org/a/133293?autoplay=1&speed=1
-
-.. |bestpractices| image:: https://bestpractices.coreinfrastructure.org/projects/271/badge
+.. |bestpractices| image:: https://www.bestpractices.dev/projects/271/badge
         :alt: Best Practices Score
-        :target: https://bestpractices.coreinfrastructure.org/projects/271
+        :target: https://www.bestpractices.dev/projects/271
 
 .. end-badges

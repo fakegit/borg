@@ -1,13 +1,13 @@
-setuptools
-setuptools_scm
-pip
+pip !=24.2
 virtualenv
+build
 tox
-pkgconfig
 pytest
 pytest-xdist
+coverage[toml]
 pytest-cov
 pytest-benchmark
-Cython!=0.27
-twine
-python-dateutil
+pytest-timeout
+pre-commit
+bandit[toml]
+types-PyYAML

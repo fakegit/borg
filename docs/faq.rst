@@ -8,42 +8,48 @@ Frequently asked questions
 Usage & Limitations
 ###################
 
-What is the difference between a repo on an external hard drive vs. repo on a server?
--------------------------------------------------------------------------------------
+What is the difference between a repository on an external hard drive and a repository on a server?
+---------------------------------------------------------------------------------------------------
 
 If Borg is running in client/server mode, the client uses SSH as a transport to
-talk to the remote agent, which is another Borg process (Borg is installed on
-the server, too). The Borg server is doing storage-related low-level repo
-operations (get, put, commit, check, compact), while the Borg client does the
-high-level stuff: deduplication, encryption, compression, dealing with
-archives, backups, restores, etc., which reduces the amount of data that goes
-over the network.
+talk to a remote agent, which is another Borg process (Borg is also installed on
+the server) started automatically by the client. The Borg server performs
+storage-related, low-level repository operations (list, load, and store objects),
+while the Borg client does the high-level stuff: deduplication, encryption,
+compression, dealing with archives, backups, restores, etc., which reduces the
+amount of data that goes over the network.
 
-When Borg is writing to a repo on a locally mounted remote file system, e.g.
-SSHFS, the Borg client only can do file system operations and has no agent
+When Borg is writing to a repo on a locally mounted remote filesystem, e.g.
+SSHFS, the Borg client can only perform filesystem operations and has no agent
 running on the remote side, so *every* operation needs to go over the network,
 which is slower.
 
-Can I backup from multiple servers into a single repository?
-------------------------------------------------------------
+Can I back up from multiple servers into a single repository?
+-------------------------------------------------------------
 
-Yes, this is *possible* from the technical standpoint, but it is
-*not recommended* from the security perspective. BorgBackup is
-built upon a defined :ref:`attack_model` that cannot provide its
-guarantees for multiple clients using the same repository. See
-:ref:`borg_security_critique` for a detailed explanation.
+Yes, you can! Even simultaneously.
 
-Also, in order for the deduplication used by Borg to work, it
-needs to keep a local cache containing checksums of all file
-chunks already stored in the repository. This cache is stored in
-``~/.cache/borg/``.  If Borg detects that a repository has been
-modified since the local cache was updated it will need to rebuild
-the cache. This rebuild can be quite time consuming.
+The clocks of machines sharing a repository should be roughly synchronized
+(e.g. via NTP): repository locks and archive timestamps are based on
+the clients' clocks, so big clock differences between clients can cause
+trouble. Where the storage backend provides object timestamps (file, sftp, s3
+and current rest servers - but not rclone), borg cross-checks lock staleness
+against the storage's clock (so a client with a wrong clock can not break
+another client's healthy lock) and logs a warning when it detects that the
+clocks of concurrently active clients differ by more than a few minutes.
+The storage's own clock does not need to be correct - it is only used as a
+common reference between the clients.
 
-So, yes it's possible. But it will be most efficient if a single
-repository is only modified from one place. Also keep in mind that
-Borg will keep an exclusive lock on the repository while creating
-or deleting archives, which may make *simultaneous* backups fail.
+Concurrent clients rely on the storage listing a newly written lock object
+immediately. If it only does so after a lag (e.g. NFS shared by several clients,
+or some cloud storages used via rclone), set ``BORG_LOCK_RECHECK_DELAY`` on all
+clients, see :ref:`storelocking`.
+
+Can I back up to multiple swapped backup targets?
+--------------------------------------------------
+
+It is possible to swap your backup disks if each backup medium is assigned its
+own repository by creating a new one with :ref:`borg_repo-create`.
 
 Can I copy or synchronize my repo to another location?
 ------------------------------------------------------
@@ -51,72 +57,61 @@ Can I copy or synchronize my repo to another location?
 If you want to have redundant backup repositories (preferably at separate
 locations), the recommended way to do that is like this:
 
-- ``borg init repo1``
-- ``borg init repo2``
+- ``borg -r repo1 repo-create --encryption=aes256-ocb``
+- ``borg -r repo2 repo-create --encryption=aes256-ocb --other-repo=repo1``
+- Optionally, create a snapshot to have stable and identical input data for both borg create runs.
 - client machine ---borg create---> repo1
 - client machine ---borg create---> repo2
 
-This will create distinct repositories (separate repo ID, separate
-keys) and nothing bad happening in repo1 will influence repo2.
+This will create distinct (different repository ID) but related repositories.
+Related means using the same chunker secret and the same id_key, thus producing
+the same chunks / the same chunk IDs if the input data is the same.
 
-Some people decide against above recommendation and create identical
-copies of a repo (using some copy / sync / clone tool).
+The two independent borg create invocations mean there is no error propagation
+from repo1 to repo2 when done like that.
 
-While this might be better than having no redundancy at all, you have
-to be very careful about how you do that and what you may / must not
-do with the result (if you decide against our recommendation).
+An alternative is to use ``borg transfer`` to copy backup archives
+from repo1 to repo2. This is likely a bit more efficient and the archives would be identical,
+but it may suffer from potential error propagation.
+``borg transfer`` is incremental: it only copies the archives (and chunks) that repo2 does not
+have yet, so you can run it repeatedly (e.g. from a cron job) to keep repo2 up to date, see
+:ref:`borg_transfer`.
 
-What you would get with this is:
+Warning: Using Borg with multiple repositories that have identical repository IDs (such as
+creating 1:1 repository copies) is not supported and can lead to various issues,
+for example cache coherency issues, malfunction, or data corruption.
 
-- client machine ---borg create---> repo
-- repo ---copy/sync---> copy-of-repo
+Can I store the data of multiple repositories on disk only once?
+----------------------------------------------------------------
 
-There is no special borg command to do the copying, you could just
-use any reliable tool that creates an identical copy (cp, rsync, rclone
-might be options).
+If you need separate repositories (e.g. one per user, for access control or retention
+reasons), but their backup sources have a lot of data in common, you can make borg store
+byte-identical files for the data they share, so that a CoW filesystem (or an offline dedup
+tool) needs to keep it only once. You need all of:
 
-But think about whether that is really what you want. If something goes
-wrong in repo, you will have the same issue in copy-of-repo.
+- Related repositories, see above: they share the chunker secret and the ``id_key``, so
+  identical input data is cut into identical chunks with identical chunk ids.
+- ``--encryption authenticated-sha256`` (or ``-blake3``) **and**
+  ``borg repo-create --copy-crypt-key``, so that the repositories also share the ``crypt_key``.
+  Only then do they store byte-identical repository objects for identical input. The
+  encrypting modes can not be used for this: they use a random session key, so their objects
+  differ even for identical input.
+- ``BORG_PACK_MAX_COUNT=1`` for every borg run on these repositories. The files in a
+  repository are packs (each batching many objects), not objects, and a pack file only matches
+  if it batched the same objects in the same order. With the default, size-bound packs that
+  stops being true as soon as the repositories' histories diverge - one of them already had a
+  chunk, or backed up something else first - and the packs differ although the objects inside
+  them are identical. One object per pack makes each pack file depend on that single object
+  only.
 
-Make sure you do the copy/sync while no backup is running, see
-:ref:`borg_with-lock` about how to do that.
+The pack files are then the same in both repositories, down to their name below ``packs/``.
+Only the archive metadata objects differ (they contain per-archive data, e.g. timestamps),
+and so do the chunk index fragments and the repository config.
 
-Also, you must not run borg against multiple instances of the same repo
-(like repo and copy-of-repo) as that would create severe issues:
-
-- Data loss: they have the same repository ID, so the borg client will
-  think they are identical and e.g. use the same local cache for them
-  (which is an issue if they happen to be not the same).
-  See :issue:`4272` for an example.
-- Encryption security issues if you would update repo and copy-of-repo
-  independently, due to AES counter reuse.
-
-See also: :ref:`faq_corrupt_repo`
-
-"this is either an attack or unsafe" warning
---------------------------------------------
-
-About the warning:
-
-  Cache, or information obtained from the security directory is newer than
-  repository - this is either an attack or unsafe (multiple repos with same ID)
-
-"unsafe": If not following the advice from the previous section, you can easily
-run into this by yourself by restoring an older copy of your repository.
-
-"attack": maybe an attacker has replaced your repo by an older copy, trying to
-trick you into AES counter reuse, trying to break your repo encryption.
-
-If you'ld decide to ignore this and accept unsafe operation for this repository,
-you could delete the manifest-timestamp and the local cache:
-
-::
-
-  borg config repo id   # shows the REPO_ID
-  rm ~/.config/borg/REPO_ID/manifest-timestamp
-  borg delete --cache-only REPO
-
-This is an unsafe and unsupported way to use borg, you have been warned.
+Be aware of what one object per pack costs: it gives up exactly what pack files are for. The
+repository gets one file per chunk again, so every operation pays one store round trip per
+chunk - slow on high-latency backends and hard on filesystems that dislike huge directories.
+Only do this if the space you save is worth more to you than the speed you lose.
 
 Which file types, attributes, etc. are *not* preserved?
 -------------------------------------------------------
@@ -127,130 +122,179 @@ Which file types, attributes, etc. are *not* preserved?
       misses a UDS!
     * The precise on-disk (or rather: not-on-disk) representation of the holes
       in a sparse file.
-      Archive creation has no special support for sparse files, holes are
-      backed up as (deduplicated and compressed) runs of zero bytes.
-      Archive extraction has optional support to extract all-zero chunks as
-      holes in a sparse file.
+      ``borg create --sparse`` detects the holes and seeks over them instead of
+      reading them, but the archive does not record which ranges were holes:
+      holes are backed up as (deduplicated and compressed) runs of zero bytes,
+      like zero bytes that are stored in the file.
+      ``borg extract --sparse`` creates holes from all-zero chunks, so the
+      extracted file can have holes where the original had stored zero bytes
+      and vice versa.
     * Some filesystem specific attributes, like btrfs NOCOW, see :ref:`platforms`.
-    * For hardlinked symlinks, the hardlinking can not be archived (and thus,
-      the hardlinking will not be done at extraction time). The symlinks will
-      be archived and extracted as non-hardlinked symlinks, see :issue:`2379`.
 
 Are there other known limitations?
 ----------------------------------
 
-- A single archive can only reference a limited volume of file/dir metadata,
-  usually corresponding to tens or hundreds of millions of files/dirs.
-  When trying to go beyond that limit, you will get a fatal IntegrityError
-  exception telling that the (archive) object is too big.
-  An easy workaround is to create multiple archives with fewer items each.
-  See also the :ref:`archive_limitation` and :issue:`1452`.
-
-  :ref:`borg_info` shows how large (relative to the maximum size) existing
-  archives are.
-- borg extract only supports restoring into an empty destination. After that,
-  the destination will exactly have the contents of the extracted archive.
-  If you extract into a non-empty destination, borg will (for example) not
-  remove files which are in the destination, but not in the archive.
+- borg extract supports restoring only into an empty destination. After extraction,
+  the destination will have exactly the contents of the extracted archive.
+  borg refuses to extract into a non-empty destination unless ``--continue`` is
+  given. If you extract into a non-empty destination, borg replaces existing files
+  by the archived files, but it will (for example) not remove files which are in
+  the destination, but not in the archive: the result is a mix of existing and
+  extracted files.
   See :issue:`4598` for a workaround and more details.
 
-.. _checkpoints_parts:
+Why are the extracted files owned by me and not by the original owner?
+----------------------------------------------------------------------
+
+Restoring the owner and group of files requires root privileges (the same is
+true for some other metadata, like device nodes, privileged file flags and
+privileged extended attributes). When you run ``borg extract`` as a normal
+user, the operating system refuses to change the ownership and borg silently
+keeps the extracted files owned by the invoking user - no warning is given.
+For the other kinds of metadata it cannot restore, borg issues warnings.
+``--numeric-ids`` does not change that. To restore all metadata, run
+``borg extract`` as root. See :ref:`borg_extract` for details.
+
+Is Borg recommended for large amounts of data?
+----------------------------------------------
+
+Borg is generally capable of handling large amounts of data. However, there are
+several things to keep in mind for scalability:
+
+- **Large datasets:** Success depends on the number of files, system resources
+  (RAM, CPU), and network performance. For very large datasets, ensure you have
+  enough RAM.
+- **Multiple repositories:** If you have multiple clients or a huge amount of
+  data, it is often better to use one repository per client or per data set.
+  This can improve performance, especially if deduplication across clients or
+  data sets is not a priority.
+- **Archive count:** Avoid having a very large number of archives in a single
+  repository, as some operations (like ``borg check`` or ``borg mount``) may become
+  slow or memory-intensive when they need to read metadata for all archives.
+- **Network filesystems:** For best performance and reliability, run the Borg
+  client on the machine where the source data is local, and the Borg server
+  on the machine where the repository storage is local. Avoid using NFS or
+  other network filesystems for repository storage if possible.
+- **Incremental backups:** Borg always creates a new full archive, but only
+  transfers and stores new/changed chunks.
+
+.. _interrupted_backup:
 
 If a backup stops mid-way, does the already-backed-up data stay there?
 ----------------------------------------------------------------------
 
-Yes, Borg supports resuming backups.
-
-During a backup a special checkpoint archive named ``<archive-name>.checkpoint``
-is saved every checkpoint interval (the default value for this is 30
-minutes) containing all the data backed-up until that point.
-
-This checkpoint archive is a valid archive,
-but it is only a partial backup (not all files that you wanted to backup are
-contained in it). Having it in the repo until a successful, full backup is
-completed is useful because it references all the transmitted chunks up
-to the checkpoint. This means that in case of an interruption, you only need to
-retransfer the data since the last checkpoint.
+Yes, the data transferred into the repo stays there - just avoid running
+``borg compact`` before you completed the backup, because that would remove
+chunks that were already transferred to the repo, but not (yet) referenced
+by an archive.
 
 If a backup was interrupted, you normally do not need to do anything special,
-just invoke ``borg create`` as you always do. If the repository is still locked,
-you may need to run ``borg break-lock`` before the next backup. You may use the
-same archive name as in previous attempt or a different one (e.g. if you always
-include the current datetime), it does not matter.
+just invoke ``borg create`` as you always do. You may use the same archive name
+as in previous attempt or a different one (e.g. if you always include the
+current datetime), it does not matter.
 
 Borg always does full single-pass backups, so it will start again
 from the beginning - but it will be much faster, because some of the data was
-already stored into the repo (and is still referenced by the checkpoint
-archive), so it does not need to get transmitted and stored again.
-
-Once your backup has finished successfully, you can delete all
-``<archive-name>.checkpoint`` archives. If you run ``borg prune``, it will
-also care for deleting unneeded checkpoints.
-
-Note: the checkpointing mechanism creates hidden, partial files in an archive,
-so that checkpoints even work while a big file is being processed.
-They are named ``<filename>.borg_part_<N>`` and all operations usually ignore
-these files, but you can make them considered by giving the option
-``--consider-part-files``. You usually only need that option if you are
-really desperate (e.g. if you have no completed backup of that file and you'ld
-rather get a partial file extracted than nothing). You do **not** want to give
-that option under any normal circumstances.
-
-Note that checkpoints inside files are created only since version 1.1, make
-sure you have an up-to-date version of borgbackup if you want to continue
-instead of retransferring a huge file. In some cases, there is only an outdated
-version shipped with your distribution (e.g. Debian). See :ref:`installation`.
-
-How can I backup huge file(s) over a unstable connection?
----------------------------------------------------------
-
-This is not a problem anymore.
-
-For more details, see :ref:`checkpoints_parts`.
-
-How can I switch append-only mode on and off?
------------------------------------------------------------------------------------------------------------------------------------
-
-You could do that (via borg config REPO append_only 0/1), but using different
-ssh keys and different entries in ``authorized_keys`` is much easier and also
-maybe has less potential of things going wrong somehow.
+already stored into the repo, so it does not need to get transmitted and stored
+again.
 
 
-My machine goes to sleep causing `Broken pipe`
-----------------------------------------------
+How can I back up huge file(s) over an unstable connection?
+-----------------------------------------------------------
 
-When backing up your data over the network, your machine should not go to sleep.
-On macOS you can use `caffeinate` to avoid that.
+Yes. For more details, see :ref:`interrupted_backup`.
 
 How can I restore huge file(s) over an unstable connection?
 -----------------------------------------------------------
 
-If you cannot manage to extract the whole big file in one go, you can extract
-all the part files and manually concatenate them together.
+Try using ``borg mount`` and ``rsync`` (or a similar tool that supports
+resuming a partial file copy from what's already copied).
 
-For more details, see :ref:`checkpoints_parts`.
+My SSH connection breaks during a long borg operation. What now?
+----------------------------------------------------------------
 
-.. _faq_corrupt_repo:
+See the `Vorta documentation <https://docs.borgbase.com/faq/#my-ssh-connection-breaks-after-a-long-backup-or-prune-operation>`_.
 
-My repository is corrupt, how can I restore from an older copy of it?
----------------------------------------------------------------------
+My machine goes to sleep causing `Broken pipe`
+----------------------------------------------
 
-If your repositories are encrypted and have the same ID, the recommended method
-is to delete the corrupted repository, but keep its security info, and then copy
-the working repository to the same location:
+While backing up your data over the network, your machine should not go to sleep.
+On Linux you can use `systemd-inhibit` to avoid that. On macOS you can use `caffeinate`.
+
+``systemd-inhibit borg create ...``
+
+``caffeinate -i borg create ...``
+
+How can I compare contents of an archive to my local filesystem?
+-----------------------------------------------------------------
+
+You can instruct ``export-tar`` to send a tar stream to the stdout, and
+then use ``tar`` to perform the comparison:
 
 ::
 
-    borg delete --keep-security-info /path/to/repo
-    rsync -aH /path/to/repo-working/ /path/to/repo  # Note the trailing slash.
+    borg export-tar archive-name - | tar --compare -f - -C /path/to/compare/to
 
-A plain delete command would remove the security info in
-``~/.config/borg/security``, including the nonce value. In BorgBackup
-:ref:`security_encryption` is AES-CTR, where the nonce is a counter. When the
-working repo was used later for creating new archives, Borg would re-use nonce
-values due to starting from a lower counter value given by the older copy of the
-repository. To prevent this, the ``keep-security-info`` option is applied so
-that the client-side nonce counter is kept.
+Repository filesystem is full. What now?
+----------------------------------------
+
+If your repository filesystem is full (ENOSPC error), don't panic. Borg is
+designed to be robust and usually doesn't corrupt data in this situation.
+
+To fix this, you need to free up some space on that filesystem.
+
+Increasing available space
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- **Delete unrelated files**: If there are other files on the same filesystem
+  (e.g., temporary files, logs), delete them to get some free space.
+- **Reserved space (ext2/3/4)**: On Linux ext-filesystems, some space (usually 5%)
+  is reserved for the root user. If you run borg as a normal user, you might hit
+  this limit while root could still write. You can reduce this reserve to 1% to
+  gain some space for Borg::
+
+    sudo tune2fs -m 1 /dev/sdXN  # Replace with your device
+
+- **Increase filesystem size**: If you're using LVM, cloud volumes, or a virtual
+  disk, increasing the partition and filesystem size is the easiest way.
+- **Move to a larger disk**: Move the entire repository to a larger disk
+  (e.g., using ``rsync -aH /old/repo /new/repo``) and perform the cleanup there.
+
+Freeing space using Borg
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+If you want to free space by deleting Borg archives, keep in mind that
+``borg delete`` and ``borg compact`` need some free space themselves to work,
+as they write new data before deleting old data.
+
+If you have really zero bytes free and ``borg delete`` fails:
+
+1. **Free reserved space**: If you have previously reserved space via
+   ``borg repo-space --reserve``, you can now free it::
+
+    borg repo-space --free
+
+2. **Prune/Delete and Compact**: Now that you have some space, use
+   ``borg prune`` or ``borg delete`` to remove unneeded archives, and
+   **must** run ``borg compact`` to actually free up the space.
+
+How to avoid that it happens again?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- **Reserve space via Borg**: You can reserve space for emergencies by using the
+  ``borg repo-space --reserve`` command. For example, to reserve 2 GB::
+
+    borg repo-space --reserve 2G
+
+- **Emergency space file**: Manually create a large "space reserve" file in the
+  repository filesystem that you can delete if you ever run out of space again.
+  This ensures you have enough room for ``borg delete`` and ``borg compact`` to
+  function::
+
+    dd if=/dev/zero of=/path/to/repo/reserve_file bs=1M count=2048
+
+- **Monitoring**: Set up disk space monitoring and alerts for your backup
+  storage to be notified before it runs out of space.
 
 Can Borg add redundancy to the backup data to deal with hardware malfunction?
 -----------------------------------------------------------------------------
@@ -269,26 +313,38 @@ Can Borg verify data integrity of a backup archive?
 ---------------------------------------------------
 
 Yes, if you want to detect accidental data damage (like bit rot), use the
-``check`` operation. It will notice corruption using CRCs and hashes.
+``check`` operation. It will notice corruption using the authentication tags
+(MACs) and the chunk ID hashes.
 If you want to be able to detect malicious tampering also, use an encrypted
-repo. It will then be able to check using CRCs and HMACs.
+repo. The MACs are keyed then, so an attacker without the key can not cover up
+a modification.
 
-Can I use Borg on SMR hard drives?
-----------------------------------
+Can a previous bad backup spoil future backups?
+-----------------------------------------------
 
-SMR (shingled magnetic recording) hard drives are very different from
-regular hard drives. Applications have to behave in certain ways or
-performance will be heavily degraded.
+In general, no. If a backup was interrupted or failed for some reason, the
+archive is simply never committed, so it does not show up in the repository and
+can not spoil anything. The chunks that were already transferred do stay in the
+repository though, so the next attempt deduplicates against them and is faster
+(until a ``borg compact`` removes the chunks that no archive references).
 
-Borg 1.1 ships with default settings suitable for SMR drives,
-and has been successfully tested on *Seagate Archive v2* drives
-using the ext4 file system.
+However, there is one specific case where a past "bad" backup can affect
+future ones due to how deduplication works:
 
-Some Linux kernel versions between 3.19 and 4.5 had various bugs
-handling device-managed SMR drives, leading to IO errors, unresponsive
-drives and unreliable operation in general.
+If data was corrupted **before** reaching Borg or while being processed by
+Borg (for example, due to a hardware failure like bad RAM), and this
+corrupted data was successfully stored in the repository with a valid
+checksum (MAC), Borg will assume this is the correct data for that chunk ID.
+Any future backup of the same content will then deduplicate against this
+corrupted version.
 
-For more details, refer to :issue:`2252`.
+This is not a Borg-specific issue, but a general property of deduplicating
+storage systems. To avoid or detect such issues, you should:
+
+- Use reliable hardware (ECC RAM is recommended).
+- Periodically run ``borg -r REPO check --verify-data`` to verify that the
+  stored data still matches its checksums. Note that this cannot detect
+  if the data was already "garbage" when it was first stored.
 
 .. _faq-integrityerror:
 
@@ -357,9 +413,7 @@ Checking processors
   operate hardware outside its specifications for productive use.
 
   Tools to verify correct processor operation include Prime95 (mprime), linpack,
-  and the `Intel Processor Diagnostic Tool
-  <https://downloadcenter.intel.com/download/19792/Intel-Processor-Diagnostic-Tool>`_
-  (applies only to Intel processors).
+  and stress-ng.
 
 .. rubric:: Repairing a damaged repository
 
@@ -369,6 +423,37 @@ needs to be ascertained and fixed.
 :ref:`borg_check` provides diagnostics and ``--repair`` options for repositories with
 issues. We recommend to first run without ``--repair`` to assess the situation.
 If the found issues and proposed repairs seem right, re-run "check" with ``--repair`` enabled.
+
+The recommended order of operations is:
+
+1. Run ``borg check`` without ``--repair``. It only reads the repository and reports
+   the extent of the damage: corrupt or missing packs, missing chunks and the files
+   and archives that reference them.
+
+2. Run ``borg check --repair``, preferably after making a copy of the repository.
+
+   At the repository level, it salvages each corrupt pack: the pack is replaced by one
+   holding only the objects whose header, metadata and data still authenticate with
+   the key. It rebuilds the chunk index and removes the index entries of the chunks
+   stored in missing packs.
+
+   At the archive level, it might remove archives whose archive metadata chunk is
+   corrupt or lost, and it reports the files that reference missing chunks.
+
+3. Run another backup of the same data. A file in an archive refers to its content
+   chunks by their ids, so a missing chunk that ``borg create`` stores again makes
+   every archive referencing it complete again at once. A following ``borg check``
+   reports the chunks that are still missing.
+
+4. Chunks that are still missing then belong to data that is permanently lost.
+   ``borg extract`` writes all-zero data in place of such a chunk and reports the
+   affected file with a warning. To get rid of the affected files, remove them from
+   the archives with :ref:`borg_recreate`. Always look at what would be removed first::
+
+       borg -r REPO recreate --dry-run --list --exclude 'path/to/damaged-file'
+
+   If the output is as intended, run the same command without ``--dry-run``.
+   Excluding files only rewrites archive metadata, so this is comparatively fast.
 
 How probable is it to get a hash collision problem?
 ---------------------------------------------------
@@ -386,7 +471,7 @@ Assuming that all your chunks have a size of :math:`2^{21}` bytes (approximately
 and we have a "perfect" hash algorithm, we can think that the probability of collision
 would be of :math:`p^2/2^{n+1}` then, using SHA-256 (:math:`n=256`) and for example
 we have 1000 million chunks (:math:`p=10^9`) (1000 million chunks would be about 2100TB).
-The probability would be around to 0.0000000000000000000000000000000000000000000000000000000000043.
+The probability would be around 0.0000000000000000000000000000000000000000000000000000000000043.
 
 A mass-murderer space rock happens about once every 30 million years on average.
 This leads to a probability of such an event occurring in the next second to about :math:`10^{-15}`.
@@ -394,9 +479,9 @@ That's **45** orders of magnitude more probable than the SHA-256 collision. Brie
 if you find SHA-256 collisions scary then your priorities are wrong. This example was grabbed from
 `this SO answer <https://stackoverflow.com/a/4014407/13359375>`_, it's great honestly.
 
-Still, the real question is if Borg tries to not make this happen?
+Still, the real question is whether Borg tries not to make this happen?
 
-Well... it used to not check anything but there was a feature added which saves the size
+Well... previously it did not check anything until there was a feature added which saves the size
 of the chunks too, so the size of the chunks is compared to the size that you got with the
 hash and if the check says there is a mismatch it will raise an exception instead of corrupting
 the file. This doesn't save us from everything but reduces the chances of corruption.
@@ -408,35 +493,34 @@ Why is the time elapsed in the archive stats different from wall clock time?
 ----------------------------------------------------------------------------
 
 Borg needs to write the time elapsed into the archive metadata before finalizing
-the archive, compacting the segments, and committing the repo & cache. This means
-when Borg is run with e.g. the ``time`` command, the duration shown in the archive
-stats may be shorter than the full time the command runs for.
+the archive and saving the files cache.
+This means when Borg is run with e.g. the ``time`` command, the duration shown
+in the archive stats may be shorter than the full time the command runs for.
 
 How do I configure different prune policies for different directories?
 ----------------------------------------------------------------------
 
 Say you want to prune ``/var/log`` faster than the rest of
-``/``. How do we implement that? The answer is to backup to different
-archive *names* and then implement different prune policies for
-different prefixes. For example, you could have a script that does::
+``/``. How do we implement that? The answer is to back up to different
+archive *series* and then implement different prune policies for the
+different series. For example, you could have a script that does::
 
-    borg create --exclude /var/log $REPOSITORY:main-$(date +%Y-%m-%d) /
-    borg create $REPOSITORY:logs-$(date +%Y-%m-%d) /var/log
+    borg create --exclude var/log main /
+    borg create logs /var/log
 
 Then you would have two different prune calls with different policies::
 
-    borg prune --verbose --list -d 30 --prefix main- "$REPOSITORY"
-    borg prune --verbose --list -d 7  --prefix logs- "$REPOSITORY"
+    borg prune --verbose --list -d 30 main
+    borg prune --verbose --list -d 7  logs
 
-This will keep 7 days of logs and 30 days of everything else. Borg 1.1
-also supports the ``--glob-archives`` parameter.
+This will keep 7 days of logs and 30 days of everything else.
 
 How do I remove files from an existing backup?
 ----------------------------------------------
 
 A file is only removed from a BorgBackup repository if all archives that contain
 the file are deleted and the corresponding data chunks are removed from the
-repository There are two ways how to remove files from a repository.
+repository. There are two ways how to remove files from a repository.
 
 1. Use :ref:`borg_delete` to remove all archives that contain the files. This
 will of course delete everything in the archive, not only some files.
@@ -445,8 +529,7 @@ will of course delete everything in the archive, not only some files.
 :ref:`borg_recreate` command to rewrite all archives with a different
 ``--exclude`` pattern. See the examples in the manpage for more information.
 
-Finally, run :ref:`borg_compact` with the ``--threshold 0`` option to delete the
-data chunks from the repository.
+Finally, run :ref:`borg_compact` to delete the data chunks from the repository.
 
 Can I safely change the compression level or algorithm?
 --------------------------------------------------------
@@ -456,44 +539,129 @@ are calculated *before* compression. New compression settings
 will only be applied to new chunks, not existing chunks. So it's safe
 to change them.
 
+Use ``borg repo-compress`` to efficiently recompress a complete repository.
+
+Which chunker parameters should I use for SQLite databases?
+------------------------------------------------------------
+
+SQLite database files (as used by browsers, mail clients, chat clients and
+many applications) are usually modified in place: only a few pages (4 kiB by
+default) change, but the file itself is rewritten and thus needs to be read
+and chunked again by borg.
+
+With the default chunker parameters (target chunk size ~2 MiB), every changed
+page spoils a whole ~2 MiB chunk, so even tiny changes cost a lot of
+repository space. Using smaller chunks for such files helps::
+
+    borg create --chunker-params=fastcdc,15,19,17,2 ...
+
+This gives a target chunk size of ~128 kiB (minimum 32 kiB, maximum 512 kiB).
+Users reported that this reduces the amount of deduplicated data stored for
+consecutive backups of mostly unchanged SQLite databases a lot. Even smaller
+chunks (e.g. ``--chunker-params=fastcdc,14,18,16,2``, ~64 kiB target) can help
+some more - shift all three size exponents, so the range stays about as narrow.
+
+The price for this is a much larger number of chunks and thus more RAM and
+disk space needed to manage them, see :ref:`cache-memory-usage`. Because
+``--chunker-params`` applies to a whole ``borg create`` run and not to
+individual files, it is usually better to not use fine-grained chunking for
+everything, but to back up the databases in a separate run (excluding them
+from the main run) - or to just accept the resource usage if the data volume
+is small.
+
+See :ref:`chunker-params` for general notes, especially about changing the
+chunker parameters of an existing repository.
+
+Note that borg just copies the file as it is - if the database is written to
+while borg reads it, the backed up file might be inconsistent. Use a SQLite-aware
+method (like ``sqlite3 db.sqlite "VACUUM INTO 'copy.sqlite'"``, note that the
+target file must not exist yet) or a filesystem snapshot if you need a
+guaranteed consistent state.
+
+Why is backing up an unmodified FAT filesystem slow on Linux?
+-------------------------------------------------------------
+
+By default, the files cache used by BorgBackup considers the inode of files.
+When an inode number changes compared to the last backup, it hashes the file
+again. The ``vfat`` kernel driver does not produce stable inode numbers by
+default.  One way to achieve stable inode numbering is mounting the filesystem
+using ``nfs=nostale_ro``. Doing so implies mounting the filesystem read-only.
+Another option is to not consider inode numbers in the files cache by passing
+``--files-cache=ctime,size``.
+
+Why are backups slow on a Linux server that is a member of a Windows domain?
+----------------------------------------------------------------------------
+
+If a Linux server is a member of a Windows domain, username to userid resolution might be
+performed via ``winbind`` without caching, which can slow down backups significantly.
+You can use e.g. ``nscd`` to add caching and improve the speed.
 
 Security
 ########
 
-.. _borg_security_critique:
-
-Isn't BorgBackup's AES-CTR crypto broken?
------------------------------------------
-
-If a nonce (counter) value is reused, AES-CTR mode crypto is broken.
-
-To exploit the AES counter management issue, an attacker would need to have
-access to the borg repository.
-
-By tampering with the repo, the attacker could bring the repo into a state so
-that it reports a lower "highest used counter value" than the one that actually
-was used. The client would usually notice that, because it rather trusts the
-clientside stored "highest used counter value" than trusting the server.
-
-But there are situations, where this is simply not possible:
-
-- If clients A and B used the repo, the client A can only know its own highest
-  CTR value, but not the one produced by B. That is only known to (B and) the
-  server (the repo) and thus the client A needs to trust the server about the
-  value produced by B in that situation. You can't do much about this except
-  not having multiple clients per repo.
-
-- Even if there is only one client, if client-side information is completely
-  lost (e.g. due to disk defect), the client also needs to trust the value from
-  server side. You can avoid this by not continuing to write to the repository
-  after you have lost clientside borg information.
-
 .. _home_config_borg:
 
-How important is the $HOME/.config/borg directory?
---------------------------------------------------
+How important is the borg config directory?
+-------------------------------------------
 
-The Borg config directory has content that you should take care of:
+The borg config directory (``~/.config/borg`` on Linux,
+``~/Library/Application Support/borg`` on macOS,
+``C:\Users\<user>\AppData\Roaming\borg`` on Windows -- see :ref:`env_vars`)
+has content that you should take care of:
+
+``keys`` subdirectory
+  All your borg keyfile keys are stored in this directory. Please note that borg
+  repokey keys are stored inside the repository. In any case, you MUST make sure
+  to have an independent backup of the borg keys, see :ref:`borg_key_export` for
+  more details.
+
+On Windows, the configuration is stored in the *roaming* AppData, so in domain
+environments it follows the user's profile (including onto the profile server).
+
+Make sure that only you have access to the borg config directory.
+
+
+Note about creating multiple keyfile repositories at the same path
+------------------------------------------------------------------
+
+If you create a new keyfile-encrypted repository at the same filesystem
+path multiple times (for example, when a previous repository at that path
+was moved away or unmounted), Borg will not overwrite or reuse an existing
+key file in your keys directory. Instead, each repository gets a key file
+of its own, named after the :ref:`store hash <store_hash>` of the key file's own content --
+the header line naming the repository's ID, followed by the encrypted key
+material. Both the repository ID and the key material are freshly
+randomized when the repository is created, so two repositories, even ones
+created at the same path, always end up with different key file content
+and therefore different names.
+
+This means you may see multiple key files like (example paths for Linux,
+names shortened for readability):
+
+- ~/.config/borg/keys/2385a3af9c1e...b9e114f9c1
+- ~/.config/borg/keys/7b410e8eab35...1c3c9802aa
+- ~/.config/borg/keys/c94fa0d1e2f7...9958a4773b
+
+Each belongs to a distinct repository, wherever it was created -- a name
+collision between different repositories would require an outright
+store hash collision, not just an unlucky path reuse. Borg does not use
+the key file name to find the right key either: to open a repository, it
+scans all files in the keys directory (see :ref:`env_vars` for
+``BORG_KEYS_DIR``) and picks the one whose header names that repository's
+ID. Only byte-for-byte identical key content -- meaning it truly is the
+same key -- would ever produce the same name again; and on repository
+creation, Borg refuses to proceed if that name is already taken, rather
+than silently overwriting it.
+
+.. _home_data_borg:
+
+How important is the borg data directory?
+-----------------------------------------
+
+The borg data directory (``~/.local/share/borg`` on Linux,
+``~/Library/Application Support/borg`` on macOS,
+``C:\Users\<user>\AppData\Local\borg`` on Windows -- see :ref:`env_vars`)
+has content that you should take care of:
 
 ``security`` subdirectory
   Each directory here represents one Borg repository by its ID and contains the last known status.
@@ -502,26 +670,30 @@ The Borg config directory has content that you should take care of:
   or manipulate these files. However, apart from those warnings, a loss of these files can be
   recovered.
 
-``keys`` subdirectory
-  In this directory all your repository keyfiles are stored. You MUST make sure to have an
-  independent backup of these keyfiles, otherwise you cannot access your backups anymore if you lose
-  them. You also MUST keep these files secret; everyone who gains access to your repository and has
-  the corresponding keyfile (and the key passphrase) can extract it.
+On macOS, this resolves to the same directory as the borg config directory,
+so the ``security`` and ``keys`` subdirectories sit next to each other there.
 
-Make sure that only you have access to the Borg config directory.
+Make sure that only you have access to the Borg data directory.
 
 .. _cache_security:
 
 Do I need to take security precautions regarding the cache?
 -----------------------------------------------------------
 
-The cache contains a lot of metadata information about the files in
-your repositories and it is not encrypted.
+The files cache contains a lot of metadata about the files in your backups
+(file sizes, timestamps, the chunk lists of the files and, if you use
+``borg create --digests``, digests of the file contents). It is protected with the
+repository key, like the data in the repository: it is encrypted and authenticated
+(authenticated only in the ``authenticated-*`` modes), so someone who can read the
+cache directory, but does not have the key, can not read it, and a modified files
+cache is detected (borg ignores it with a warning and rebuilds it). The pack cache
+(``BORG_STORE_CACHE``) only holds copies of the encrypted packs of the repository.
 
-However, the assumption is that the cache is being stored on the very
-same system which also contains the original files which are being
-backed up. So someone with access to the cache files would also have
-access the original files anyway.
+What is not protected: the names, sizes and timestamps of the files in the cache
+directory, the repository id (the cache directory is named after it) and the cache
+``config`` file (it only contains the cache version and the repository id). Someone
+who can write to the cache directory can delete files there, which only makes the
+next backup slower.
 
 The Internals section contains more details about :ref:`cache`. If you ever need to move the cache
 to a different location, this can be achieved by using the appropriate :ref:`env_vars`.
@@ -547,13 +719,12 @@ Setting ``BORG_PASSPHRASE``
           user
           <https://security.stackexchange.com/questions/14000/environment-variable-accessibility-in-linux/14009#14009>`_.
 
-Using ``BORG_PASSCOMMAND`` with a properly permissioned file
+Using ``BORG_PASSCOMMAND`` with a file of proper permissions
   Another option is to create a file with a password in it in your home
   directory and use permissions to keep anyone else from reading it. For
   example, first create a key::
 
-    head -c 32 /dev/urandom | base64 -w 0 > ~/.borg-passphrase
-    chmod 400 ~/.borg-passphrase
+    (umask 0077; head -c 32 /dev/urandom | base64 -w 0 > ~/.borg-passphrase)
 
   Then in an automated script one can put::
 
@@ -564,24 +735,34 @@ Using ``BORG_PASSCOMMAND`` with a properly permissioned file
 Using keyfile-based encryption with a blank passphrase
   It is possible to encrypt your repository in ``keyfile`` mode instead of the default
   ``repokey`` mode and use a blank passphrase for the key file (simply press Enter twice
-  when ``borg init`` asks for the password). See :ref:`encrypted_repos`
+  when ``borg repo-create`` asks for the password). See :ref:`encrypted_repos`
   for more details.
 
 Using ``BORG_PASSCOMMAND`` with macOS Keychain
   macOS has a native manager for secrets (such as passphrases) which is safer
   than just using a file as it is encrypted at rest and unlocked manually
-  (fortunately, the login keyring automatically unlocks when you login). With
+  (fortunately, the login keyring automatically unlocks when you log in). With
   the built-in ``security`` command, you can access it from the command line,
   making it useful for ``BORG_PASSCOMMAND``.
 
-  First generate a passphrase and use ``security`` to save it to your login
-  (default) keychain::
+  To store an existing passphrase in your login (default) keychain::
 
-    security add-generic-password -D secret -U -a $USER -s borg-passphrase -w $(head -c 32 /dev/urandom | base64 -w 0)
+    security add-generic-password -a $USER -s borg-passphrase -w YOUR_PASSPHRASE
+
+  Alternatively, to generate a new random passphrase and store it::
+
+    security add-generic-password -a $USER -s borg-passphrase -w $(head -c 32 /dev/urandom | base64 -w 0)
 
   In your backup script retrieve it in the ``BORG_PASSCOMMAND``::
 
     export BORG_PASSCOMMAND="security find-generic-password -a $USER -s borg-passphrase -w"
+
+  .. note::
+    If you run ``borg`` using ``sudo``, you must use the ``-E`` (preserve environment)
+    flag to ensure ``BORG_PASSCOMMAND`` is available and executed as the correct
+    user to access the keychain::
+
+      sudo -E borg create ...
 
 Using ``BORG_PASSCOMMAND`` with GNOME Keyring
   GNOME also has a keyring daemon that can be used to store a Borg passphrase.
@@ -605,7 +786,7 @@ Using ``BORG_PASSCOMMAND`` with GNOME Keyring
 
     export BORG_PASSCOMMAND="secret-tool lookup borg-repository repo-name"
 
-  .. note:: For this to automatically unlock the keychain it must be run
+  .. note:: For this to unlock the keychain automatically it must be run
     in the ``dbus`` session of an unlocked terminal; for example, running a backup
     script as a ``cron`` job might not work unless you also ``export DISPLAY=:0``
     so ``secret-tool`` can pick up your open session. `It gets even more complicated`__
@@ -643,18 +824,17 @@ all your files/dirs data and metadata are stored in their encrypted form
 into the repository.
 
 Yes, as an attacker with access to the remote server could delete (or
-otherwise make unavailable) all your backups.
+otherwise make unavailable) all your backups on that server.
 
 How can I protect against a hacked backup client?
 -------------------------------------------------
 
-Assume you backup your backup client machine C to the backup server S and
+Assume you back up your backup client machine C to the backup server S and
 C gets hacked. In a simple push setup, the attacker could then use borg on
 C to delete all backups residing on S.
 
 These are your options to protect against that:
 
-- Do not allow to permanently delete data from the repo, see :ref:`append_only_mode`.
 - Use a pull-mode setup using ``ssh -R``, see :ref:`pull_backup` for more information.
 - Mount C's filesystem on another machine and then create a backup of it.
 - Do not give C filesystem-level access to S.
@@ -680,7 +860,7 @@ These are your options to protect against that:
 How can I protect against theft, sabotage, lightning, fire, ...?
 ----------------------------------------------------------------
 
-In general: if your only backup medium is nearby the backupped machine and
+In general: if your only backup medium is nearby the backed-up machine and
 always connected, you can easily get into trouble: they likely share the same
 fate if something goes really wrong.
 
@@ -701,31 +881,43 @@ Please disclose security issues responsibly.
 Common issues
 #############
 
-Why does Borg extract hang after some time?
--------------------------------------------
+Command error: ... needed to match precisely one archive, but matched N.
+------------------------------------------------------------------------
 
-When I do a ``borg extract``, after a while all activity stops, no cpu usage,
-no downloads.
+The command wanted one archive to work with. But the parameters you gave either
+didn't match anything or they matched multiple archives.
 
-This may happen when the SSH connection is stuck on server side. You can
-configure SSH on client side to prevent this by sending keep-alive requests,
-for example in ~/.ssh/config:
+See :ref:`archive_specification` about how to refer to an archive.
 
-::
+/path/to/repo is not a valid repository. Check repo config.
+-----------------------------------------------------------
 
-    Host borg.example.com
-        # Client kills connection after 3*30 seconds without server response:
-        ServerAliveInterval 30
-        ServerAliveCountMax 3
+There can be many causes of this error. E.g. you have incorrectly specified the repository path.
 
-You can also do the opposite and configure SSH on server side in
-/etc/ssh/sshd_config, to make the server send keep-alive requests to the client:
+You will also get this error if you try to access a repository with a key that uses the argon2 key algorithm using an old version of borg.
+We recommend upgrading to the latest stable version and trying again. We are sorry. We should have thought about forward
+compatibility and implemented a more helpful error message.
 
-::
+Why am I seeing idle borg serve processes on the repo server?
+-------------------------------------------------------------
 
-    # Server kills connection after 3*30 seconds without client response:
-    ClientAliveInterval 30
-    ClientAliveCountMax 3
+Please see the next question.
+
+Why does Borg disconnect or hang when backing up to a remote server?
+--------------------------------------------------------------------
+
+Communication with the remote server (e.g. using an ``ssh://user@host/path`` repo URL)
+is tunneled through an SSH connection. This can lead to some issues that would not
+occur during a local backup:
+
+- Since Borg does not send data all the time, the connection may get closed, leading
+  to errors like "connection closed by remote".
+- On the other hand, network issues may lead to a dysfunctional connection
+  that is only detected after some time by the server, leading to stale ``borg serve``
+  processes and locked repositories.
+
+To fix such problems, please apply these :ref:`SSH settings <ssh_configuration>` so that
+keep-alive requests are sent regularly.
 
 How can I deal with my very unstable SSH connection?
 ----------------------------------------------------
@@ -733,90 +925,24 @@ How can I deal with my very unstable SSH connection?
 If you have issues with lost connections during long-running borg commands, you
 could try to work around:
 
-- Make partial extracts like ``borg extract REPO PATTERN`` to do multiple
-  smaller extraction runs that complete before your connection has issues.
-- Try using ``borg mount REPO MOUNTPOINT`` and ``rsync -avH`` from
+- Use ``borg extract --continue ARCHIVE`` to continue an interrupted extraction
+  (in the same directory): it skips the files that are fully extracted already.
+- Make partial extracts like ``borg extract --continue ARCHIVE PATTERN`` to do
+  multiple smaller extraction runs that complete before your connection has issues
+  (``--continue`` is needed as soon as the extraction directory is not empty).
+- Try using ``borg mount MOUNTPOINT`` and ``rsync -avH`` from
   ``MOUNTPOINT`` to your desired extraction directory. If the connection breaks
   down, just repeat that over and over again until rsync does not find anything
   to do any more. Due to the way borg mount works, this might be less efficient
   than borg extract for bigger volumes of data.
 
-Why do I get "connection closed by remote" after a while?
----------------------------------------------------------
-
-When doing a backup to a remote server (using a ssh: repo URL), it sometimes
-stops after a while (some minutes, hours, ... - not immediately) with
-"connection closed by remote" error message. Why?
-
-That's a good question and we are trying to find a good answer in :issue:`636`.
-
-Why am I seeing idle borg serve processes on the repo server?
--------------------------------------------------------------
-
-Maybe the ssh connection between client and server broke down and that was not
-yet noticed on the server. Try these settings:
-
-::
-
-    # /etc/ssh/sshd_config on borg repo server - kill connection to client
-    # after ClientAliveCountMax * ClientAliveInterval seconds with no response
-    ClientAliveInterval 20
-    ClientAliveCountMax 3
-
-If you have multiple borg create ... ; borg create ... commands in a already
-serialized way in a single script, you need to give them ``--lock-wait N`` (with N
-being a bit more than the time the server needs to terminate broken down
-connections and release the lock).
-
-.. _disable_archive_chunks:
-
-The borg cache eats way too much disk space, what can I do?
------------------------------------------------------------
-
-This may especially happen if borg needs to rebuild the local "chunks" index -
-either because it was removed, or because it was not coherent with the
-repository state any more (e.g. because another borg instance changed the
-repository).
-
-To optimize this rebuild process, borg caches per-archive information in the
-``chunks.archive.d/`` directory. It won't help the first time it happens, but it
-will make the subsequent rebuilds faster (because it needs to transfer less data
-from the repository). While being faster, the cache needs quite some disk space,
-which might be unwanted.
-
-There is a temporary (but maybe long lived) hack to avoid using lots of disk
-space for chunks.archive.d (see :issue:`235` for details):
-
-::
-
-    # this assumes you are working with the same user as the backup.
-    cd ~/.cache/borg/$(borg config /path/to/repo id)
-    rm -rf chunks.archive.d ; touch chunks.archive.d
-
-This deletes all the cached archive chunk indexes and replaces the directory
-that kept them with a file, so borg won't be able to store anything "in" there
-in future.
-
-This has some pros and cons, though:
-
-- much less disk space needs for ~/.cache/borg.
-- chunk cache resyncs will be slower as it will have to transfer chunk usage
-  metadata for all archives from the repository (which might be slow if your
-  repo connection is slow) and it will also have to build the hashtables from
-  that data.
-  chunk cache resyncs happen e.g. if your repo was written to by another
-  machine (if you share same backup repo between multiple machines) or if
-  your local chunks cache was lost somehow.
-
-The long term plan to improve this is called "borgception", see :issue:`474`.
-
-Can I backup my root partition (/) with Borg?
----------------------------------------------
+Can I back up my root partition (/) with Borg?
+----------------------------------------------
 
 Backing up your entire root partition works just fine, but remember to
-exclude directories that make no sense to backup, such as /dev, /proc,
+exclude directories that make no sense to back up, such as /dev, /proc,
 /sys, /tmp and /run, and to use ``--one-file-system`` if you only want to
-backup the root partition (and not any mounted devices e.g.).
+back up the root partition (and not any mounted devices e.g.).
 
 If it crashes with a UnicodeError, what can I do?
 -------------------------------------------------
@@ -824,6 +950,12 @@ If it crashes with a UnicodeError, what can I do?
 Check if your encoding is set correctly. For most POSIX-like systems, try::
 
   export LANG=en_US.UTF-8  # or similar, important is correct charset
+
+If that does not help:
+
+- check for typos, check if you really used ``export``.
+- check if you have set ``LC_ALL`` - if so, try not setting it.
+- check if you generated the respective locale via ``locale-gen``.
 
 I can't extract non-ascii filenames by giving them on the commandline!?
 -----------------------------------------------------------------------
@@ -842,13 +974,27 @@ If you run into that, try this:
 What's the expected backup performance?
 ---------------------------------------
 
-A first backup will usually be somehow "slow" because there is a lot of data
-to process. Performance here depends on a lot of factors, so it is hard to
-give specific numbers.
+Compared to simply copying files (e.g. with ``rsync``), Borg has more work to do.
+This can make creation of the first archive slower, but saves time
+and disk space on subsequent runs. Here what Borg does when you run ``borg create``:
+
+- Borg chunks the file (using content-defined chunking, which needs to look at every byte)
+- It then computes the "id" of the chunk (hmac-sha256 (slow, except
+  if your CPU has sha256 acceleration) or blake3 (fast, in software))
+- Then it checks whether this chunk is already in the repo (local hashtable lookup,
+  fast). If so, the processing of the chunk is completed here. Otherwise it needs to
+  process the chunk:
+- Compresses (the default lz4 is super fast)
+- Encrypts and authenticates (AES-OCB, usually fast if your CPU has AES acceleration as usual
+  since about 10y, or chacha20-poly1305, fast pure-software crypto)
+- Transmits to repo. If the repo is remote, this usually involves an SSH connection
+  (does its own encryption / authentication).
+- Stores the chunk into a key/value store (the key is the chunk id, the value
+  is the data).
 
 Subsequent backups are usually very fast if most files are unchanged and only
 a few are new or modified. The high performance on unchanged files primarily depends
-only on a few factors (like fs recursion + metadata reading performance and the
+only on a few factors (like FS recursion + metadata reading performance and the
 files cache working as expected) and much less on other factors.
 
 E.g., for this setup:
@@ -866,14 +1012,30 @@ few FAQ entries below.
 
 .. _slow_backup:
 
-Why is backup slow for me?
+Why is my backup so slow?
 --------------------------
 
-So, if you feel your Borg backup is too slow somehow, you should find out why.
+If you feel your Borg backup is too slow somehow, here is what you can do:
 
-The usual way to approach this is to add ``--list --filter=AME --stats`` to your
-``borg create`` call to produce more log output, including a file list (with file status
-characters) and also some statistics at the end of the backup.
+- Make sure Borg has enough RAM (depends on how big your repo is / how many
+  files you have)
+- Use blake3 as chunk id hash when creating the repository (``--id-hash blake3``
+  for the encrypted modes, or one of the ``*-blake3`` modes) except if you
+  positively know your CPU (and openssl) accelerates sha256 (then stay with sha256).
+- Don't use any expensive compression. The default is lz4 and super fast.
+  Uncompressed is often slower than lz4.
+- Just wait. You can also interrupt it and start it again as often as you like,
+  it will converge against a valid "completed" state. It is starting
+  from the beginning each time, but it is still faster then as it does not store
+  data into the repo which it already has there.
+- If you don’t need additional file attributes, you can disable them with ``--noflags``,
+  ``--noacls``, ``--noxattrs``. This can lead to noticeable performance improvements
+  when your backup consists of many small files.
+
+To see what files have changed and take more time processing, you can also add
+``--list --filter=AME --stats`` to your ``borg create`` call to produce more log output,
+including a file list (with file status characters) and also some statistics at
+the end of the backup.
 
 Then you do the backup and look at the log output:
 
@@ -893,8 +1055,26 @@ Then you do the backup and look at the log output:
   The metadata values used in this comparison are determined by the ``--files-cache`` option
   and could be e.g. size, ctime and inode number (see the ``borg create`` docs for more
   details and potential issues).
-  You can use the ``stat`` command on files to manually look at fs metadata to debug if
+  You can use the ``stat`` command on files to look at fs metadata manually to debug if
   there is any unexpected change triggering the ``M`` status.
+  Also, the ``--debug-topic=files_cache`` option of ``borg create`` provides a lot of debug
+  output helping to analyse why the files cache does not give its expected high performance.
+
+When borg runs inside a virtual machine, there are some more things to look at:
+
+Some hypervisors (e.g. kvm on older proxmox) give some broadly compatible CPU type to the
+VM (usually to ease migration between VM hosts of potentially different hardware CPUs).
+
+It is broadly compatible because they leave away modern CPU features that could be
+not present in older or other CPUs, e.g. hardware acceleration for AES crypto, for
+sha2 hashes, for (P)CLMUL(QDQ) computations useful for crc32.
+
+So, basically you pay for compatibility with bad performance. If you prefer better
+performance, you should try to use the x86-64-v2-AES VCPU or the "host" VCPU,
+exposing misc. hw acceleration features to the VM which runs borg.
+
+On Linux, check ``/proc/cpuinfo`` for the CPU flags inside the VM.
+For kvm check the docs about "Host model" and "Host passthrough".
 
 See also the next few FAQ entries for more details.
 
@@ -935,82 +1115,141 @@ already used.
 By default, ctime (change time) is used for the timestamps to have a rather
 safe change detection (see also the --files-cache option).
 
-Furthermore, pathnames recorded in files cache are always absolute, even if you
-specify source directories with relative pathname. If relative pathnames are
-stable, but absolute are not (for example if you mount a filesystem without
-stable mount points for each backup or if you are running the backup from a
-filesystem snapshot whose name is not stable), borg will assume that files are
-different and will report them as 'added', even though no new chunks will be
-actually recorded for them. To avoid this, you could bind mount your source
-directory in a directory with the stable path.
+Furthermore, pathnames used as key into the files cache are **as archived**,
+so make sure these are always the same (see ``borg list``).
 
 .. _always_chunking:
 
 It always chunks all my files, even unchanged ones!
 ---------------------------------------------------
 
-Borg maintains a files cache where it remembers the timestamp, size and
+Borg maintains a files cache where it remembers the timestamps, size and
 inode of files. When Borg does a new backup and starts processing a
 file, it first looks whether the file has changed (compared to the values
 stored in the files cache). If the values are the same, the file is assumed
 unchanged and thus its contents won't get chunked (again).
 
-Borg can't keep an infinite history of files of course, thus entries
-in the files cache have a "maximum time to live" which is set via the
-environment variable BORG_FILES_CACHE_TTL (and defaults to 20).
-Every time you do a backup (on the same machine, using the same user), the
-cache entries' ttl values of files that were not "seen" are incremented by 1
-and if they reach BORG_FILES_CACHE_TTL, the entry is removed from the cache.
+The files cache is stored separately (using a different filename suffix) per
+archive series, thus using always the same name for the archive is strongly
+recommended. The "rebuild files cache from previous archive in repo" feature
+also depends on that.
+Alternatively, there is also BORG_FILES_CACHE_SUFFIX which can be used to
+manually set a custom suffix (if you can't just use the same archive name).
 
-So, for example, if you do daily backups of 26 different data sets A, B,
-C, ..., Z on one machine (using the default TTL), the files from A will be
-already forgotten when you repeat the same backups on the next day and it
-will be slow because it would chunk all the files each time. If you set
-BORG_FILES_CACHE_TTL to at least 26 (or maybe even a small multiple of that),
-it would be much faster.
+Another possible reason is that files don't always have the same path -
+borg uses the paths as seen in the archive when using ``borg list``.
 
-Another possible reason is that files don't always have the same path, for
-example if you mount a filesystem without stable mount points for each backup
-or if you are running the backup from a filesystem snapshot whose name is not
-stable. If the directory where you mount a filesystem is different every time,
-Borg assumes they are different files. This is true even if you backup these
-files with relative pathnames - borg uses full pathnames in files cache regardless.
+It is possible for some filesystems, such as ``mergerfs`` or network filesystems,
+to return inconsistent inode numbers across runs, causing borg to consider them changed.
+A workaround is to set the option ``--files-cache=ctime,size`` to exclude the inode
+number comparison from the files cache check so that files with different inode
+numbers won't be treated as modified.
 
+Using a pure-python msgpack! This will result in lower performance.
+-------------------------------------------------------------------
+
+borg uses `msgpack` to serialize/deserialize data.
+
+`msgpack` has 2 implementations:
+
+- a fast one (C code compiled into a platform specific binary), and
+- a slow pure-python one.
+
+The slow one is used if it can't successfully import the fast one.
+
+If you use the pyinstaller-made borg "fat binary" which we offer on github
+releases, it could be that you downloaded a binary that does not match the
+(g)libc on your system.
+
+Binaries made for an older glibc than the one you have on your system usually
+just work, but the opposite is not necessarily the case and can lead to misc.
+issues - like failing to load the fast msgpack code or not working at all.
+
+So: try a binary made for an older glibc.
+
+If you see this without using a "fat binary" from us, it usually means that
+msgpack is not built / installed correctly. It could be also that the platform
+is not fully supported (so the python code works, but there is no fast binary
+code).
 
 Is there a way to limit bandwidth with Borg?
 --------------------------------------------
 
-To limit upload (i.e. :ref:`borg_create`) bandwidth, use the
-``--remote-ratelimit`` option.
+Borg has no bandwidth limiting option - ``--remote-ratelimit`` and
+``--upload-ratelimit`` were removed. There are 2 ways to do it anyway:
 
-There is no built-in way to limit *download*
-(i.e. :ref:`borg_extract`) bandwidth, but limiting download bandwidth
-can be accomplished with pipeviewer_:
+Using borgstore's bandwidth limit
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Create a wrapper script:  /usr/local/bin/pv-wrapper
+borgstore, which Borg uses for repository access, can limit the transfer rate::
 
-::
+    # 16 Mbit/s == 2 MB/s, 0 (the default) means unlimited:
+    export BORGSTORE_BANDWIDTH=16000000
 
-    #!/bin/sh
+Pros:
+
+- works for all backends (``sftp://``, ``ssh://``, ``rclone:``, ``s3://``, ...).
+- limits both directions.
+- needs no additional software.
+
+Cons:
+
+- the value is given in **bits** per second (easy to confuse with ``pv``, which
+  uses bytes per second).
+- only the object payload is accounted for, protocol overhead (ssh, TLS, http,
+  ...) comes on top, so the real usage is a bit higher than the given rate.
+- it does not shape the traffic: an object is transferred at full speed and
+  Borg then waits until the given rate is reached on average. As Borg transfers
+  rather big objects (pack files are up to 50MB), the connection will be busy
+  for a while and idle afterwards.
+
+There is also ``BORGSTORE_LATENCY`` (in microseconds), which adds a delay per
+backend call.
+
+Using pv on the ssh connection
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For ``ssh://`` repositories, Borg connects via ssh, so the transfer can be
+limited with pipeviewer_. Put a ``pv`` on each side of the connection using an
+ssh ``ProxyCommand`` (this needs ``nc``), e.g. in ``~/.ssh/config``::
+
+    Host borghost
         ## -q, --quiet              do not output any transfer information at all
         ## -L, --rate-limit RATE    limit transfer to RATE bytes per second
-    RATE=307200
-    pv -q -L $RATE  | "$@"
+        ProxyCommand pv -q -L 307200 | nc %h %p | pv -q -L 307200
 
-Add BORG_RSH environment variable to use pipeviewer wrapper script with ssh.
+The first ``pv`` limits the upload, the second one the download, each to RATE
+bytes per second.
 
-::
+Pros:
 
-    export BORG_RSH='/usr/local/bin/pv-wrapper ssh'
+- smoother, as ``pv`` limits the rate of the data stream itself.
+- each direction has its own limit.
+- the ssh protocol overhead is included in the limit.
+- the rate can be changed on the fly::
 
-Now Borg will be bandwidth limited. The nice thing about ``pv`` is that you can
-change rate-limit on the fly:
+      pv -R $(pidof pv) -L 102400
 
-::
+  As the ``ProxyCommand`` above runs 2 ``pv`` processes, ``pidof`` will print 2
+  pids - give ``pv -R`` the pid of the direction you want to change.
 
-    pv -R $(pidof pv) -L 102400
+Cons:
 
-.. _pipeviewer: http://www.ivarch.com/programs/pv.shtml
+- only works for ``ssh://`` repositories. ``sftp://`` does not run an external
+  ssh command (borgstore uses paramiko and creates the connection itself) and
+  a ``ProxyCommand`` in ``~/.ssh/config`` is not used there.
+- needs ``pv`` and ``nc``.
+
+Using rclone's bandwidth limit
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For ``rclone:`` repositories, you can also use rclone's own bandwidth limiting,
+see its ``--bwlimit`` option. rclone picks up options from the environment, so
+you can use::
+
+    export RCLONE_BWLIMIT=300k
+
+.. _pipeviewer: https://www.ivarch.com/programs/pv.shtml
 
 
 How can I avoid unwanted base directories getting stored into archives?
@@ -1018,7 +1257,7 @@ How can I avoid unwanted base directories getting stored into archives?
 
 Possible use cases:
 
-- Another file system is mounted and you want to backup it with original paths.
+- Another file system is mounted and you want to back it up with original paths.
 - You have created a BTRFS snapshot in a ``/.snapshots`` directory for backup.
 
 To achieve this, run ``borg create`` within the mountpoint/snapshot directory:
@@ -1027,7 +1266,13 @@ To achieve this, run ``borg create`` within the mountpoint/snapshot directory:
 
     # Example: Some file system mounted in /mnt/rootfs.
     cd /mnt/rootfs
-    borg create /path/to/repo::rootfs_backup .
+    borg create rootfs_backup .
+
+Another way (without changing the directory) is to use the slashdot hack:
+
+::
+
+    borg create rootfs_backup /mnt/rootfs/./
 
 
 I am having troubles with some network/FUSE/special filesystem, why?
@@ -1108,19 +1353,52 @@ to make it behave correctly::
 .. _workaround: https://unix.stackexchange.com/a/123236
 
 
-Can I disable checking for free disk space?
--------------------------------------------
+How do I rename a repository?
+-----------------------------
 
-In some cases, the free disk space of the target volume is reported incorrectly.
-This can happen for CIFS- or FUSE shares. If you are sure that your target volume
-will always have enough disk space, you can use the following workaround to disable
-checking for free disk space::
+There is nothing special that needs to be done, you can simply rename the
+directory that corresponds to the repository. However, the next time borg
+interacts with the repository (e.g., via ``borg repo-list``), depending on the value
+of ``BORG_RELOCATED_REPO_ACCESS_IS_OK``, borg may warn you that the repository
+has been moved. You will be given a prompt to confirm you are OK with this.
 
-    borg config -- $REPO_LOCATION additional_free_space -2T
+Accessing the same local repository directory via a different path (e.g., via a
+symlink, a bind mount or a different letter case on a case-insensitive filesystem)
+is not considered a relocation, as long as the previous path still exists.
+
+If ``BORG_RELOCATED_REPO_ACCESS_IS_OK`` is unset, borg will interactively ask for
+each repository whether it's OK.
+
+It may be useful to set ``BORG_RELOCATED_REPO_ACCESS_IS_OK=yes`` to avoid the
+prompts when renaming multiple repositories or in a non-interactive context
+such as a script. See :doc:`deployment` for an example.
+
+
+My backup disk is full, what can I do?
+--------------------------------------
+
+Borg cannot work if you really have zero free space on the backup disk, so the
+first thing you must do is deleting some files to regain free disk space. See
+:ref:`about_free_space` for further details.
+
+Some Borg commands that do not change the repository might work under disk-full
+conditions, but generally this should be avoided. If your backup disk is already
+full when Borg starts a write command like `borg create`, it will abort
+immediately and the repository will stay as-is.
 
 
 Miscellaneous
 #############
+
+macOS: borg mounts not shown in Finder's side bar
+-------------------------------------------------
+
+https://github.com/macfuse/macfuse/wiki/Mount-options#local
+
+Read the above first and use this on your own risk::
+
+    borg mount -olocal -r REPO MOUNTPOINT
+
 
 Requirements for the borg single-file binary, esp. (g)libc?
 -----------------------------------------------------------
@@ -1139,112 +1417,3 @@ libraries are actually loaded and used.
 In the borg git repository, there is scripts/glibc_check.py that can determine
 (based on the symbols' versions they want to link to) whether a set of given
 (Linux) binaries works with a given glibc version.
-
-
-Why was Borg forked from Attic?
--------------------------------
-
-Borg was created in May 2015 in response to the difficulty of getting new
-code or larger changes incorporated into Attic and establishing a bigger
-developer community / more open development.
-
-More details can be found in `ticket 217
-<https://github.com/jborg/attic/issues/217>`_ that led to the fork.
-
-Borg intends to be:
-
-* simple:
-
-  * as simple as possible, but no simpler
-  * do the right thing by default, but offer options
-* open:
-
-  * welcome feature requests
-  * accept pull requests of good quality and coding style
-  * give feedback on PRs that can't be accepted "as is"
-  * discuss openly, don't work in the dark
-* changing:
-
-  * Borg is not compatible with Attic
-  * do not break compatibility accidentally, without a good reason
-    or without warning. allow compatibility breaking for other cases.
-  * if major version number changes, it may have incompatible changes
-
-Migrating from Attic
-####################
-
-What are the differences between Attic and Borg?
-------------------------------------------------
-
-Borg is a fork of `Attic`_ and maintained by "`The Borg collective`_".
-
-.. _Attic: https://github.com/jborg/attic
-.. _The Borg collective: https://borgbackup.readthedocs.org/en/latest/authors.html
-
-Here's a (incomplete) list of some major changes:
-
-* lots of attic issues fixed
-  (see `issue #5 <https://github.com/borgbackup/borg/issues/5>`_),
-  including critical data corruption bugs and security issues.
-* more open, faster paced development
-  (see `issue #1 <https://github.com/borgbackup/borg/issues/1>`_)
-* less chunk management overhead (less memory and disk usage for chunks index)
-* faster remote cache resync (useful when backing up multiple machines into same repo)
-* compression: no, lz4, zstd, zlib or lzma compression, adjustable compression levels
-* repokey replaces problematic passphrase mode (you can't change the passphrase
-  nor the pbkdf2 iteration count in "passphrase" mode)
-* simple sparse file support, great for virtual machine disk files
-* can read special files (e.g. block devices) or from stdin, write to stdout
-* rename-based locking is more compatible than attic's posix locking
-* uses fadvise to not spoil / blow up the fs cache
-* better error messages / exception handling
-* better logging, screen output, progress indication
-* tested on misc. Linux systems, 32 and 64bit, FreeBSD, OpenBSD, NetBSD, macOS
-
-Please read the :ref:`changelog` (or ``docs/changes.rst`` in the source distribution) for more
-information.
-
-Borg is not compatible with original Attic (but there is a one-way conversion).
-
-How do I migrate from Attic to Borg?
-------------------------------------
-
-Use :ref:`borg_upgrade`. This is a one-way process that cannot be reversed.
-
-There are some caveats:
-
-- The upgrade can only be performed on local repositories.
-  It cannot be performed on remote repositories.
-
-- If the repository is in "keyfile" encryption mode, the keyfile must
-  exist locally or it must be manually moved after performing the upgrade:
-
-  1. Get the repository ID with ``borg config /path/to/repo id``.
-  2. Locate the attic key file at ``~/.attic/keys/``. The correct key for the
-     repository starts with the line ``ATTIC_KEY <repository id>``.
-  3. Copy the attic key file to ``~/.config/borg/keys/``
-  4. Change the first line from ``ATTIC_KEY ...`` to ``BORG_KEY ...``.
-  5. Verify that the repository is now accessible (e.g. ``borg list <repository>``).
-- Attic and Borg use different :ref:`"chunker params" <chunker-params>`.
-  This means that data added by Borg won't deduplicate with the existing data
-  stored by Attic. The effect is lessened if the files cache is used with Borg.
-- Repositories in "passphrase" mode *must* be migrated to "repokey" mode using
-  :ref:`borg_key_migrate-to-repokey`. Borg does not support the "passphrase" mode
-  any other way.
-
-Why is my backup bigger than with attic?
-----------------------------------------
-
-Attic was rather unflexible when it comes to compression, it always
-compressed using zlib level 6 (no way to switch compression off or
-adjust the level or algorithm).
-
-The default in Borg is lz4, which is fast enough to not use significant CPU time
-in most cases, but can only achieve modest compression. It still compresses
-easily compressed data fairly well.
-
-Borg also offers zstd, zlib and lzma compression, choose wisely.
-
-Which choice is the best option depends on a number of factors, like
-bandwidth to the repository, how well the data compresses, available CPU
-power and so on.

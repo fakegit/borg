@@ -1,12 +1,37 @@
 import os
 
 from libc.stdint cimport uint32_t
+from libc cimport errno
+from posix.time cimport timespec
 
-from .posix import user2uid, group2gid
+from . import posix_ug
+from .base import MountEntry
 from ..helpers import safe_decode, safe_encode
 from .xattr import _listxattr_inner, _getxattr_inner, _setxattr_inner, split_string0
 
-API_VERSION = '1.2_05'
+
+
+cdef extern from *:
+    """
+    #ifdef _DARWIN_FEATURE_64_BIT_INODE
+    #define DARWIN_FEATURE_64_BIT_INODE_DEFINED 1
+    #else
+    #define DARWIN_FEATURE_64_BIT_INODE_DEFINED 0
+    #endif
+    """
+    int DARWIN_FEATURE_64_BIT_INODE_DEFINED
+
+is_darwin_feature_64_bit_inode = DARWIN_FEATURE_64_BIT_INODE_DEFINED != 0
+
+cdef extern from "sys/mount.h":
+    # only the members we use (the header defines the struct; with 64-bit inodes - the default on
+    # current SDKs - getmntinfo maps to getmntinfo$INODE64 on x86_64, the header takes care of that)
+    cdef struct statfs:
+        char f_fstypename[16]  # MFSTYPENAMELEN
+        char f_mntonname[1024]  # MAXPATHLEN
+        char f_mntfromname[1024]  # MAXPATHLEN
+    int getmntinfo(statfs **mntbufp, int mode)
+    int MNT_NOWAIT
 
 cdef extern from "sys/xattr.h":
     ssize_t c_listxattr "listxattr" (const char *path, char *list, size_t size, int flags)
@@ -35,6 +60,14 @@ cdef extern from "sys/acl.h":
     acl_t acl_from_text(const char *buf)
     char *acl_to_text(acl_t acl, ssize_t *len_p)
     int ACL_TYPE_EXTENDED
+
+cdef extern from "sys/stat.h":
+    cdef struct stat:
+        timespec st_birthtimespec
+
+    int c_stat "stat" (const char *path, stat *buf)
+    int c_lstat "lstat" (const char *path, stat *buf)
+    int c_fstat "fstat" (int filedes, stat *buf)
 
 
 def listxattr(path, *, follow_symlinks=False):
@@ -79,17 +112,17 @@ def setxattr(path, name, value, *, follow_symlinks=False):
 
 
 def _remove_numeric_id_if_possible(acl):
-    """Replace the user/group field with the local uid/gid if possible
-    """
+    """Replace the user/group field with the local uid/gid, if possible."""
+    assert isinstance(acl, bytes)
     entries = []
     for entry in safe_decode(acl).split('\n'):
         if entry:
             fields = entry.split(':')
             if fields[0] == 'user':
-                if user2uid(fields[2]) is not None:
+                if posix_ug._user2uid(fields[2]) is not None:
                     fields[1] = fields[3] = ''
             elif fields[0] == 'group':
-                if group2gid(fields[2]) is not None:
+                if posix_ug._group2gid(fields[2]) is not None:
                     fields[1] = fields[3] = ''
             entries.append(':'.join(fields))
     return safe_encode('\n'.join(entries))
@@ -98,6 +131,7 @@ def _remove_numeric_id_if_possible(acl):
 def _remove_non_numeric_identifier(acl):
     """Remove user and group names from the acl
     """
+    assert isinstance(acl, bytes)
     entries = []
     for entry in safe_decode(acl).split('\n'):
         if entry:
@@ -121,10 +155,13 @@ def acl_get(path, item, st, numeric_ids=False, fd=None):
         else:
             acl = acl_get_link_np(path, ACL_TYPE_EXTENDED)
         if acl == NULL:
-            return
+            if errno.errno == errno.ENOENT:
+                # macOS weirdness: if a file has no ACLs, it sets errno to ENOENT. :-(
+                return
+            raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
         text = acl_to_text(acl, NULL)
         if text == NULL:
-            return
+            raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
         if numeric_ids:
             item['acl_extended'] = _remove_non_numeric_identifier(text)
         else:
@@ -139,17 +176,139 @@ def acl_set(path, item, numeric_ids=False, fd=None):
     acl_text = item.get('acl_extended')
     if acl_text is not None:
         try:
+            if isinstance(path, str):
+                path = os.fsencode(path)
             if numeric_ids:
                 acl = acl_from_text(acl_text)
             else:
                 acl = acl_from_text(<bytes>_remove_numeric_id_if_possible(acl_text))
             if acl == NULL:
-                return
-            if isinstance(path, str):
-                path = os.fsencode(path)
+                raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
             if fd is not None:
-                acl_set_fd_np(fd, acl, ACL_TYPE_EXTENDED)
+                if acl_set_fd_np(fd, acl, ACL_TYPE_EXTENDED) == -1:
+                    raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
             else:
-                acl_set_link_np(path, ACL_TYPE_EXTENDED, acl)
+                if acl_set_link_np(path, ACL_TYPE_EXTENDED, acl) == -1:
+                    raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
         finally:
             acl_free(acl)
+
+
+def _get_birthtime_ns(path, follow_symlinks=False):
+    if isinstance(path, str):
+        path = os.fsencode(path)
+    cdef stat stat_info
+    cdef int result
+    if isinstance(path, int):
+        result = c_fstat(path, &stat_info)
+        if result != 0:
+            raise OSError(errno.errno, os.strerror(errno.errno), "<FD %d>" % path)
+    else:
+        if follow_symlinks:
+            result = c_stat(path, &stat_info)
+        else:
+            result = c_lstat(path, &stat_info)
+        if result != 0:
+            raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
+    return stat_info.st_birthtimespec.tv_sec * 1_000_000_000 + stat_info.st_birthtimespec.tv_nsec
+
+
+# macOS flags handling: only modify flags documented as settable; preserve all others, see #9090.
+# The man page states UF_COMPRESSED and SF_DATALESS are internal flags and must not be modified
+# from user space. We therefore only modify flags that are documented to be settable by owner or
+# super-user and preserve everything else (including unknown or future flags).
+
+cdef extern from "sys/stat.h":
+    int chflags(const char *path, uint32_t flags)
+    int lchflags(const char *path, uint32_t flags)
+    int fchflags(int fd, uint32_t flags)
+
+
+# Known-good settable flags from macOS chflags(2). We intentionally do NOT influence
+# internal flags like UF_COMPRESSED and SF_DATALESS.
+# The masks are defined in platform.base and shared by all platforms, see #9039.
+# Same logic as platform.base.set_flags, but uses fchflags(2) when an fd is given
+# (Python has no os.fchflags), so the flags are set on the open file, not via the path.
+from .base import OWNER_SETTABLE_FLAGS_MASK, SETTABLE_FLAGS_MASK
+
+
+def set_flags(path, bsd_flags, fd=None):
+    """Set BSD-style flags on macOS, preserving system-managed read-only flags."""
+    # Determine current flags.
+    try:
+        if fd is not None:
+            st = os.fstat(fd)
+        else:
+            st = os.lstat(path)
+        current = st.st_flags
+    except (OSError, AttributeError):
+        # We can't determine the current flags, so better give up than corrupting anything.
+        return
+
+    cdef uint32_t c_flags
+    mask = SETTABLE_FLAGS_MASK
+    path_bytes = os.fsencode(path)
+    while True:
+        # Replace only the bits we want to influence, keep all others.
+        c_flags = <uint32_t> ((current & ~mask) | (bsd_flags & mask))
+        if fd is not None:
+            result = fchflags(fd, c_flags)
+        else:
+            result = lchflags(path_bytes, c_flags)
+        if result != -1:
+            return
+        err = errno.errno
+        if err == errno.EOPNOTSUPP:
+            return  # some filesystems do not support flags
+        if err == errno.EPERM and mask != OWNER_SETTABLE_FLAGS_MASK:
+            # Not permitted to change super-user-only flags (e.g. not running as root):
+            # retry, influencing only the owner-settable flags.
+            mask = OWNER_SETTABLE_FLAGS_MASK
+            continue
+        raise OSError(err, os.strerror(err), path)
+
+
+import errno as errno_mod
+import fcntl as fcntl_mod
+
+
+def fdatasync(fd):
+    """macOS fdatasync using F_FULLFSYNC for true data durability.
+
+    os.fsync() is an OS-level flush (kernel page cache -> drive write buffer).
+    F_FULLFSYNC additionally issues a HW-level flush (drive write buffer -> persistent storage).
+    Falls back to os.fsync() if F_FULLFSYNC is not supported (e.g. network fs).
+    """
+    try:
+        fcntl_mod.fcntl(fd, fcntl_mod.F_FULLFSYNC)
+    except OSError:
+        # F_FULLFSYNC not supported (e.g. network filesystem), fall back
+        os.fsync(fd)
+
+
+def sync_dir(path):
+    """Sync a directory to persistent storage on macOS using F_FULLFSYNC."""
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        fdatasync(fd)
+    except OSError as os_error:
+        if os_error.errno != errno_mod.EINVAL:
+            raise
+    finally:
+        os.close(fd)
+
+
+def list_mounts():
+    """See platform.base.list_mounts, macOS implementation via getmntinfo(3)."""
+    cdef statfs *mntbuf
+    # getmntinfo points mntbuf to an array (allocated by libc, not to be freed) of count struct statfs.
+    # MNT_NOWAIT: do not ask the file systems for fresh statistics, we only need the names.
+    cdef int count = getmntinfo(&mntbuf, MNT_NOWAIT)
+    if count <= 0:
+        raise OSError(errno.errno, "getmntinfo failed")
+    return [
+        MountEntry(
+            os.fsdecode(mntbuf[i].f_mntfromname), os.fsdecode(mntbuf[i].f_fstypename), os.fsdecode(mntbuf[i].f_mntonname)
+        )
+        for i in range(count)
+    ]

@@ -5,10 +5,9 @@
 Quick Start
 ===========
 
-This chapter will get you started with Borg and covers
-various use cases.
+This chapter will get you started with Borg and covers various use cases.
 
-A step by step example
+A step-by-step example
 ----------------------
 
 .. include:: quickstart_example.rst.inc
@@ -20,77 +19,56 @@ A *Borg archive* is the result of a single backup (``borg create``). An archive
 stores a snapshot of the data of the files "inside" it. One can later extract or
 mount an archive to restore from a backup.
 
-*Repositories* are filesystem directories acting as self-contained stores of archives.
-Repositories can be accessed locally via path or remotely via ssh. Under the hood,
-repositories contain data blocks and a manifest tracking which blocks are in each
-archive. If some data hasn't changed from one backup to another, Borg can simply
-reference an already uploaded data chunk (deduplication).
+*Repositories* are self-contained stores of archives. A repository can be a local
+directory or remote storage (see :ref:`remote_repos`). Under the hood, a repository
+is a plain store of encrypted objects, keyed by object ID: it holds the data chunks,
+the archive metadata (which lists, per file, the IDs of the chunks it consists of)
+and the list of archives. If some data hasn't changed between backups, Borg simply
+references an already-uploaded data chunk (deduplication).
+
+.. _about_free_space:
 
 Important note about free space
 -------------------------------
 
-Before you start creating backups, please make sure that there is *always*
-a good amount of free space on the filesystem that has your backup repository
+Before you start creating backups, ensure that there is *always* plenty
+of free space on the destination filesystem that has your backup repository
 (and also on ~/.cache). A few GB should suffice for most hard-drive sized
 repositories. See also :ref:`cache-memory-usage`.
 
-Borg doesn't use space reserved for root on repository disks (even when run as root),
-on file systems which do not support this mechanism (e.g. XFS) we recommend to reserve
-some space in Borg itself just to be safe by adjusting the ``additional_free_space``
-setting (a good starting point is ``2G``)::
-
-    borg config /path/to/repo additional_free_space 2G
-
-If Borg runs out of disk space, it tries to free as much space as it
-can while aborting the current operation safely, which allows the user to free more space
-by deleting/pruning archives. This mechanism is not bullet-proof in some
-circumstances [1]_.
-
-If you *really* run out of disk space, it can be hard or impossible to free space,
-because Borg needs free space to operate - even to delete backup
-archives.
+If you do run out of disk space, it can be hard or impossible to free space,
+because Borg needs free space to operate - even to delete backup archives.
 
 You can use some monitoring process or just include the free space information
 in your backup log files (you check them regularly anyway, right?).
 
 Also helpful:
 
-- create a big file as a "space reserve", that you can delete to free space
+- use `borg repo-space` to reserve some disk space that can be freed when the filesystem
+  does not have free space any more.
 - if you use LVM: use a LV + a filesystem that you can resize later and have
   some unallocated PEs you can add to the LV.
-- consider using quotas
+- consider using quotas (e.g. fs quota, quota settings of storage provider)
 - use `prune` and `compact` regularly
 
-.. [1] This failsafe can fail in these circumstances:
-
-    - The underlying file system doesn't support statvfs(2), or returns incorrect
-      data, or the repository doesn't reside on a single file system
-    - Other tasks fill the disk simultaneously
-    - Hard quotas (which may not be reflected in statvfs(2))
 
 Important note about permissions
 --------------------------------
 
-Using root likely will be required if you want to backup files of other users
-or the operating system. If you only back up your own files, you neither need
-nor want to use root.
+To avoid permission issues (in your borg repository or borg cache), **always
+access the repository using the same user account**.
 
-Avoid to create a mixup of users and permissions in your repository (or cache).
+If you want to back up files of other users or the operating system, running
+borg as root likely will be required (otherwise you get `Permission denied`
+errors).
+If you only back up your own files, run it as your normal user (i.e. not root).
 
-This can easily happen if you run borg using different user accounts (e.g. your
-non-privileged user and root) while accessing the same repo.
+For a local repository always use the same user to invoke borg.
 
-Of course, a non-root user will have no permission to work with the files
-created by root (or another user) and borg operations will just fail with
-`Permission denied`.
-
-The easy way to avoid this is to always access the repo as the same user:
-
-For a local repository just always invoke borg as same user.
-
-For a remote repository: always use e.g. borg@remote_host. You can use this
-from different local users, the remote user accessing the repo will always be
-borg.
+For a remote repository: always use e.g., ssh://borg@remote_host/path/to/repo
+(Borg connects via ssh and runs ``borg serve --rest`` on the remote). You can use
+this from different local users; the remote user running borg and accessing the
+repo will always be `borg`.
 
 If you need to access a local repository from different users, you can use the
 same method by using ssh to borg@localhost.
@@ -118,18 +96,18 @@ common techniques to achieve this.
 
 - Dump databases or stop the database servers.
 
-- Shut down virtual machines before backing up their images.
+- Shut down virtual machines before backing up their disk image files.
 
 - Shut down containers before backing up their storage volumes.
 
-For some systems Borg might work well enough without these
+For some systems, Borg might work well enough without these
 precautions.  If you are simply backing up the files on a system that
 isn't very active (e.g. in a typical home directory), Borg usually
 works well enough without further care for consistency.  Log files and
 caches might not be in a perfect state, but this is rarely a problem.
 
 For databases, virtual machines, and containers, there are specific
-techniques for backing them up that do not simply use Borg to backup
+techniques for backing them up that do not simply use Borg to back up
 the underlying filesystem.  For databases, check your database
 documentation for techniques that will save the database state between
 transactions.  For virtual machines, consider running the backup on
@@ -141,15 +119,16 @@ Automating backups
 
 The following example script is meant to be run daily by the ``root`` user on
 different local machines. It backs up a machine's important files (but not the
-complete operating system) to a repository ``~/backup/main``  on a remote server.
+complete operating system) to a repository ``~/backup/main`` in the home directory
+of the login user on a remote server.
 Some files which aren't necessarily needed in this backup are excluded. See
 :ref:`borg_patterns` on how to add more exclude options.
 
-After the backup this script also uses the :ref:`borg_prune` subcommand to keep
-only a certain number of old archives and deletes the others.
+After the backup, this script also uses the :ref:`borg_prune` subcommand to keep
+a certain number of old archives and deletes the others.
 
-Finally, it uses the :ref:`borg_compact` subcommand to remove deleted objects
-from the segment files in the repository to preserve disk space.
+Finally, it uses the :ref:`borg_compact` subcommand to free disk space in the
+repository by removing objects that are not referenced by any archive any more.
 
 Before running, make sure that the repository is initialized as documented in
 :ref:`remote_repos` and that the script has the correct permissions to be executable
@@ -158,15 +137,17 @@ by the root user, but not executable or readable by anyone else, i.e. root:root 
 You can use this script as a starting point and modify it where it's necessary to fit
 your setup.
 
-Do not forget to test your created backups to make sure everything you need is being
-backed up and that the ``prune`` command is keeping and deleting the correct backups.
+Do not forget to test your created backups to make sure everything you need is
+backed up and that the ``prune`` command keeps and deletes the correct backups.
 
 ::
 
     #!/bin/sh
 
-    # Setting this, so the repo does not need to be given on the commandline:
-    export BORG_REPO=ssh://username@example.com:2022/~/backup/main
+    # Setting this, so the repo does not need to be given on the commandline.
+    # One slash after the host means: relative to the remote login directory,
+    # so this is ~/backup/main of the remote "username" user:
+    export BORG_REPO=ssh://username@example.com:2022/backup/main
 
     # See the section "Passphrase notes" for more infos.
     export BORG_PASSPHRASE='XYZl0ngandsecurepa_55_phrasea&&123'
@@ -175,10 +156,25 @@ backed up and that the ``prune`` command is keeping and deleting the correct bac
     info() { printf "\n%s %s\n\n" "$( date )" "$*" >&2; }
     trap 'echo $( date ) Backup interrupted >&2; exit 2' INT TERM
 
+    # Classify a borg return code into a severity, so we can report the worst
+    # one at the end. Borg 2 uses specific return codes by default, see the
+    # "Return codes" section of the docs:
+    #   0 == success, 1 and 100..127 == warning,
+    #   2 and 3..99 == error, 128+N == killed by signal N.
+    severity() {
+        if   [ "$1" -eq 0   ]; then echo 0  # success
+        elif [ "$1" -eq 1   ]; then echo 1  # generic warning
+        elif [ "$1" -ge 128 ]; then echo 3  # killed by a signal
+        elif [ "$1" -ge 100 ]; then echo 1  # specific warning
+        else                        echo 2  # error
+        fi
+    }
+
     info "Starting backup"
 
-    # Backup the most important directories into an archive named after
-    # the machine this script is currently running on:
+    # Back up the most important directories into an archive of the
+    # "backup-sys-home" series. The archive name describes the archive content;
+    # borg records the host, user and time of the backup in the archive metadata:
 
     borg create                         \
         --verbose                       \
@@ -188,52 +184,65 @@ backed up and that the ``prune`` command is keeping and deleting the correct bac
         --show-rc                       \
         --compression lz4               \
         --exclude-caches                \
-        --exclude '/home/*/.cache/*'    \
-        --exclude '/var/tmp/*'          \
+        --exclude 'home/*/.cache/*'     \
+        --exclude 'var/tmp/*'           \
                                         \
-        ::'{hostname}-{now}'            \
+        backup-sys-home                 \
         /etc                            \
         /home                           \
         /root                           \
-        /var                            \
+        /var
 
     backup_exit=$?
 
     info "Pruning repository"
 
     # Use the `prune` subcommand to maintain 7 daily, 4 weekly and 6 monthly
-    # archives of THIS machine. The '{hostname}-' prefix is very important to
-    # limit prune's operation to this machine's archives and not apply to
-    # other machines' archives also:
+    # archives of the "backup-sys-home" series. Giving the series name is very
+    # important to limit prune's operation to archives with exactly that name and
+    # not apply to archives with other names also. By default, prune applies the
+    # retention rules separately per archive name and host, so if several machines
+    # back up to the same repository, each machine's archives get their own
+    # retention and do not push out the archives of other machines:
 
-    borg prune                          \
-        --list                          \
-        --prefix '{hostname}-'          \
-        --show-rc                       \
-        --keep-daily    7               \
-        --keep-weekly   4               \
-        --keep-monthly  6               \
+    borg prune               \
+        backup-sys-home      \
+        --list               \
+        --show-rc            \
+        --keep-daily    7    \
+        --keep-weekly   4    \
+        --keep-monthly  6
 
     prune_exit=$?
 
-    # actually free repo disk space by compacting segments
+    # actually free repo disk space by removing unreferenced objects
 
     info "Compacting repository"
 
-    borg compact
+    borg compact -v
 
     compact_exit=$?
 
-    # use highest exit code as global exit code
-    global_exit=$(( backup_exit > prune_exit ? backup_exit : prune_exit ))
-    global_exit=$(( compact_exit > global_exit ? compact_exit : global_exit ))
+    # exit with the return code of the most severe outcome. Note that comparing
+    # the return codes numerically would be wrong: a specific warning (e.g. 107)
+    # is numerically larger, but less severe, than a specific error (e.g. 13).
 
-    if [ ${global_exit} -eq 0 ]; then
+    global_exit=0
+    global_severity=0
+    for rc in ${backup_exit} ${prune_exit} ${compact_exit}; do
+        rc_severity=$( severity ${rc} )
+        if [ ${rc_severity} -gt ${global_severity} ]; then
+            global_severity=${rc_severity}
+            global_exit=${rc}
+        fi
+    done
+
+    if [ ${global_severity} -eq 0 ]; then
         info "Backup, Prune, and Compact finished successfully"
-    elif [ ${global_exit} -eq 1 ]; then
-        info "Backup, Prune, and/or Compact finished with warnings"
+    elif [ ${global_severity} -eq 1 ]; then
+        info "Backup, Prune, and/or Compact finished with warnings (rc ${global_exit})"
     else
-        info "Backup, Prune, and/or Compact finished with errors"
+        info "Backup, Prune, and/or Compact finished with errors (rc ${global_exit})"
     fi
 
     exit ${global_exit}
@@ -242,7 +251,7 @@ Pitfalls with shell variables and environment variables
 -------------------------------------------------------
 
 This applies to all environment variables you want Borg to see, not just
-``BORG_PASSPHRASE``. The short explanation is: always ``export`` your variable,
+``BORG_PASSPHRASE``. TL;DR: always ``export`` your variable,
 and use single quotes if you're unsure of the details of your shell's expansion
 behavior. E.g.::
 
@@ -262,7 +271,7 @@ For more information, refer to the sudo(8) man page and ``env_keep`` in
 the sudoers(5) man page.
 
 .. Tip::
-    To debug what your borg process is actually seeing, find its PID
+    To debug what your borg process sees, find its PID
     (``ps aux|grep borg``) and then look into ``/proc/<PID>/environ``.
 
 .. passphrase_notes:
@@ -270,29 +279,34 @@ the sudoers(5) man page.
 Passphrase notes
 ----------------
 
-If you use encryption (or authentication), Borg will interactively ask you
+If you use encryption (or authentication), Borg will ask you interactively
 for a passphrase to encrypt/decrypt the keyfile / repokey.
 
-A passphrase should be a single line of text, a trailing linefeed will be
+A passphrase should be a single line of text. Any trailing linefeed will be
 stripped.
 
-For your own safety, you maybe want to avoid empty passphrases as well
-extremely long passphrase (much more than 256 bits of entropy).
+Do not use empty passphrases, as these can be trivially guessed, which does not
+leave any encrypted data secure. Borg accepts an empty passphrase nevertheless
+(e.g. for a keyfile-mode repository on a client with an encrypted disk); such a
+repository is still encrypted with a random key and you can add a passphrase
+later with ``borg key change-passphrase``. ``borg repo-info`` shows whether the
+key has an empty passphrase.
 
-Also avoid passphrases containing non-ASCII characters.
-Borg is technically able to process all unicode text, but you might get into
-trouble reproducing the same encoded utf-8 bytes or with keyboard layouts,
-so better just avoid non-ASCII stuff.
+Avoid passphrases containing non-ASCII characters.
+Borg can process any unicode text, but problems may arise at input due to text
+encoding or differing keyboard layouts, so best just avoid non-ASCII stuff.
 
-If you want to automate, you can alternatively supply the passphrase
-directly or indirectly using some environment variables.
+See: https://xkcd.com/936/
 
-You can directly give a passphrase::
+If you want to automate, you can supply the passphrase
+directly or indirectly with the use of environment variables.
+
+Supply a passphrase directly::
 
     # use this passphrase (use safe permissions on the script!):
     export BORG_PASSPHRASE='my super secret passphrase'
 
-Or ask an external program to supply the passphrase::
+Or delegate to an external program to supply the passphrase::
 
     # use the "pass" password manager to get the passphrase:
     export BORG_PASSCOMMAND='pass show backup'
@@ -315,39 +329,40 @@ Backup compression
 ------------------
 
 The default is lz4 (very fast, but low compression ratio), but other methods are
-supported for different situations.
+supported for different situations. Compression not only helps you save disk space,
+but will especially speed up remote backups since less data needs to be transferred.
 
-You can use zstd for a wide range from high speed (and relatively low
-compression) using N=1 to high compression (and lower speed) using N=22.
+zstd is a modern compression algorithm which can be parametrized to anything between
+N=1 for highest speed (and relatively low compression) to N=22 for highest compression
+(and lower speed)::
 
-zstd is a modern compression algorithm and might be preferable over zlib and
-lzma, except if you need compatibility to older borg versions (< 1.1.4) that
-did not yet offer zstd.::
+    $ borg create --compression zstd,N arch ~
 
-    $ borg create --compression zstd,N /path/to/repo::arch ~
+If you have a fast repo storage and you want minimum CPU usage you can disable
+compression::
 
-Other options are:
+    $ borg create --compression none arch ~
 
-If you have a fast repo storage and you want minimum CPU usage, no compression::
+You can also use zlib and lzma instead of zstd, although zstd usually provides
+the best compression for a given resource consumption. Please see :ref:`borg_compression`
+for all options.
 
-    $ borg create --compression none /path/to/repo::arch ~
+An interesting alternative is ``auto``, which first checks with lz4 whether a chunk is
+compressible (that check is very fast), and only if it is, compresses it with the
+specified algorithm::
 
-If you have a less fast repo storage and you want a bit more compression (N=0..9,
-0 means no compression, 9 means high compression):
-
-::
-
-    $ borg create --compression zlib,N /path/to/repo::arch ~
-
-If you have a very slow repo storage and you want high compression (N=0..9, 0 means
-low compression, 9 means high compression):
-
-::
-
-    $ borg create --compression lzma,N /path/to/repo::arch ~
+    $ borg create --compression auto,zstd,7 arch ~
 
 You'll need to experiment a bit to find the best compression for your use case.
 Keep an eye on CPU load and throughput.
+
+Instead of giving ``--compression`` to every command, you can set a default compression
+for the repository when creating it::
+
+    $ borg repo-create --encryption aes256-ocb --compression zstd,3
+
+Commands that compress data use this default when you do not give ``--compression``.
+``borg repo-create --chunker-params`` sets the default chunker parameters in the same way.
 
 .. _encrypted_repos:
 
@@ -356,10 +371,10 @@ Repository encryption
 
 You can choose the repository encryption mode at repository creation time::
 
-    $ borg init --encryption=MODE PATH
+    $ borg repo-create --encryption=MODE
 
 For a list of available encryption MODEs and their descriptions, please refer
-to :ref:`borg_init`.
+to :ref:`borg_repo-create`.
 
 If you use encryption, all data is encrypted on the client before being written
 to the repository.
@@ -380,26 +395,9 @@ For automated backups the passphrase can be specified using the
 .. warning:: The repository data is totally inaccessible without the key
     and the key passphrase.
 
-    Make a backup copy of the key file (``keyfile`` mode) or repo config
-    file (``repokey`` mode) and keep it at a safe place, so you still have
-    the key in case it gets corrupted or lost. Also keep your passphrase
-    at a safe place. You can make backups using :ref:`borg_key_export`
-    subcommand.
+    In any case, make a backup of the borg key, see :ref:`borg_key_export` for
+    more details.
 
-    If you want to print a backup of your key to paper use the ``--paper``
-    option of this command and print the result, or print this `template`_
-    if you need a version with QR-Code.
-
-    A backup inside of the backup that is encrypted with that key/passphrase
-    won't help you with that, of course.
-
-    In case you lose your repository and the security information, but have an
-    older copy of it to restore from, don't use that later for creating new
-    backups – you would run into security issues (reuse of nonce counter
-    values). It is better to initialize a new Borg repository. See also:
-    :ref:`faq_corrupt_repo`
-
-.. _template: paperkey.html
 
 .. _remote_repos:
 
@@ -408,51 +406,71 @@ Remote repositories
 
 Borg can initialize and access repositories on remote hosts if the
 host is accessible using SSH.  This is fastest and easiest when Borg
-is installed on the remote host, in which case the following syntax is used::
+is installed on the remote host, in which case an ``ssh://`` repository URL is
+used. Borg connects via SSH and runs ``borg serve --rest`` on the remote host,
+which serves the repository talking HTTP over stdio::
 
-  $ borg init user@hostname:/path/to/repo
+  $ borg -r ssh://user@hostname:port/path/to/repo repo-create ...
 
-Note: please see the usage chapter for a full documentation of repo URLs.
+Note: Please see the usage chapter for a full documentation of repo URLs. Also
+see :ref:`ssh_configuration` for recommended settings to avoid disconnects and hangs.
 
-Remote operations over SSH can be automated with SSH keys. You can restrict the
-use of the SSH keypair by prepending a forced command to the SSH public key in
-the remote server's `authorized_keys` file. This example will start Borg
-in server mode and limit it to a specific filesystem path::
+.. note::
 
-  command="borg serve --restrict-to-path /path/to/repo",restrict ssh-rsa AAAAB3[...]
+   An ``ssh://`` repository URL is also used to access legacy borg 1.x (v1)
+   repositories on a remote host, e.g. via
+   ``borg transfer --from-borg1 --other-repo ssh://...``. Due to ``--from-borg1``,
+   Borg then talks the legacy borg 1.x protocol to ``borg serve`` on the remote
+   host, which may also be a borg 1.x ``borg serve``.
 
 If it is not possible to install Borg on the remote host,
 it is still possible to use the remote host to store a repository by
 mounting the remote filesystem, for example, using sshfs::
 
   $ sshfs user@hostname:/path/to /path/to
-  $ borg init /path/to/repo
+  $ borg -r /path/to/repo repo-create ...
   $ fusermount -u /path/to
 
 You can also use other remote filesystems in a similar way. Just be careful,
 not all filesystems out there are really stable and working good enough to
 be acceptable for backup usage.
 
+Other kinds of repositories
+---------------------------
+
+Due to using the `borgstore` project, borg also supports other kinds of
+(remote) repositories besides `file:` and `ssh:`:
+
+- sftp: the borg client will directly talk to an sftp server.
+  This does not require borg being installed on the sftp server.
+- rclone: the borg client will talk via rclone to cloud storage.
+- s3 / b2: the borg client will directly talk to S3-compatible object storage
+  (e.g. Amazon S3, Backblaze B2).
+- Others may come in the future, adding backends to `borgstore` is rather simple.
+
+See the "Repository URLs" section in the usage chapter for the URL syntax of
+each of these backends.
 
 Restoring a backup
 ------------------
 
-Please note that we are only describing the most basic commands and options
-here - please refer to the command reference to see more.
+Please note that we describe only the most basic commands and options
+here. Refer to the command reference to see more.
 
-For restoring, you usually want to work **on the same machine as the same user**
-that was also used to create the backups of the wanted files. Doing it like
-that avoids quite some issues:
+To restore, work **on the same machine as the same user**
+that was used to create the backups of the wanted files. Doing so
+avoids issues such as:
 
-- no confusion relating to paths
-- same mapping of user/group names to user/group IDs
-- no permission issues
-- you likely already have a working borg setup there,
+- confusion relating to paths
+- mapping of user/group names to user/group IDs
+- permissions
 
-  - maybe including a environment variable for the key passphrase (for encrypted repos),
-  - maybe including a keyfile for the repo (not needed for repokey mode),
-  - maybe including a ssh key for the repo server (not needed for locally mounted repos),
-  - maybe including a valid borg cache for that repo (quicker than cache rebuild).
+You likely already have a working borg setup there, including perhaps:
+
+  - an environment variable for the key passphrase (for encrypted repos),
+  - a keyfile for the repo (not needed for repokey mode),
+  - a ssh key for the repo server (not needed for locally mounted repos),
+  - a valid borg cache for that repo (quicker than cache rebuild).
 
 The **user** might be:
 
@@ -474,12 +492,12 @@ The **key** can be located:
 - in the repository (**repokey** mode).
 
   Easy, this will usually "just work".
-- in the home directory of the user who did the backup (**keyfile** mode).
+- in the home directory of the user who made the backup (**keyfile** mode).
 
   This may cause a bit more effort:
 
   - if you have just lost that home directory and you first need to restore the
-    borg key (e.g. from the separate backup you have made of it or from another
+    borg key (e.g. from the separate backup you made of it or from another
     user or machine accessing the same repository).
   - if you first must find out the correct machine / user / home directory
     (where the borg client was run to make the backups).
@@ -496,19 +514,19 @@ There are **2 ways to restore** files from a borg backup repository:
 
 - **borg mount** - use this if:
 
-  - you don't precisely know what files you want to restore
+  - you don't know exactly which files you want to restore
   - you don't know which archive contains the files (in the state) you want
   - you need to look into files / directories before deciding what you want
   - you need a relatively low volume of data restored
-  - you don't care for restoring stuff that the FUSE mount is not implementing yet
+  - you don't care for restoring stuff that FUSE mount does not implement yet
     (like special fs flags, ACLs)
-  - you have a client with good resources (RAM, CPU, temp. disk space)
-  - you want to rather use some filemanager to restore (copy) files than borg
+  - you have a client with good resources (RAM, CPU, temporary disk space)
+  - you would rather use some filemanager to restore (copy) files than borg
     extract shell commands
 
 - **borg extract** - use this if:
 
-  - you precisely know what you want (repo, archive, path)
+  - you know precisely what you want (repo, archive, path)
   - you need a high volume of files restored (best speed)
   - you want a as-complete-as-it-gets reproduction of file metadata
     (like special fs flags, ACLs)
@@ -521,14 +539,14 @@ Example with **borg mount**:
 
     # open a new, separate terminal (this terminal will be blocked until umount)
 
-    # now we find out the archive names we have in the repo:
-    borg list /mnt/backup/borg_repo
+    # now we find out the archive ID of the archive we want to mount:
+    borg repo-list
 
-    # mount one archive from a borg repo:
-    borg mount /mnt/backup/borg_repo::myserver-system-2019-08-11 /mnt/borg
+    # mount one archive giving its archive ID prefix:
+    borg mount -a aid:d34db33f /mnt/borg
 
     # alternatively, mount all archives from a borg repo (slower):
-    borg mount /mnt/backup/borg_repo /mnt/borg
+    borg mount /mnt/borg
 
     # it may take a while until you will see stuff in /mnt/borg.
 
@@ -541,23 +559,25 @@ Example with **borg extract**:
 
 ::
 
-    # borg extract always extracts into current directory and that directory
-    # should be empty (borg does not support transforming a non-empty dir to
-    # the state as present in your backup archive).
+    # borg extract always extracts into the current directory and that directory
+    # must be empty: extracting into a non-empty directory replaces existing files
+    # and results in a mix of existing and extracted files, so borg refuses to do
+    # that unless --continue is given (and borg does not support transforming a
+    # non-empty dir to the state as present in your backup archive).
     mkdir borg_restore
     cd borg_restore
 
-    # now we find out the archive names we have in the repo:
-    borg list /mnt/backup/borg_repo
+    # now we find out the archive ID of the archive we want to extract:
+    borg repo-list
 
-    # we could find out the archive contents, esp. the path layout:
-    borg list /mnt/backup/borg_repo::myserver-system-2019-08-11
+    # find out how the paths stored in the archive look like:
+    borg list aid:d34db33f
 
     # we extract only some specific path (note: no leading / !):
-    borg extract /mnt/backup/borg_repo::myserver-system-2019-08-11 path/to/extract
+    borg extract aid:d34db33f path/to/extract
 
     # alternatively, we could fully extract the archive:
-    borg extract /mnt/backup/borg_repo::myserver-system-2019-08-11
+    borg extract aid:d34db33f
 
     # now move the files to the correct place...
 
@@ -565,7 +585,8 @@ Example with **borg extract**:
 Difference when using a **remote borg backup server**:
 
 It is basically all the same as with the local repository, but you need to
-refer to the repo using a ``ssh://`` URL.
+refer to the repo using an ``ssh://`` URL (Borg connects via ssh and runs
+``borg serve --rest`` on the remote host).
 
 In the given example, ``borg`` is the user name used to log into the machine
 ``backup.example.org`` which runs ssh on port ``2222`` and has the borg repo
@@ -579,6 +600,6 @@ case if unattended, automated backups were done).
 
 ::
 
-    borg mount ssh://borg@backup.example.org:2222/path/to/repo /mnt/borg
+    borg -r ssh://borg@backup.example.org:2222/path/to/repo mount /mnt/borg
     # or
-    borg extract ssh://borg@backup.example.org:2222/path/to/repo
+    borg -r ssh://borg@backup.example.org:2222/path/to/repo extract archive

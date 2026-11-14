@@ -1,1637 +1,3010 @@
-import errno
-import mmap
+import io
+import configparser
 import os
-import shutil
-import stat
-import struct
+import re
+import sys
+import threading
 import time
-from binascii import hexlify, unhexlify
-from collections import defaultdict
-from configparser import ConfigParser
-from datetime import datetime
-from functools import partial
-from itertools import islice
+from collections import defaultdict, namedtuple
+from pathlib import Path
+
+from borghash import HashTableNT
+
+from borgstore.store import Store
+from borgstore.backends.rest import REST, ssh_cmd
+from borgstore.store import ObjectNotFound as StoreObjectNotFound, ReadRangeError
+from borgstore.backends.errors import BackendError as StoreBackendError
+from borgstore.backends.errors import BackendConnectionError as StoreBackendConnectionError
+from borgstore.backends.errors import BackendDoesNotExist as StoreBackendDoesNotExist
+from borgstore.backends.errors import BackendAlreadyExists as StoreBackendAlreadyExists
+from borgstore.backends.errors import PermissionDenied as StorePermissionDenied
 
 from .constants import *  # NOQA
-from .hashindex import NSIndex
-from .helpers import Error, ErrorWithTraceback, IntegrityError, format_file_size, parse_file_size
+from .hashindex import ChunkIndex, ChunkIndexEntry
+from .helpers import Error, ErrorWithTraceback, IntegrityError
 from .helpers import Location
+from .helpers import bin_to_hex, hex_to_bin
+from .helpers import get_cache_dir
+from .helpers import replace_placeholders
+from .helpers import sig_int
 from .helpers import ProgressIndicatorPercent
-from .helpers import bin_to_hex
-from .helpers import secure_erase, truncate_and_unlink
-from .helpers import Manifest
 from .helpers import msgpack
-from .locking import Lock, LockError, LockErrorT
+from .helpers.lrucache import LRUCache
+from .storelocking import Lock
 from .logger import create_logger
-from .lrucache import LRUCache
-from .platform import SaveFile, SyncFile, sync_dir, safe_fadvise
-from .algorithms.checksums import crc32
-from .crypto.file_integrity import IntegrityCheckedFile, FileIntegrityError
+from .repoobj import RepoObj, OBJ_MAGIC
+from .crypto.key import is_keyfile, key_factory, store_hash, STORE_HASH_NAME
 
 logger = create_logger(__name__)
 
-MAGIC = b'BORG_SEG'
-MAGIC_LEN = len(MAGIC)
-ATTIC_MAGIC = b'ATTICSEG'
-assert len(ATTIC_MAGIC) == MAGIC_LEN
-TAG_PUT = 0
-TAG_DELETE = 1
-TAG_COMMIT = 2
+# an object name is the hex store hash of the object's content (64 lowercase hex digits), see
+# crypto.key.store_hash(). borgstore names the packs it writes for us (defrag) and verifies objects
+# (hash) with the store hash, which it knows by STORE_HASH_NAME.
+_valid_object_name = re.compile(r"[0-9a-f]{64}").fullmatch
 
-FreeSpace = partial(defaultdict, int)
+# how much of a pack PackReader reads at once when searching for the next object header.
+RESYNC_WINDOW_SIZE = 1024 * 1024
+# how much to read to get an object's header plus, at the usual metadata slot sizes, its metadata
+# slot in the same read.
+META_READ_SIZE = 1024
+# how much of a gap superseded_gap_ranges reads at once after an object smaller than this, so that
+# small objects share a read. after a larger object, it reads META_READ_SIZE.
+GAP_READ_SIZE = 64 * 1024
+# the largest metadata slot a validating read fetches. a slot holds a few compression fields, packed
+# and encrypted, i.e. some tens of bytes, so this is a generous bound and it keeps a corrupt
+# meta_size, which only MAX_DATA_SIZE bounds, from triggering a large read.
+MAX_VALIDATED_META_SIZE = 64 * 1024
+# AAD prefix of the store objects protected by the key (index/, cache/): keeps their envelopes apart
+# from the metadata and data slots of pack objects, whose AAD starts with OBJ_MAGIC (b"BORG_OBJ"). The
+# repository id, a tag and the object name (or namespace) follow it, see Repository._store_obj_aad.
+STORE_OBJ_AAD = b"borg-store-object\0"
+# the store object with the repository defaults, e.g. the default compression, see Repository.save_defaults.
+DEFAULTS_NAME = "config/defaults"
+
+
+def repo_lister(repository, *, limit=None):
+    marker = None
+    finished = False
+    while not finished:
+        result = repository.list(limit=limit, marker=marker)
+        finished = (len(result) < limit) if limit is not None else (len(result) == 0)
+        if not finished:
+            marker = result[-1][0]
+        yield from result
+
+
+def borg_permissions(permissions):
+    """Map a borg permissions string to a borgstore permissions dict (or None for "all").
+
+    The namespaces match the borg repository layout (see Repository.__init__ ns_config).
+    """
+    match permissions:
+        case "all":
+            return None  # permissions system will not be used
+        case "no-delete":  # mostly no delete, no overwrite
+            return {
+                "": "lr",
+                "archives": "lrw",
+                "cache": "lrwWD",  # WD for checked-packs, ...
+                "config": "lrW",  # W for manifest
+                "index": "lrwWD",  # WD for index/<HASH> (merge/compaction of incremental indexes)
+                "keys": "lr",
+                "locks": "lrwD",  # borg needs to create/delete a shared lock here
+                "packs": "lrw",
+            }
+        case "write-only":  # mostly no reading
+            return {
+                "": "l",
+                "archives": "lw",
+                "cache": "lrwWD",  # TODO: check more restrictive permissions
+                "config": "lrW",  # W for manifest
+                "index": "lrwWD",  # read allowed so that borg create can check chunk presence for deduplication
+                "keys": "lr",
+                "locks": "lrwD",  # borg needs to create/delete a shared lock here
+                "packs": "lw",  # no r!
+            }
+        case "read-only":  # mostly r/o
+            return {"": "lr", "locks": "lrwD"}
+        case _:
+            raise Error(
+                f"Invalid BORG_REPO_PERMISSIONS value: {permissions}, should be one of: "
+                f"all, no-delete, write-only, read-only."
+            )
+
+
+def rest_serve_command(location):
+    """Build the command line that serves an ssh:// *location* via "borg serve --rest".
+
+    We prefix an ssh command (reusing borgstore's ssh_cmd / BORGSTORE_RSH) to reach the remote borg.
+    For the special host "__testsuite__", we run this borg locally instead (over stdio, no ssh).
+    """
+    backend_arg = f"FILE:{location.path}"
+    if location.host == "__testsuite__":
+        # run this borg locally, talking over stdio
+        borg_cmd = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "borg"]
+        return borg_cmd + ["serve", "--rest", "--backend", backend_arg]
+    # reach the remote borg via ssh
+    remote_path = replace_placeholders(os.environ.get("BORG_REMOTE_PATH", "borg"))
+    return ssh_cmd(location.user, location.host, location.port) + [
+        remote_path,
+        "serve",
+        "--rest",
+        "--backend",
+        backend_arg,
+    ]
+
+
+def propagate_rsh():
+    """Give borgstore the remote shell command borg uses.
+
+    borg has BORG_RSH, borgstore has its own BORGSTORE_RSH - if only the borg one is set,
+    borgstore shall use it, too. An explicitly set BORGSTORE_RSH always wins.
+    """
+    borg_rsh = os.environ.get("BORG_RSH")
+    if borg_rsh and not os.environ.get("BORGSTORE_RSH"):
+        os.environ["BORGSTORE_RSH"] = borg_rsh
+
+
+def build_rest_backend(location):
+    """Return a borgstore REST backend for an ssh:// *location*, served by "borg serve --rest"."""
+    return REST(base_url="http://stdio-backend", command=rest_serve_command(location))
+
+
+class PackWriter:
+    """Buffers chunks into a pack file and writes it to the store when full.
+
+    add() buffers a (chunk_id, cdata) pair and marks the chunk pending (F_PENDING), unless
+    its index entry already has a resolved pack location (a re-put of a stored chunk keeps
+    that location, so the chunk stays readable, also if an abort drops the buffered copy);
+    when the pack is full, it is built, hashed and stored, and each entry's pack_id,
+    obj_offset and obj_size are set, clearing F_PENDING.
+
+    With async_store (the default), a full pack is handed to a background store-thread
+    (at most one in flight), so the caller can assemble the next pack while the previous
+    one is hashed and stored (#9988).  The ChunkIndex is only ever touched by the calling
+    thread: the store-thread's results (or error) are applied when it is joined, at the
+    next pack boundary or flush().  Consequently, add() returns the *previous* pack's
+    results while the current pack's store is in flight, and a store error surfaces one
+    pack later, from whichever add()/flush() call joins the store-thread.
+
+    flush() is a barrier: it joins an in-flight store and writes the current buffer
+    synchronously, so afterwards nothing is buffered or in flight and no chunk written
+    through this writer is F_PENDING anymore.
+
+    The ChunkIndex comes from the repository, or from an explicit chunks index when
+    there is no repository (see the chunks property).
+
+    max_count bounds how many chunks a pack holds; max_size bounds its byte size.
+    A pack is written when either limit is reached.  Set a limit to None to disable it;
+    at least one must be set, otherwise the pack buffer is unbounded.
+    """
+
+    class _Outcome:
+        """What one pack store produced: filled in by _store_pieces, applied by _apply_outcome."""
+
+        def __init__(self, pending_ids):
+            self.pending_ids = pending_ids  # chunk ids to drop from the index if the store fails
+            self.results = None  # list of (chunk_id, pack_id, obj_offset, obj_size) on success
+            self.error = None  # the store exception on failure
+
+    def __init__(self, store, *, max_count=None, max_size=None, chunks=None, repository=None, async_store=True):
+        if repository is None and chunks is None:
+            raise ValueError("PackWriter requires either a repository or an explicit chunks index")
+        if max_count is None and max_size is None:
+            raise ValueError("PackWriter needs max_count or max_size, otherwise the pack buffer is unbounded")
+        self.store = store
+        self.max_count = max_count  # None = no count limit
+        self.max_size = max_size  # None = no size limit
+        self.repository = repository
+        self.async_store = async_store
+        # BORG_PACK_TRACE=yes prints store-thread lifecycle markers to stderr, see _trace.
+        self.trace_store = os.environ.get("BORG_PACK_TRACE", "no") == "yes"
+        self._chunks = chunks  # used when there is no repository
+        self._pieces = []  # list of (chunk_id, cdata)
+        self._size = 0  # byte size of buffered pieces
+        self._inflight = None  # (thread, outcome) of the pack store-thread, at most one in flight
+
+    @property
+    def chunks(self):
+        """The ChunkIndex this writer updates: the repository's index, or the
+        explicit index passed at construction when there is no repository."""
+        if self.repository is not None:
+            return self.repository.chunks
+        return self._chunks
+
+    def add(self, chunk_id, cdata):
+        """Buffer a chunk.
+
+        When the chunk fills the pack, the pack is written and the results of the
+        *previously* written pack (with async_store) or of this pack (without) are
+        returned as a list of (chunk_id, pack_id, obj_offset, obj_size) tuples.
+        Returns None when there is nothing to report.
+        """
+        self.chunks.add(chunk_id, 0)  # size: plaintext chunk size, set by the cache layer
+        self._pieces.append((chunk_id, cdata))
+        self._size += len(cdata)
+        if (self.max_count is not None and len(self._pieces) >= self.max_count) or (
+            self.max_size is not None and self._size >= self.max_size
+        ):
+            if self.async_store:
+                results = self.join_inflight()  # apply the previous pack's store, or raise its error
+                self._handoff()  # current pack -> background store-thread
+                return results
+            return self.flush()
+        return None
+
+    def _take_pieces(self):
+        """Take the buffered pieces, leaving an empty buffer."""
+        pieces, self._pieces, self._size = self._pieces, [], 0
+        return pieces
+
+    @staticmethod
+    def _trace(char, trace):
+        """Emit one lifecycle marker of the background store-thread to stderr:
+        < thread started, H hashing starts, S storing starts, > thread finished.
+        Only active with BORG_PACK_TRACE=yes (debugging aid: visualizes how pack
+        stores overlap with the assembly of the next pack, #9988)."""
+        if trace:
+            sys.stderr.write(char)
+            sys.stderr.flush()
+
+    def _store_pieces(self, pieces, outcome, trace=False):
+        """Build, hash and store one pack; record the results or the error in *outcome*.
+
+        Runs in the store-thread (async, trace=True) or inline in the calling thread
+        (sync/flush).  Touches only the store (borgstore >= 0.6 serializes all Store
+        operations internally, see borgstore #206), never the ChunkIndex.
+        """
+        self._trace("<", trace)
+        try:
+            # Build the pack bytes once by joining all pieces (avoids O(n^2) copies
+            # that incremental string concatenation would cause in Python).
+            pack_data = b"".join(cdata for _, cdata in pieces)
+
+            # Name the pack by the store hash of its bytes: the name commits to the stored content,
+            # so borgstore can verify and cache the file.
+            self._trace("H", trace)
+            pack_id = store_hash(pack_data).digest()
+
+            # Record (chunk_id, pack_id, obj_offset, obj_size) for every piece.
+            results = []
+            offset = 0
+            for chunk_id, cdata in pieces:
+                obj_size = len(cdata)
+                results.append((chunk_id, pack_id, offset, obj_size))
+                offset += obj_size
+
+            self._trace("S", trace)
+            self.store.store("packs/" + bin_to_hex(pack_id), pack_data)
+        except BaseException as exc:  # incl. KeyboardInterrupt: it must not vanish with the thread
+            outcome.error = exc
+        else:
+            outcome.results = results
+        finally:
+            self._trace(">", trace)
+
+    def _apply_outcome(self, outcome):
+        """Apply one finished pack store to the ChunkIndex (calling thread only).
+
+        On success, set the real pack locations (clearing F_PENDING) and return the results;
+        on failure, drop the failed pack's index entries and raise the store error.
+        """
+        if outcome.error is not None:
+            # the pack was not stored: drop the index entries for its chunks.
+            self._drop_index_entries(outcome.pending_ids)
+            raise outcome.error
+        if self.repository is not None and not self.repository.is_chunk_index_loaded:
+            # no in-memory index: this pack's entries died with it (see _drop_index_entries).
+            # do not build the index from the repo here: join_inflight also runs while closing
+            # or aborting, and that I/O could fail and mask an error being unwound.  the stored
+            # pack is then simply not recorded, like the buffered pieces that die with an abort.
+            # flush() asserts the index is loaded while chunks are outstanding, so on the normal
+            # (non-aborting) path this state fails loudly there instead of being skipped here.
+            return outcome.results
+        self.chunks.update_pack_info(outcome.results)  # set the real location and clear F_PENDING
+        return outcome.results
+
+    def _handoff(self):
+        """Hand the buffered pieces to a background store-thread (at most one in flight)."""
+        assert self._inflight is None, "join_inflight() must run before handing off another pack"
+        pieces = self._take_pieces()
+        outcome = self._Outcome([chunk_id for chunk_id, _ in pieces])
+        # daemon: normally irrelevant, because flush() and close() always join the thread
+        # (also while unwinding a Ctrl-C), so it is never still running at interpreter
+        # shutdown.  it is a safety net for the pathological case of a store that hangs
+        # (e.g. a dead sftp/rest connection without timeout) on a path that never joins:
+        # exiting then beats hanging forever in threading._shutdown.  losing an unjoined
+        # store costs nothing: its index entries are only applied at the join, and all
+        # backends write to a temp name + rename (or have the server verify a content
+        # hash), so an aborted store can leave garbage, but never a corrupt pack.
+        thread = threading.Thread(
+            target=self._store_pieces,
+            args=(pieces, outcome),
+            kwargs=dict(trace=self.trace_store),
+            name="borg-pack-store",
+            daemon=True,
+        )
+        self._inflight = (thread, outcome)
+        thread.start()
+
+    def _drop_index_entries(self, chunk_ids):
+        """Drop the (still pending) index entries of *chunk_ids*, without building the index.
+
+        Runs while aborting (a pack store failed, or the caller is unwinding an exception),
+        so it must never build the chunk index from the repo: that I/O can fail and mask the
+        error being unwound.  No in-memory index means nothing to delete: add() installs a
+        chunk's index entry before buffering its piece, so pending entries never outlive a
+        dropped index.  Entries that are not pending anymore are kept: their chunk is in a
+        stored pack, only the aborted (duplicate) piece dies.
+        """
+        if self.repository is not None and not self.repository.is_chunk_index_loaded:
+            return
+        for chunk_id in chunk_ids:
+            # a chunk_id may appear more than once in a pack or buffer
+            if chunk_id in self.chunks and self.chunks.is_pending(chunk_id):
+                del self.chunks[chunk_id]
+
+    def _drop_buffered(self):
+        """Drop the buffered pieces and their (still pending) index entries.
+
+        Called when a pack store failed or the caller is unwinding an exception: the caller
+        is aborting, so chunks not yet handed to the store die with it.  Dropping their
+        entries keeps the index free of F_PENDING leftovers, like the sync store path does,
+        so the close()-time index persist works.
+        """
+        pieces = self._take_pieces()
+        if pieces:
+            logger.debug("dropping %d buffered chunk(s) while aborting", len(pieces))
+        self._drop_index_entries(chunk_id for chunk_id, _ in pieces)
+
+    def join_inflight(self):
+        """Wait for an in-flight pack store and apply it to the index.
+
+        Returns its results, None when nothing was in flight.  If the store failed, the
+        writer is emptied (see _drop_buffered) and the store error is raised.
+        """
+        if self._inflight is None:
+            return None
+        thread, outcome = self._inflight
+        thread.join()
+        self._inflight = None
+        try:
+            return self._apply_outcome(outcome)
+        except BaseException:
+            self._drop_buffered()
+            raise
+
+    def discard(self):
+        """Join a still in-flight pack store, then drop the buffered pieces.
+
+        The abort-side counterpart to flush(): a pack already handed to the store-thread is
+        joined first, so a stored pack gets recorded in the index and a failed one gets its
+        entries dropped; the pieces still buffered were never stored and die with the aborted
+        operation.  Store errors are logged, not raised: the caller is aborting already, and
+        raising here would mask the error being unwound.
+        """
+        try:
+            self.join_inflight()
+        except Exception as exc:
+            # join_inflight already dropped the failed pack's index entries and the buffer.
+            logger.warning("pack store failed while aborting: %s", exc)
+        self._drop_buffered()
+
+    def flush(self):
+        """Write the current pack to the store.  This is a barrier: any in-flight store
+        is joined first and the current buffer is written synchronously, so afterwards
+        no chunk written through this writer is F_PENDING anymore.
+
+        Returns a list of (chunk_id, pack_id, obj_offset, obj_size) tuples covering
+        every chunk written by this flush (including a joined in-flight pack), or
+        None if there was nothing to do.
+        """
+        # invalidating the chunk index with chunks buffered or in flight discards their entries,
+        # so this flush could not resolve their locations anymore: a caller must flush first.
+        assert (
+            self.repository is None
+            or self.repository.is_chunk_index_loaded
+            or (self._inflight is None and not self._pieces)
+        ), "chunk index not loaded; flush() before invalidate_chunk_index()"
+        results = self.join_inflight() or []
+        if self._pieces:
+            pieces = self._take_pieces()
+            outcome = self._Outcome([chunk_id for chunk_id, _ in pieces])
+            self._store_pieces(pieces, outcome)
+            results += self._apply_outcome(outcome)
+        return results or None
+
+
+class PackReader:
+    """Reads pack files, the read-side counterpart to PackWriter.
+
+    Pass pack_id to read from the store, or pack_contents for a pack already in memory. pack_size, if given,
+    is the size of the pack in the store, so size() does not look it up.
+    """
+
+    def __init__(self, store=None, pack_id=None, pack_contents=None, pack_size=None):
+        self.store = store
+        self.pack_id = pack_id
+        self.key = "packs/" + bin_to_hex(pack_id) if pack_id is not None else None
+        self.pack_contents = pack_contents
+        self.pack_size = pack_size
+        self.headers_parsed = 0  # headers _parse_header accepted in the last iter_headers walk
+
+    def read(self, offset, size):
+        # in-memory pack: return a memoryview into pack_contents. store: range-read bytes.
+        if self.pack_contents is not None:
+            return memoryview(self.pack_contents)[offset : offset + size]
+        return self.store.load(self.key, offset=offset, size=size)
+
+    def size(self):
+        """Return the pack size in bytes (a store metadata lookup, unless the pack is in memory or pack_size is set)."""
+        if self.pack_contents is not None:
+            return len(self.pack_contents)
+        if self.pack_size is not None:
+            return self.pack_size
+        return self.store.info(self.key).size
+
+    @staticmethod
+    def _parse_header(hdr_data, offset, pack_size):
+        """Return (ObjHeader, None) for a valid header at offset, (None, problem) otherwise.
+
+        hdr_data: at most obj_header.size bytes read at offset, a position in the pack.
+        pack_size: the pack size in bytes.
+        Valid means: RepoObj.parse_header accepts hdr_data, and the object fits into the pack and is
+        at most MAX_DATA_SIZE bytes, the maximum size of a whole object. problem is a message naming the
+        check that failed.
+        """
+        hdr, problem = RepoObj.parse_header(hdr_data)
+        if hdr is None:
+            return None, problem
+        obj_size = RepoObj.obj_header.size + hdr.meta_size + hdr.data_size
+        if offset + obj_size > pack_size:
+            return None, "object extends past end of file"
+        if obj_size > MAX_DATA_SIZE:
+            return None, f"object of {obj_size} bytes exceeds the maximum of {MAX_DATA_SIZE}"
+        return hdr, None
+
+    def _validation_problem(self, hdr, offset, buf, buf_offset, validate):
+        """Return None if validate accepts the object with header hdr at offset, else the problem.
+
+        buf holds the pack bytes from buf_offset on; the metadata slot is read separately when buf
+        does not reach its end. A slot over MAX_VALIDATED_META_SIZE is rejected without that read.
+        """
+        if hdr.meta_size > MAX_VALIDATED_META_SIZE:
+            return f"metadata slot of {hdr.meta_size} bytes exceeds the maximum of {MAX_VALIDATED_META_SIZE}"
+        size = RepoObj.obj_header.size + hdr.meta_size
+        start = offset - buf_offset
+        end = start + size
+        obj = buf[start:end] if end <= len(buf) else self.read(offset, size)
+        if not validate(hdr.chunk_id, obj):
+            return "object header or metadata does not authenticate"
+        return None
+
+    def _find_header(self, offset, pack_size, validate):
+        """Scan forward from offset for the next object validate accepts, return (offset, header).
+
+        Returns None if the pack holds no such object from offset on.
+
+        A pack has no framing besides the object headers, so this searches for OBJ_MAGIC. That byte
+        sequence also occurs inside payloads, so a candidate is accepted only when its header parses
+        and validate(chunk_id, obj) confirms the header and metadata slot at that position.
+        """
+        hdr_size = RepoObj.obj_header.size
+        while offset + hdr_size <= pack_size:
+            # a window at a time, so the scan costs one store request per RESYNC_WINDOW_SIZE bytes.
+            buf = bytes(self.read(offset, min(RESYNC_WINDOW_SIZE, pack_size - offset)))
+            if len(buf) < hdr_size:
+                break
+            pos = 0
+            while True:
+                pos = buf.find(OBJ_MAGIC, pos)
+                if pos < 0 or pos + hdr_size > len(buf):
+                    break  # not in this window, or a header overlapping its end: the next window has it
+                hdr, _ = self._parse_header(buf[pos : pos + hdr_size], offset + pos, pack_size)
+                if hdr is not None:
+                    self.headers_parsed += 1
+                    if self._validation_problem(hdr, offset + pos, buf, offset, validate) is None:
+                        return offset + pos, hdr
+                pos += 1
+            # step by the window less one header, so a magic straddling the boundary is still found.
+            offset += max(len(buf) - (hdr_size - 1), 1)
+        return None
+
+    def iter_headers(self, validate=None, on_drop=None):
+        """Yield (chunk_id, offset, size) for each object by walking the fixed object headers.
+
+        The walk reads one range per object (or a slice, for a pack in memory), plus one store
+        metadata lookup for the pack size unless pack_size is set. Fewer than a header's bytes left
+        ends the walk: that is the end of the pack.
+
+        validate(chunk_id, obj) tells whether obj - an object's header and metadata slot - is the
+        repo object with id chunk_id. Given one, the walk validates every header, reading the
+        metadata slot along with it, and a header that fails makes the walk resync: it scans from
+        just past that header for the next object validate accepts and continues there. The object
+        with the failed header is dropped - its id, its extent or its metadata is wrong, so it can
+        not be read back. The pack keeps the dropped object's bytes. If nothing in the pack
+        validates, the walk yields nothing and raises nothing.
+
+        Without a validator a resync is impossible, because payload bytes can look like a header.
+        A header that _parse_header rejects then raises IntegrityError naming what is wrong with it.
+
+        on_drop, if given, is called once per byte range a validating walk skips: the object with
+        the failed header plus the bytes up to the next object validate accepts, or up to the end of
+        the pack if there is none.
+
+        headers_parsed is set to the number of headers _parse_header accepted in this walk, the
+        candidates the resync scan tried included. A pack whose bytes hold no object header at all
+        leaves it at zero.
+        """
+        pack_hex = bin_to_hex(self.pack_id) if self.pack_id is not None else "<no id>"
+        pack_size = self.size()
+        hdr_size = RepoObj.obj_header.size
+        # TODO: objects smaller than META_READ_SIZE make the validating walk read the pack several
+        # times over. Buffering a window, as _find_header scans with, would suit them; skipping a
+        # large object stays cheaper with a short read per header.
+        read_size = META_READ_SIZE if validate is not None else hdr_size
+        self.headers_parsed = 0
+        offset = 0
+        while offset + hdr_size <= pack_size:
+            buf = self.read(offset, min(read_size, pack_size - offset))
+            if len(buf) < hdr_size:
+                break  # trailing partial bytes
+            hdr, problem = self._parse_header(buf[:hdr_size], offset, pack_size)
+            if hdr is not None:
+                self.headers_parsed += 1
+                if validate is not None:
+                    problem = self._validation_problem(hdr, offset, buf, offset, validate)
+            if problem is not None:
+                if validate is None:
+                    # without a validator, payload bytes that look like a header can not be told
+                    # apart from an object, so the walk can not continue past this header.
+                    raise IntegrityError(f"pack {pack_hex}: {problem} at offset {offset} (pack corruption)")
+                if on_drop is not None:
+                    on_drop()  # content is discarded either way below: this object, or the tail.
+                found = self._find_header(offset + 1, pack_size, validate)
+                if found is None:
+                    logger.warning(
+                        f"pack {pack_hex}: {problem} at offset {offset} and no object after it, "
+                        f"skipping the remaining {pack_size - offset} bytes."
+                    )
+                    break
+                next_offset, hdr = found  # _find_header validated it, so yield it without re-reading
+                logger.warning(
+                    f"pack {pack_hex}: {problem} at offset {offset}, "
+                    f"continuing at the object at offset {next_offset}."
+                )
+                offset = next_offset
+            obj_size = hdr_size + hdr.meta_size + hdr.data_size
+            yield hdr.chunk_id, offset, obj_size
+            offset += obj_size
+
+
+def decode_ranges(ranges):
+    """Return the (offset, size) tuples of byte ranges encoded as offset << 32 | size.
+
+    borg compact and borg repo-compress keep the byte ranges of all index entries, so they store each
+    as one int in an array. Offset and size are below 2**32, like obj_offset and obj_size in the
+    chunks index.
+    """
+    return [(r >> 32, r & 0xFFFFFFFF) for r in ranges]
+
+
+def check_pack_objects(pack_hex, obj_ranges, pack_size):
+    """Validate a pack's indexed objects against the pack's file size.
+
+    obj_ranges: the offset-ordered (obj_offset, obj_size) ranges of the pack's indexed objects.
+    An overlap between objects, or an object claiming to end past the pack file (pack_size bytes),
+    means index corruption and raises IntegrityError.
+    """
+    covered = 0
+    for offset, size in obj_ranges:
+        if offset < covered:
+            raise IntegrityError(
+                f'pack {pack_hex}: overlapping objects at offset {offset} (index corruption), run "borg check"'
+            )
+        covered = offset + size
+    if covered > pack_size:
+        raise IntegrityError(
+            f'pack {pack_hex}: object extends past end of file at offset {covered} (index corruption), run "borg check"'
+        )
+
+
+def superseded_gap_ranges(reader, chunks, pack_id, obj_ranges, pack_size, *, validate, untrusted_pack_ids=frozenset()):
+    """Return the offset-ordered (offset, size) ranges of the superseded duplicates in a pack's gaps.
+
+    A gap is a byte range of the pack that no chunks index entry covers. A superseded duplicate is
+    an object in a gap whose chunk id the index maps to another location, in a pack not in
+    untrusted_pack_ids. Equal chunk ids mean equal plaintext, so its bytes are redundant, whatever
+    the stored size of the indexed copy.
+
+    Each gap is walked from object header to object header, stepping by the object size the header
+    states. A read starts at an object header. It is GAP_READ_SIZE bytes at the start of a gap and
+    after an object smaller than that, so small objects share a read, and META_READ_SIZE bytes after
+    a larger object.
+    An object is reported when it is a superseded duplicate and validate accepts it. The walk over
+    a gap ends at a header that does not parse or that reaches past the gap. Objects validate
+    rejects are kept, and so is the rest of a gap where the walk ends early; both are logged as a
+    warning with the pack id and the offset.
+
+    reader: PackReader of the pack.
+    chunks: the chunks index (chunk id -> ChunkIndexEntry).
+    pack_id: id of the pack.
+    obj_ranges: the offset-ordered (obj_offset, obj_size) ranges of the pack's indexed objects,
+        non-overlapping and within the pack. The gaps are the byte ranges between and after them.
+    pack_size: size of the pack in bytes.
+    validate: validate(chunk_id, obj) -> bool, see repoobj.object_validator. obj is the object's
+        header and metadata slot (the meta_size metadata bytes after the header). True means chunk
+        id, meta_size and data_size are verified, so the reported range is exactly the object.
+        With None, nothing is reported.
+    untrusted_pack_ids: ids of packs whose objects may be unreadable, e.g. packs missing from the
+        store, recorded corrupt, or shorter than their index entries state. A gap object whose chunk
+        id the index maps into one of them is kept.
+    """
+    if validate is None:
+        return []
+
+    # find the gaps: byte ranges no indexed object covers.
+    gaps = []  # (start, end) of each gap, offset-ordered
+    cursor = 0
+    for offset, size in obj_ranges:
+        if offset > cursor:
+            gaps.append((cursor, offset))
+        cursor = offset + size
+    if cursor < pack_size:
+        gaps.append((cursor, pack_size))
+
+    pack_hex = bin_to_hex(pack_id)
+    drop_ranges = []  # (obj_offset, obj_size) of superseded duplicates, offset-ordered
+    hdr_size = RepoObj.obj_header.size
+    for gstart, gend in gaps:
+        buf, buf_offset = memoryview(b""), gstart  # buf holds the gap bytes from buf_offset on
+        read_size = GAP_READ_SIZE
+        offset = gstart
+        while offset < gend:
+            pos = offset - buf_offset  # position of the object in buf
+            if pos + META_READ_SIZE > len(buf) and buf_offset + len(buf) < gend:
+                # buf does not hold the header and the usual metadata slot of this object: read from here on.
+                buf, buf_offset, pos = memoryview(reader.read(offset, min(gend - offset, read_size))), offset, 0
+            hdr, problem = PackReader._parse_header(buf[pos : pos + hdr_size], offset, pack_size)
+            if hdr is not None and offset + hdr_size + hdr.meta_size + hdr.data_size > gend:
+                hdr, problem = None, "object reaching past its gap"
+            if hdr is None:
+                logger.warning(
+                    f"pack {pack_hex}: {problem} at offset {offset} in a gap, "
+                    f"keeping the remaining {gend - offset} bytes of the gap."
+                )
+                break
+            obj_size = hdr_size + hdr.meta_size + hdr.data_size
+            entry = chunks.get(hdr.chunk_id)
+            if (
+                entry is not None
+                and entry.pack_id not in untrusted_pack_ids
+                and (entry.pack_id != pack_id or entry.obj_offset != offset)
+            ):
+                problem = reader._validation_problem(hdr, offset, buf, buf_offset, validate)
+                if problem is None:
+                    drop_ranges.append((offset, obj_size))
+                else:
+                    logger.warning(f"pack {pack_hex}: {problem} at offset {offset} in a gap, keeping its bytes.")
+            # TODO: obj_size is verified only for objects validate accepts. A wrong obj_size
+            # usually ends the walk at a header that does not parse, so the superseded duplicates in
+            # the rest of the gap are kept on every rewrite. PackReader._find_header could resync to
+            # the next object validate accepts, but in the authenticated-* modes that can
+            # be a copy of an object inside another object's unencrypted data, whose range can cover
+            # bytes of the gap objects after it, which would then be dropped.
+            offset += obj_size
+            read_size = GAP_READ_SIZE if obj_size < GAP_READ_SIZE else META_READ_SIZE
+    return drop_ranges
+
+
+def remove_missing_pack_entries(chunks, missing_pack_ids):
+    """Remove the entries of the chunks stored in the given packs from chunks.
+
+    chunks: ChunkIndex, modified in place.
+    missing_pack_ids: ids of packs that are absent from the store.
+
+    Entries with F_PENDING set have no pack location yet and are kept. Return the number of removed entries.
+    """
+    missing = set(missing_pack_ids)
+    stale_ids = [
+        chunk_id
+        for chunk_id, entry in chunks.iteritems()
+        if not (entry.flags & ChunkIndex.F_PENDING) and entry.pack_id in missing
+    ]
+    for chunk_id in stale_ids:
+        del chunks[chunk_id]
+    return len(stale_ids)
+
+
+# Repository.salvage_pack outcomes.
+SALVAGE_INTACT = "intact"  # the pack's store hash matches its name
+SALVAGE_DONE = "salvaged"  # the pack was replaced by one holding only its authenticated objects
+SALVAGE_NOTHING_AUTHENTICATES = "nothing authenticates"  # no object in the pack authenticates
+SALVAGE_READS_DIFFER = "reads differ"  # two reads of the pack disagree
+SALVAGE_READ_ERROR = "read error"  # reading the pack failed
+
+# status: one of the SALVAGE_* outcomes.
+# new_pack_id: id of the replacement pack (SALVAGE_DONE), else None.
+# kept: (chunk_id, obj_offset, obj_size) of each object in the replacement pack, else [].
+# dropped_bytes: number of bytes of the old pack left out of the replacement pack, else 0.
+# removed_ids: chunk ids whose chunk index entries were removed, else [].
+SalvageResult = namedtuple("SalvageResult", "status new_pack_id kept dropped_bytes removed_ids")
+
+
+class CheckTracker:
+    """Check results, mapping a 32-byte id -> (timestamp, result).
+
+    Stored at NAME as the serialized table in the repository key's envelope (see
+    Repository.store_encrypt_store). new() starts an empty tracker, load() reads the stored one.
+    Subclasses set NAME.
+
+    If the store denies writing or deleting NAME, save() and clear() leave the stored object as it is
+    and log a warning, once per repository object and NAME.
+    """
+
+    NAME: str
+    KEY_SIZE = 32
+    Entry = namedtuple("Entry", "timestamp result")
+    EntryFormatT = namedtuple("EntryFormatT", "timestamp result")
+    _EntryFormat = EntryFormatT(timestamp="Q", result="B")  # unix ts, 1=ok 0=failed
+
+    def __init__(self, repository, table):
+        self.repository = repository
+        self.table = table
+
+    @classmethod
+    def new(cls, repository):
+        """Return a tracker with an empty table."""
+        table = HashTableNT(key_size=cls.KEY_SIZE, value_type=cls.Entry, value_format=cls._EntryFormat)
+        return cls(repository, table)
+
+    @classmethod
+    def load(cls, repository):
+        """Return a tracker holding the stored table.
+
+        Return an empty one if the object at NAME is missing, fails the authentication of the key's
+        envelope, does not deserialize, or its entries do not have this class's key size and Entry layout.
+        """
+        label = cls.NAME.rpartition("/")[2]
+        try:
+            data = repository.store_load_decrypt(cls.NAME)
+        except StoreObjectNotFound:
+            return cls.new(repository)
+        except IntegrityError:
+            logger.warning(f"Ignoring corrupted {label} set.")
+            return cls.new(repository)
+        try:
+            with io.BytesIO(data) as f:
+                table = HashTableNT.read(f)
+        except ValueError:
+            logger.warning(f"Ignoring unreadable {label} set.")
+            return cls.new(repository)
+        # read() takes key size and value type from the blob itself, so the table needs a layout check
+        # against Entry here. All entries in a table share one layout, so checking one entry suffices.
+        sample = next(iter(table.items()), None)
+        if sample is not None:
+            key, value = sample
+            if len(key) != cls.KEY_SIZE or value._fields != cls.Entry._fields:
+                logger.warning(f"Ignoring {label} set with an unexpected layout.")
+                return cls.new(repository)
+        return cls(repository, table)
+
+    def __len__(self):
+        return len(self.table)
+
+    def get(self, id):
+        """Return the Entry for id, or None if it is not recorded."""
+        return self.table.get(id)
+
+    def record(self, id, ok):
+        self.table[id] = self.Entry(timestamp=int(time.time()), result=int(ok))
+
+    def is_recent(self, id, max_age):
+        """Return True if id has an ok record younger than max_age seconds (0 = never).
+
+        The timestamp is set by the client that ran the earlier check, so a future one (negative age)
+        is accepted up to MAX_CLOCK_SKEW.
+        """
+        entry = self.table.get(id)
+        if entry is None or not entry.result or not max_age:
+            return False
+        age = time.time() - entry.timestamp
+        return -min(MAX_CLOCK_SKEW, max_age) <= age < max_age
+
+    def forget(self, id):
+        """Drop the record of id, if any."""
+        self.table.pop(id, None)
+
+    def failed_ids(self):
+        """Return the ids recorded with result=0, sorted."""
+        return sorted(id for id, entry in self.table.items() if not entry.result)
+
+    def prune(self, ids):
+        """Drop the records whose id is not in ids, then store the remaining records (or delete the
+        stored object if none remain).
+        """
+        # the keys are collected first because the table must not be mutated while iterating it.
+        for id in [id for id, _ in self.table.items() if id not in ids]:
+            del self.table[id]
+        if len(self.table):
+            self.save()
+        else:
+            self.clear()
+
+    def save(self):
+        with io.BytesIO() as f:
+            self.table.write(f)
+            data = f.getvalue()
+        try:
+            self.repository.store_encrypt_store(self.NAME, data)
+        except StorePermissionDenied:
+            self._warn_denied()
+
+    def clear(self):
+        self.table.clear()
+        try:
+            self.repository.store_delete(self.NAME)
+        except StoreObjectNotFound:
+            pass
+        except StorePermissionDenied:
+            self._warn_denied()
+
+    def _warn_denied(self):
+        denied = self.repository.check_results_denied
+        if self.NAME not in denied:
+            denied.add(self.NAME)
+            logger.warning(
+                f"Not updating {self.NAME}: permission denied. The check results stored there stay as they are."
+            )
+
+
+class PackTracker(CheckTracker):
+    """Pack verification results, mapping pack_id -> (timestamp, result).
+
+    Records are kept across checks: intact records (result=1) are reused by checks run with
+    max_age, corrupt records (result=0) are kept for repair and always re-verified. Records of
+    packs no longer listed in packs/ are pruned when a check finishes scanning packs/.
+    """
+
+    NAME = "cache/checked-packs"
+
+    def corrupt_ids(self):
+        """Return the ids of the packs recorded corrupt, sorted."""
+        return self.failed_ids()
+
+
+class ArchiveTracker(CheckTracker):
+    """Archive check results, mapping archive_id -> (timestamp, result).
+
+    result=1: the archives check read all metadata of the archive and found every chunk it references
+    in the chunk index. Archives checks run with max_age reuse such a record. result=0: the check found
+    a problem, such an archive is always checked again.
+    A check that finds a corrupt or missing pack or salvages a pack, and an archives check that
+    repairs, clear all records: chunks the archives reference may be gone then. An archives check
+    stores no records while a pack is recorded corrupt. Records of archives no longer in archives/
+    (soft-deleted ones included) are pruned when an archives check finishes.
+    """
+
+    NAME = "cache/checked-archives"
+
+
+class _ConfigMissing(Exception):
+    """internal: the store exists, but has no repository config object (see Repository._load_config)."""
 
 
 class Repository:
-    """
-    Filesystem based transactional key value store
-
-    Transactionality is achieved by using a log (aka journal) to record changes. The log is a series of numbered files
-    called segments. Each segment is a series of log entries. The segment number together with the offset of each
-    entry relative to its segment start establishes an ordering of the log entries. This is the "definition" of
-    time for the purposes of the log.
-
-    Log entries are either PUT, DELETE or COMMIT.
-
-    A COMMIT is always the final log entry in a segment and marks all data from the beginning of the log until the
-    segment ending with the COMMIT as committed and consistent. The segment number of a segment ending with a COMMIT
-    is called the transaction ID of that commit, and a segment ending with a COMMIT is called committed.
-
-    When reading from a repository it is first checked whether the last segment is committed. If it is not, then
-    all segments after the last committed segment are deleted; they contain log entries whose consistency is not
-    established by a COMMIT.
-
-    Note that the COMMIT can't establish consistency by itself, but only manages to do so with proper support from
-    the platform (including the hardware). See platform.base.SyncFile for details.
-
-    A PUT inserts a key-value pair. The value is stored in the log entry, hence the repository implements
-    full data logging, meaning that all data is consistent, not just metadata (which is common in file systems).
-
-    A DELETE marks a key as deleted.
-
-    For a given key only the last entry regarding the key, which is called current (all other entries are called
-    superseded), is relevant: If there is no entry or the last entry is a DELETE then the key does not exist.
-    Otherwise the last PUT defines the value of the key.
-
-    By superseding a PUT (with either another PUT or a DELETE) the log entry becomes obsolete. A segment containing
-    such obsolete entries is called sparse, while a segment containing no such entries is called compact.
-
-    Sparse segments can be compacted and thereby disk space freed. This destroys the transaction for which the
-    superseded entries where current.
-
-    On disk layout:
-
-    dir/README
-    dir/config
-    dir/data/<X // SEGMENTS_PER_DIR>/<X>
-    dir/index.X
-    dir/hints.X
-
-    File system interaction
-    -----------------------
-
-    LoggedIO generally tries to rely on common behaviours across transactional file systems.
-
-    Segments that are deleted are truncated first, which avoids problems if the FS needs to
-    allocate space to delete the dirent of the segment. This mostly affects CoW file systems,
-    traditional journaling file systems have a fairly good grip on this problem.
-
-    Note that deletion, i.e. unlink(2), is atomic on every file system that uses inode reference
-    counts, which includes pretty much all of them. To remove a dirent the inodes refcount has
-    to be decreased, but you can't decrease the refcount before removing the dirent nor can you
-    decrease the refcount after removing the dirent. File systems solve this with a lock,
-    and by ensuring it all stays within the same FS transaction.
-
-    Truncation is generally not atomic in itself, and combining truncate(2) and unlink(2) is of
-    course never guaranteed to be atomic. Truncation in a classic extent-based FS is done in
-    roughly two phases, first the extents are removed then the inode is updated. (In practice
-    this is of course way more complex).
-
-    LoggedIO gracefully handles truncate/unlink splits as long as the truncate resulted in
-    a zero length file. Zero length segments are considered to not exist, while LoggedIO.cleanup()
-    will still get rid of them.
-    """
-
-    class DoesNotExist(Error):
-        """Repository {} does not exist."""
+    """borgstore-based key/value store."""
 
     class AlreadyExists(Error):
         """A repository already exists at {}."""
 
-    class PathAlreadyExists(Error):
-        """There is already something at {}."""
+        exit_mcode = 10
 
-    class ParentPathDoesNotExist(Error):
-        """The parent path of the repo directory [{}] does not exist."""
+    class IncompleteRepository(Error):
+        """{} has no repository config."""
 
-    class InvalidRepository(Error):
-        """{} is not a valid repository. Check repo config."""
-
-    class InvalidRepositoryConfig(Error):
-        """{} does not have a valid configuration. Check repo config [{}]."""
-
-    class AtticRepository(Error):
-        """Attic repository detected. Please run "borg upgrade {}"."""
+        exit_mcode = 11
 
     class CheckNeeded(ErrorWithTraceback):
         """Inconsistency detected. Please run "borg check {}"."""
 
+        exit_mcode = 12
+
+    class DoesNotExist(Error):
+        """Repository {} does not exist."""
+
+        exit_mcode = 13
+
+    class InsufficientFreeSpaceError(Error):
+        """Insufficient free space to complete the transaction (required: {}, available: {})."""
+
+        exit_mcode = 14
+
+    class InvalidRepository(Error):
+        """{} is not a valid repository. Check the repository config."""
+
+        exit_mcode = 15
+
+    class InvalidRepositoryConfig(Error):
+        """{} does not have a valid config. Check the repository config [{}]."""
+
+        exit_mcode = 16
+
     class ObjectNotFound(ErrorWithTraceback):
         """Object with key {} not found in repository {}."""
+
+        exit_mcode = 17
 
         def __init__(self, id, repo):
             if isinstance(id, bytes):
                 id = bin_to_hex(id)
             super().__init__(id, repo)
 
-    class InsufficientFreeSpaceError(Error):
-        """Insufficient free space to complete transaction (required: {}, available: {})."""
+    class PackLocationUnknown(ErrorWithTraceback):
+        """Object with key {} is indexed but its pack location is unresolved in repository {}."""
 
-    class StorageQuotaExceeded(Error):
-        """The storage quota ({}) has been exceeded ({}). Try deleting some archives."""
+        exit_mcode = 22
 
-    def __init__(self, path, create=False, exclusive=False, lock_wait=None, lock=True,
-                 append_only=False, storage_quota=None, check_segment_magic=True,
-                 make_parent_dirs=False):
-        self.path = os.path.abspath(path)
-        self._location = Location('file://%s' % self.path)
-        self.io = None  # type: LoggedIO
-        self.lock = None
-        self.index = None
-        # This is an index of shadowed log entries during this transaction. Consider the following sequence:
-        # segment_n PUT A, segment_x DELETE A
-        # After the "DELETE A" in segment_x the shadow index will contain "A -> [n]".
-        # .delete() is updating this index, it is persisted into "hints" file and is later used by .compact_segments().
-        self.shadow_index = {}
-        self._active_txn = False
-        self.lock_wait = lock_wait
-        self.do_lock = lock
+        # this is a code bug, not a genuine miss: the chunk is in the index but still buffered
+        # (not flushed).  deliberately NOT a subclass of ObjectNotFound, so the usual
+        # "except ObjectNotFound" handlers do not swallow it -- it surfaces loudly with a traceback.
+        def __init__(self, id, repo):
+            if isinstance(id, bytes):
+                id = bin_to_hex(id)
+            super().__init__(id, repo)
+
+    class PackNotFound(ErrorWithTraceback):
+        """Object with key {} is indexed to pack {}, but that whole pack is missing from repository {}."""
+
+        exit_mcode = 23
+
+        # a missing pack means the index is stale or more than one object was lost.
+        def __init__(self, id, pack_id, repo):
+            if isinstance(id, bytes):
+                id = bin_to_hex(id)
+            if isinstance(pack_id, bytes):
+                pack_id = bin_to_hex(pack_id)
+            super().__init__(id, pack_id, repo)
+
+    class ParentPathDoesNotExist(Error):
+        """The parent path of the repository directory [{}] does not exist."""
+
+        exit_mcode = 18
+
+    class PathAlreadyExists(Error):
+        """There is already something at {}."""
+
+        exit_mcode = 19
+
+    # StorageQuotaExceeded was exit_mcode = 20
+
+    class PathPermissionDenied(Error):
+        """Permission denied to {}."""
+
+        exit_mcode = 21
+
+    class PermissionDenied(Error):
+        """Repository permission denied: {}"""
+
+        exit_mcode = 24
+
+    class KeyRequired(ErrorWithTraceback):
+        """Repository {} needs its key to access the store object {}, but no key was set."""
+
+        exit_mcode = 28
+
+    class LegacyRepository(Error):
+        """{} looks like a borg 1.x repository, use --from-borg1 to access it (e.g. with borg transfer)."""
+
+        exit_mcode = 29
+
+    class DefaultsMissing(Error):
+        """Repository {} has no config/defaults object, run "borg check --repair" to store empty defaults."""
+
+        exit_mcode = 34
+
+    # Whole packs kept in memory for reads; the least recently used is evicted first.
+    # Memory use is this count times the pack size.
+    PACK_READER_CACHE_SIZE = 3
+
+    # Limits for one store.gather call in gather_many(): max. object count, and the byte count that ends a batch.
+    GATHER_MAX_COUNT = 1000
+    GATHER_MAX_SIZE = 16 * 1024 * 1024
+
+    def __init__(
+        self,
+        path_or_location,
+        create=False,
+        create_config=True,
+        allow_incomplete=False,
+        exclusive=False,
+        lock_wait=1.0,
+        lock=True,
+        send_log_cb=None,
+        permissions=None,
+        key_loader=None,
+    ):
+        if isinstance(path_or_location, Location):
+            location = path_or_location
+            if location.proto == "file":
+                url = Path(location.path).as_uri()
+            else:
+                url = location.processed  # location as given by user, processed placeholders
+        else:
+            url = Path(path_or_location).absolute().as_uri()
+            location = Location(url)
+        self._location = location
+        self.url = url
+        ns_config = {
+            "archives/": {"levels": [0]},
+            "cache/": {"levels": [0]},
+            "config/": {"levels": [0]},
+            "index/": {"levels": [0]},
+            "keys/": {"levels": [0]},
+            "locks/": {"levels": [0]},
+            "packs/": {"levels": [1]},
+        }
+        # Get permissions from parameter or environment variable
+        permissions = permissions if permissions is not None else os.environ.get("BORG_REPO_PERMISSIONS", "all")
+        permissions = borg_permissions(permissions)
+
+        # writethrough cache for the packs/ namespace: on a cache miss borgstore loads the whole
+        # pack, caches it, and serves later reads of that pack's objects from the cache.
+        # packs are named by content hash, so one cache directory can hold packs from several
+        # repositories; a colliding name has identical content, so sharing is safe.
+        # BORG_STORE_CACHE sets the cache directory ("1" means <cache_dir>/storecache); the
+        # directory holds the whole store's cache, currently just the packs/ namespace.
+        # BORG_PACK_CACHE_SIZE limits the pack cache size in bytes.
+        cache_url = None
+        store_cache = os.environ.get("BORG_STORE_CACHE")
+        if store_cache:
+            if store_cache == "1":
+                cache_dir = Path(get_cache_dir("storecache"))
+            else:
+                cache_dir = Path(store_cache)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+            ns_config["packs/"]["cache"] = "writethrough"
+            cache_size = os.environ.get("BORG_PACK_CACHE_SIZE")
+            if cache_size:
+                ns_config["packs/"]["size"] = int(cache_size)
+            cache_url = cache_dir.as_uri()
+        # True if packs are cached locally (BORG_STORE_CACHE): store.load() of a pack may return the cached copy.
+        self.uses_pack_store_cache = cache_url is not None
+
+        # pack-sizing overrides: BORG_PACK_MAX_COUNT sets the max object count per pack,
+        # BORG_PACK_MAX_SIZE the max pack size in bytes. Default: size-bound only.
+        # They are validated here, so a bad value fails before the store is created, opened or locked.
+        # An empty value counts as unset, like BORG_PACK_CACHE_SIZE. A non-integer or non-positive
+        # value is rejected. The size must also stay below
+        # MAX_PACK_SIZE_LIMIT: add() keeps the object that crosses the cap, so this keeps packs
+        # below 2 GiB, clear of OS bugs with files of 2 GiB or more. Count-only mode still passes
+        # that ceiling (minus one) as max_size. pack_max_size remembers the configured size, or the
+        # default when the user did not set one, so the safety ceiling does not become the compact target.
+        max_count_env = os.environ.get("BORG_PACK_MAX_COUNT") or None
+        max_size_env = os.environ.get("BORG_PACK_MAX_SIZE") or None
+        if max_count_env is None:
+            max_count = None
+        else:
+            try:
+                max_count = int(max_count_env)
+            except ValueError:
+                raise Error(f"BORG_PACK_MAX_COUNT must be an integer, but is: {max_count_env!r}") from None
+            if max_count <= 0:
+                raise Error(f"BORG_PACK_MAX_COUNT must be positive, but is: {max_count}")
+        self._pack_max_count = max_count
+        if max_size_env is None:
+            self._pack_max_size = (MAX_PACK_SIZE_LIMIT - 1) if max_count is not None else DEFAULT_PACK_MAX_SIZE
+            self._configured_pack_max_size = DEFAULT_PACK_MAX_SIZE
+        else:
+            try:
+                max_size = int(max_size_env)
+            except ValueError:
+                raise Error(f"BORG_PACK_MAX_SIZE must be an integer, but is: {max_size_env!r}") from None
+            if max_size <= 0:
+                raise Error(f"BORG_PACK_MAX_SIZE must be positive, but is: {max_size}")
+            if max_size >= MAX_PACK_SIZE_LIMIT:
+                raise Error(f"BORG_PACK_MAX_SIZE must be below {MAX_PACK_SIZE_LIMIT}, but is: {max_size}")
+            self._pack_max_size = self._configured_pack_max_size = max_size
+
+        propagate_rsh()  # borgstore shall use the same remote shell command as borg
+
+        try:
+            if location.proto == "ssh":
+                # ssh:// is served by a remote "borg serve --rest" (reached via ssh), talking HTTP over stdio -
+                # rather than borgstore's own "borgstore-server-rest" command.
+                # permissions are not given to the (remote) backend here; they are enforced on the
+                # server side by "borg serve --rest --permissions ...".
+                backend = build_rest_backend(location)
+                # note: borgstore >= 0.6 Store serializes all its operations internally, so the
+                # PackWriter store-thread and the main thread can share it (borgstore #206).
+                self.store = Store(backend=backend, config=ns_config, cache_url=cache_url)
+            else:
+                self.store = Store(url, config=ns_config, permissions=permissions, cache_url=cache_url)
+        except StoreBackendError as e:
+            raise Error(str(e))
+        # None means "all" (no restrictions); for ssh:// the backend enforces permissions
+        # server-side, so the client does not check them (see above).
+        self.permissions = None if location.proto == "ssh" else permissions
+        self.store_opened = False
+        # NAMEs of the check results the store denied updating, see CheckTracker.
+        self.check_results_denied = set()
+        self.version = None
+        self.id = None
+        # the crypto suite of the repository's key, as recorded in the repository config (see save_config):
+        self.encryption = None  # the "--encryption" name, e.g. "aes256-ocb"
+        self.id_hash = None  # the "--id-hash" name, e.g. "sha256"
+        # the repository's key, see set_key(): the lock, index/ and cache/ objects are stored in its envelope.
+        self.key = None
+        # key_loader(repository) returns the repository's key; acquire_lock() calls it if no key was set yet.
+        # None: key_factory(repository).
+        self._key_loader = key_loader
+        self._defaults = None  # cache of load_defaults()
+        # plaintext store hash -> fragment hash of the index/ fragments read in this session, so a
+        # fragment with the same content is not stored again, see cache._store_chunkindex_fragment.
+        self.chunkindex_fragment_hashes = {}
+        # long-running repository methods which emit log or progress output are responsible for calling
+        # the ._send_log method periodically to get log and progress output transferred to the borg client
+        # in a timely manner, in case we have a RemoteRepository.
+        # for local repositories ._send_log can be called also (it will just do nothing in that case).
+        self._send_log = send_log_cb or (lambda: None)
         self.do_create = create
         self.created = False
+        # create_config=False: create() does not write the repository config, the caller does that via
+        # save_config() (used by "borg repo-create", which writes it once the key exists, see create()).
+        self._create_config = create_config
+        self._config_written = False
+        # allow_incomplete=True: open() also accepts a store without repository config (see create()),
+        # so that "borg repo-delete --force" can destroy it. self.incomplete tells whether that happened.
+        self._allow_incomplete = allow_incomplete
+        self.incomplete = False
+        self.acceptable_repo_versions = (5,)
+        self.opened = False
+        self.lock = None
+        self.do_lock = lock
+        self.lock_wait = lock_wait
         self.exclusive = exclusive
-        self.append_only = append_only
-        self.storage_quota = storage_quota
-        self.storage_quota_use = 0
-        self.transaction_doomed = None
-        self.check_segment_magic = check_segment_magic
-        self.make_parent_dirs = make_parent_dirs
-
-    def __del__(self):
-        if self.lock:
-            self.close()
-            assert False, "cleanup happened in Repository.__del__"
+        self._pack_writer = None
+        self._chunks = None  # ChunkIndex; loaded lazily on first access to .chunks
+        # pack_id -> PackReader holding the whole pack; get_many loads into it, get() reuses it
+        self._pack_cache = LRUCache(capacity=self.PACK_READER_CACHE_SIZE)
 
     def __repr__(self):
-        return '<%s %s>' % (self.__class__.__name__, self.path)
+        return f"<{self.__class__.__name__} {self._location}>"
 
     def __enter__(self):
-        if self.do_create:
-            self.do_create = False
-            self.create(self.path)
-            self.created = True
-        self.open(self.path, bool(self.exclusive), lock_wait=self.lock_wait, lock=self.do_lock)
+        try:
+            if self.do_create:
+                self.do_create = False
+                self.create()
+                self.created = True
+            try:
+                self.open(exclusive=bool(self.exclusive), lock_wait=self.lock_wait, lock=self.do_lock)
+            except Exception:
+                self.close(aborting=True)
+                if self.created:
+                    # we just created the store, but could not open it: do not leave it behind (see create()).
+                    self.store.destroy()
+                raise
+        except StoreBackendError as e:
+            if self._location.proto != "ssh":
+                raise
+            # the first request to the remote "borg serve" failed, usually because it did not start.
+            raise Error(
+                f"Could not access the repository via borg serve on the remote host: {e}\n"
+                "Is borg 2 installed there (see BORG_REMOTE_PATH)? "
+                "For a borg 1.x repository, use --from-borg1."
+            ) from None
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type is not None:
-            no_space_left_on_device = exc_type is OSError and exc_val.errno == errno.ENOSPC
-            # The ENOSPC could have originated somewhere else besides the Repository. The cleanup is always safe, unless
-            # EIO or FS corruption ensues, which is why we specifically check for ENOSPC.
-            if self._active_txn and no_space_left_on_device:
-                logger.warning('No space left on device, cleaning up partial transaction to free space.')
-                cleanup = True
-            else:
-                cleanup = False
-            self._rollback(cleanup=cleanup)
-        self.close()
+        try:
+            if exc_type is not None and self._pack_writer is not None:
+                # unwinding an exception: chunks still buffered in the pack writer were never
+                # stored, so they die with the aborted operation.  discard them (joining a
+                # still in-flight pack store first, so a stored pack gets recorded) so that
+                # close() neither trips its flush assertion -- which would mask the original
+                # exception -- nor persists pending index entries.
+                self._pack_writer.discard()
+        finally:
+            self.close(aborting=exc_type is not None)
 
     @property
     def id_str(self):
         return bin_to_hex(self.id)
 
-    @staticmethod
-    def is_repository(path):
-        """Check whether there is already a Borg repository at *path*."""
+    def create(self):
+        """Create the store for a new repository, give it a fresh id and write the repository config.
+
+        The config has no key information yet (see save_config), so the repository can be opened and
+        used as a key/value store, but its key can not be loaded until save_config(key) was called.
+
+        With create_config=False (see __init__), the config is not written here, but by the caller via
+        save_config(). Until then, the store is not a repository (open() reports it as not a valid
+        repository): "borg repo-create" uses this, so that an interrupted repo-create does not leave a
+        repository behind.
+
+        If anything fails after the store was created, the store is destroyed again, so a failure (e.g.
+        disk full, permission denied) does not leave a store without config behind either.
+
+        No chunk index is written here, as the index/ objects need the key (see store_encrypt_store):
+        "borg repo-create" writes an empty one after creating the key.
+        """
         try:
-            # Use binary mode to avoid troubles if a README contains some stuff not in our locale
-            with open(os.path.join(path, 'README'), 'rb') as fd:
-                # Read only the first ~100 bytes (if any), in case some README file we stumble upon is large.
-                readme_head = fd.read(100)
-                # The first comparison captures our current variant (REPOSITORY_README), the second comparison
-                # is an older variant of the README file (used by 1.0.x).
-                return b'Borg Backup repository' in readme_head or b'Borg repository' in readme_head
-        except OSError:
-            # Ignore FileNotFound, PermissionError, ...
+            self.store.create()
+        except StoreBackendAlreadyExists:
+            raise self._already_exists_error() from None
+        try:
+            # create all namespace directories in advance (saves ad-hoc mkdirs later, see borgstore). This
+            # also is what tells a store borg created apart from any other directory, see looks_like_borg_store().
+            self.store.create_levels()
+            self.store.open()
+            try:
+                self.version = 5
+                self.id = os.urandom(32)
+                if self._create_config:
+                    self.save_config()
+            finally:
+                self.store.close()
+        except BaseException:
+            # do not leave the just created store behind (see above); the original error is what matters.
+            try:
+                self.store.destroy()
+            except Exception as exc:
+                logger.warning("could not remove the incompletely created store: %s", exc)
+            raise
+
+    def _already_exists_error(self):
+        # the store backend refused to create the store, e.g. because the directory is not empty. if there
+        # is a repository config, it is a repository. else we only know that there is no borg 2 repository:
+        # the directory may hold anything, e.g. a borg 1.x repository, or be the leftover of an interrupted
+        # repo-create (see create()).
+        try:
+            self.store.open()
+            try:
+                self.store.load("config/config")
+            except StoreObjectNotFound:
+                return self.IncompleteRepository(self.url)
+            finally:
+                self.store.close()
+        except StoreBackendError:
+            pass  # can not look inside, so we do not know more
+        return self.AlreadyExists(self.url)
+
+    def save_config(self, key=None):
+        """Store the repository config (the config/config store object).
+
+        It holds the repository version and id and the crypto suite of the repository's key (encryption
+        mode and id hash), so that the key class is known without reading any repository object.
+        Writing it is what makes the store a repository: open() requires it.
+
+        key: the repository's key, its crypto suite gets recorded. None: record the crypto suite known
+        from a previous config (if any) - without it, the repository can be opened, but its key can not
+        be loaded (see key_factory).
+        """
+        if key is not None:
+            self.encryption, self.id_hash = key.ENC_NAME, key.IDHASH_NAME
+        config = configparser.ConfigParser(interpolation=None)
+        config.add_section("repository")
+        config.set("repository", "version", str(self.version))
+        config.set("repository", "id", bin_to_hex(self.id))
+        if self.encryption is not None and self.id_hash is not None:
+            config.set("repository", "encryption", self.encryption)
+            config.set("repository", "id_hash", self.id_hash)
+        with io.StringIO() as f:
+            for line in REPOSITORY_README.splitlines():
+                f.write(f"# {line}\n")
+            f.write("\n")
+            config.write(f)
+            self.store.store("config/config", f.getvalue().encode())
+        self._config_written = True
+
+    def _load_config(self):
+        try:
+            text = self.store.load("config/config").decode()
+        except StoreBackendDoesNotExist:
+            # An ssh:// store's open() does not contact the server, so for ssh:// a missing repository
+            # only shows up here, when the first request fails with BackendDoesNotExist (#10365).
+            raise self.DoesNotExist(str(self._location)) from None
+        except StoreObjectNotFound:
+            if self._is_legacy_repository():
+                raise self.LegacyRepository(str(self._location)) from None
+            # the store exists, but has no repository config: a repository that lost its config, something
+            # that never was a borg 2 repository, or the leftover of an interrupted repo-create (see create()).
+            raise _ConfigMissing() from None
+        except UnicodeDecodeError:
+            raise self.InvalidRepository(str(self._location)) from None
+        config = configparser.ConfigParser(interpolation=None)
+        try:
+            config.read_string(text)
+            self.version = config.getint("repository", "version")
+            self.id = hex_to_bin(config.get("repository", "id"), length=32)
+            self.encryption = config.get("repository", "encryption", fallback=None)
+            self.id_hash = config.get("repository", "id_hash", fallback=None)
+        except (configparser.Error, ValueError):
+            raise self.InvalidRepository(str(self._location)) from None
+        if (self.encryption is None) != (self.id_hash is None):
+            # the crypto suite is recorded by both entries or by none, see save_config().
+            raise self.InvalidRepository(str(self._location))
+
+    def _is_legacy_repository(self):
+        """Does the (opened) store look like a borg 1.x repository?
+
+        A borg 1.x repository has a config *file* where borg 2 has the config/ namespace, so the store
+        object config/config is not found. The backend (not the Store, which only knows names within
+        namespaces) can look at that file-or-namespace directly.
+        """
+        try:
+            info = self.store.backend.info("config")
+        except (StoreBackendError, OSError):  # e.g. PermissionDenied, connection errors
             return False
+        return info.exists and not info.directory
 
-    def check_can_create_repository(self, path):
+    def looks_like_borg_store(self):
+        """Does the (opened, config-less) store have the packs, archives, index and config namespaces?
+
+        create() makes them, so every store borg created has them, even the leftover of an interrupted
+        repo-create. Any other directory (data, a home directory, a borg 1.x repository) does not, and
+        "borg repo-delete --force" must never destroy it.
         """
-        Raise an exception if a repository already exists at *path* or any parent directory.
 
-        Checking parent directories is done for two reasons:
-        (1) It's just a weird thing to do, and usually not intended. A Borg using the "parent" repository
-            may be confused, or we may accidentally put stuff into the "data/" or "data/<n>/" directories.
-        (2) When implementing repository quotas (which we currently don't), it's important to prohibit
-            folks from creating quota-free repositories. Since no one can create a repository within another
-            repository, user's can only use the quota'd repository, when their --restrict-to-path points
-            at the user's repository.
-        """
-        try:
-            st = os.stat(path)
-        except FileNotFoundError:
-            pass  # nothing there!
-        else:
-            # there is something already there!
-            if self.is_repository(path):
-                raise self.AlreadyExists(path)
-            if not stat.S_ISDIR(st.st_mode) or os.listdir(path):
-                raise self.PathAlreadyExists(path)
-            # an empty directory is acceptable for us.
-
-        while True:
-            # Check all parent directories for Borg's repository README
-            previous_path = path
-            # Thus, path = previous_path/..
-            path = os.path.abspath(os.path.join(previous_path, os.pardir))
-            if path == previous_path:
-                # We reached the root of the directory hierarchy (/.. = / and C:\.. = C:\).
-                break
-            if self.is_repository(path):
-                raise self.AlreadyExists(path)
-
-    def create(self, path):
-        """Create a new empty repository at `path`
-        """
-        self.check_can_create_repository(path)
-        if self.make_parent_dirs:
-            parent_path = os.path.join(path, os.pardir)
-            os.makedirs(parent_path, exist_ok=True)
-        if not os.path.exists(path):
+        def namespace_exists(name):
             try:
-                os.mkdir(path)
-            except FileNotFoundError as err:
-                raise self.ParentPathDoesNotExist(path) from err
-        with open(os.path.join(path, 'README'), 'w') as fd:
-            fd.write(REPOSITORY_README)
-        os.mkdir(os.path.join(path, 'data'))
-        config = ConfigParser(interpolation=None)
-        config.add_section('repository')
-        config.set('repository', 'version', '1')
-        config.set('repository', 'segments_per_dir', str(DEFAULT_SEGMENTS_PER_DIR))
-        config.set('repository', 'max_segment_size', str(DEFAULT_MAX_SEGMENT_SIZE))
-        config.set('repository', 'append_only', str(int(self.append_only)))
-        if self.storage_quota:
-            config.set('repository', 'storage_quota', str(self.storage_quota))
-        else:
-            config.set('repository', 'storage_quota', '0')
-        config.set('repository', 'additional_free_space', '0')
-        config.set('repository', 'id', bin_to_hex(os.urandom(32)))
-        self.save_config(path, config)
+                next(iter(self.store.list(name)), None)  # an existing namespace lists (maybe nothing)
+            except StoreObjectNotFound:
+                return False
+            return True
 
-    def save_config(self, path, config):
-        config_path = os.path.join(path, 'config')
-        old_config_path = os.path.join(path, 'config.old')
+        return all(namespace_exists(name) for name in ("packs", "archives", "index", "config"))
 
-        if os.path.isfile(old_config_path):
-            logger.warning("Old config file not securely erased on previous config update")
-            secure_erase(old_config_path)
+    def _set_id(self, id):
+        # for testing: change the id of an existing repository
+        assert self.opened
+        assert isinstance(id, bytes) and len(id) == 32
+        self.id = id
+        self.save_config()
 
-        if os.path.isfile(config_path):
-            link_error_msg = ("Failed to securely erase old repository config file (hardlinks not supported>). "
-                              "Old repokey data, if any, might persist on physical storage.")
-            try:
-                os.link(config_path, old_config_path)
-            except OSError as e:
-                if e.errno in (errno.EMLINK, errno.ENOSYS, errno.EPERM, errno.EACCES, errno.ENOTSUP, errno.EIO):
-                    logger.warning(link_error_msg)
-                else:
-                    raise
-            except AttributeError:
-                # some python ports have no os.link, see #4901
-                logger.warning(link_error_msg)
+    def _lock_refresh(self):
+        if self.lock is not None:
+            self.lock.refresh()
 
-        try:
-            with SaveFile(config_path) as fd:
-                config.write(fd)
-        except PermissionError as e:
-            # error is only a problem if we even had a lock
-            if self.do_lock:
-                raise
-            logger.warning("%s: Failed writing to '%s'. This is expected when working on "
-                           "read-only repositories." % (e.strerror, e.filename))
-
-        if os.path.isfile(old_config_path):
-            secure_erase(old_config_path)
+    def store_key(self, keydata):
+        # store a single repokey borg key (content-addressed). does NOT delete other borg keys,
+        # so a repository can have multiple borg keys (one per passphrase). returns the
+        # store object name (= borg key id) under which the borg key was stored.
+        digest = store_hash(keydata).hexdigest()
+        self.store.store(f"keys/{digest}", keydata)
+        return digest
 
     def save_key(self, keydata):
-        assert self.config
-        keydata = keydata.decode('utf-8')  # remote repo: msgpack issue #99, getting bytes
-        self.config.set('repository', 'key', keydata)
-        self.save_config(self.path, self.config)
+        # additive: store this borg key, keeping any other borg keys of this repository.
+        # note: saving an empty key is a no-op here; use delete_key() to remove a borg key.
+        if keydata:
+            self.store_key(keydata)
+
+    def load_keys(self):
+        # return a list of (name, keydata) for all borg keys matching this repository's ID.
+        repo_id_hex = bin_to_hex(self.id)
+        result = []
+        try:
+            infos = list(self.store.list("keys"))
+        except StoreObjectNotFound:
+            return result
+        for info in infos:
+            try:
+                keydata = self.store.load(f"keys/{info.name}")
+            except StoreObjectNotFound:
+                continue
+            if is_keyfile(keydata, repo_id_hex):
+                result.append((info.name, keydata))
+        return result
 
     def load_key(self):
-        keydata = self.config.get('repository', 'key')
-        return keydata.encode('utf-8')  # remote repo: msgpack issue #99, returning bytes
+        # convenience: return the first borg key matching this repository's ID, or b"" if none.
+        keys = self.load_keys()
+        return keys[0][1] if keys else b""
 
-    def get_free_nonce(self):
-        if self.do_lock and not self.lock.got_exclusive_lock():
-            raise AssertionError("bug in code, exclusive lock should exist here")
-
-        nonce_path = os.path.join(self.path, 'nonce')
+    def delete_key(self, name):
+        # delete a single borg key by its store object name (borg key id).
         try:
-            with open(nonce_path, 'r') as fd:
-                return int.from_bytes(unhexlify(fd.read()), byteorder='big')
-        except FileNotFoundError:
-            return None
-
-    def commit_nonce_reservation(self, next_unreserved, start_nonce):
-        if self.do_lock and not self.lock.got_exclusive_lock():
-            raise AssertionError("bug in code, exclusive lock should exist here")
-
-        if self.get_free_nonce() != start_nonce:
-            raise Exception("nonce space reservation with mismatched previous state")
-        nonce_path = os.path.join(self.path, 'nonce')
-        try:
-            with SaveFile(nonce_path, binary=False) as fd:
-                fd.write(bin_to_hex(next_unreserved.to_bytes(8, byteorder='big')))
-        except PermissionError as e:
-            # error is only a problem if we even had a lock
-            if self.do_lock:
-                raise
-            logger.warning("%s: Failed writing to '%s'. This is expected when working on "
-                           "read-only repositories." % (e.strerror, e.filename))
+            self.store.delete(f"keys/{name}")
+        except StoreObjectNotFound:
+            pass
 
     def destroy(self):
-        """Destroy the repository at `self.path`
-        """
-        if self.append_only:
-            raise ValueError(self.path + " is in append-only mode")
+        """Destroy the repository"""
         self.close()
-        os.remove(os.path.join(self.path, 'config'))  # kill config first
-        shutil.rmtree(self.path)
+        self.store.destroy()
 
-    def get_index_transaction_id(self):
-        indices = sorted(int(fn[6:])
-                         for fn in os.listdir(self.path)
-                         if fn.startswith('index.') and fn[6:].isdigit() and os.stat(os.path.join(self.path, fn)).st_size != 0)
-        if indices:
-            return indices[-1]
+    def open(self, *, exclusive, lock_wait=None, lock=True):
+        assert lock_wait is not None
+        try:
+            self.store.open()
+        except StoreBackendDoesNotExist:
+            raise self.DoesNotExist(str(self._location)) from None
         else:
-            return None
-
-    def check_transaction(self):
-        index_transaction_id = self.get_index_transaction_id()
-        segments_transaction_id = self.io.get_segments_transaction_id()
-        if index_transaction_id is not None and segments_transaction_id is None:
-            # we have a transaction id from the index, but we did not find *any*
-            # commit in the segment files (thus no segments transaction id).
-            # this can happen if a lot of segment files are lost, e.g. due to a
-            # filesystem or hardware malfunction. it means we have no identifiable
-            # valid (committed) state of the repo which we could use.
-            msg = '%s" - although likely this is "beyond repair' % self.path  # dirty hack
-            raise self.CheckNeeded(msg)
-        # Attempt to automatically rebuild index if we crashed between commit
-        # tag write and index save
-        if index_transaction_id != segments_transaction_id:
-            if index_transaction_id is not None and index_transaction_id > segments_transaction_id:
-                replay_from = None
+            self.store_opened = True
+        if self.created and not self._config_written:
+            pass  # create() just ran and set version and id; the config is written later by save_config().
+        else:
+            try:
+                self._load_config()
+            except _ConfigMissing:
+                if not self._allow_incomplete:
+                    raise self.InvalidRepository(str(self._location)) from None
+                # a store without repository config: version and id are unknown, nothing gets locked, the
+                # only thing the caller may do with it is looks_like_borg_store() / destroy().
+                self.incomplete = True
+                return
+        if self.version not in self.acceptable_repo_versions:
+            self.close()
+            raise self.InvalidRepositoryConfig(
+                str(self._location), "repository version %d is not supported by this borg version" % self.version
+            )
+        # important: lock *after* making sure that there actually is an existing, supported repository.
+        self._lock_args = exclusive, lock_wait
+        if lock:
+            if self.created and not self._config_written:
+                pass  # "borg repo-create": there is no key yet, it calls acquire_lock() once it created the key.
             else:
-                replay_from = index_transaction_id
-            self.replay_segments(replay_from, segments_transaction_id)
+                self.acquire_lock()
+        self._chunks = None
+        # BORG_PACK_ASYNC=no disables the background store-thread (debugging aid, see PackWriter).
+        async_store = os.environ.get("BORG_PACK_ASYNC", "yes") != "no"
+        self._pack_writer = PackWriter(
+            self.store,
+            repository=self,
+            max_count=self._pack_max_count,
+            max_size=self._pack_max_size,
+            async_store=async_store,
+        )
+        self.opened = True
 
-    def get_transaction_id(self):
-        self.check_transaction()
-        return self.get_index_transaction_id()
+    @property
+    def pack_max_size(self):
+        """The configured byte cap for a pack (BORG_PACK_MAX_SIZE, or the default if it was not set)."""
+        return self._configured_pack_max_size
+
+    @property
+    def chunks(self):
+        """ChunkIndex mapping every known chunk id to its pack location.
+
+        This property is the single owner of the in-memory index: get() resolves
+        pack locations through it, PackWriter updates it, and the Cache reads it
+        from here rather than building its own.  Built lazily on first access, unless a
+        caller installed one through the setter, and persisted back to the repo cache at
+        close().
+        """
+        if self._chunks is None:
+            from .cache import build_chunkindex_from_repo
+
+            self._chunks = build_chunkindex_from_repo(self)
+        return self._chunks
+
+    @chunks.setter
+    def chunks(self, value):
+        # The index is normally built lazily; this setter installs a specific index: wiping the
+        # cache, restoring an index captured before close(), or an index that compact (it needs the
+        # usage flags) or check built itself, so the repository does not build a second one.
+        # To drop a stale index so it rebuilds, do not assign None here -- call
+        # invalidate_chunk_index() instead.
+        self._chunks = value
+
+    def invalidate_chunk_index(self):
+        """Drop the in-memory chunk index, so close() does not persist it and its memory is freed.
+
+        The next access to .chunks builds the index again. PackWriter reads the index through this
+        Repository, so it uses the new one.
+        """
+        self._chunks = None
+
+    @property
+    def is_chunk_index_loaded(self):
+        """Whether the in-memory chunk index has been built/loaded this session.
+
+        Lets the few flag-style checks ask "is it loaded?" without going through the
+        .chunks property (which would build it on demand).  self._chunks should not be
+        read directly elsewhere; use .chunks for the index or this for the loaded flag.
+        """
+        return self._chunks is not None
+
+    def flush(self):
+        """Store the pack writer buffer as a pack, after waiting for the pack the background store-thread is storing.
+
+        Returns the (chunk_id, pack_id, obj_offset, obj_size) tuples of the objects in the packs this call
+        stored or waited for, or None if there were none.
+        """
+        if self._pack_writer is not None:
+            self._lock_refresh()
+            return self._pack_writer.flush()  # PackWriter updates _chunks internally
+        return None
+
+    def close(self, *, aborting=False):
+        """Close the repository: join an in-flight pack store, persist the chunk index, tear down.
+
+        aborting=True means close() runs while unwinding an exception: teardown errors are then
+        logged instead of raised, so they cannot mask the error being unwound.  On a clean close
+        (the default), a failing index persist or lock release raises, so the caller learns about
+        it -- but the lock release and store close still run, in the finally block.
+        """
+        try:
+            if self._pack_writer is not None:
+                try:
+                    # normally a no-op: flush() is a barrier and runs before close().  when close() runs
+                    # while unwinding an error, a pack store may still be in flight: join it, so a stored
+                    # pack gets recorded in the index and a failed one gets its index entries dropped.
+                    self._pack_writer.join_inflight()
+                except Exception as exc:
+                    # do not raise: a store error here was already raised at the caller's put() or
+                    # flush() if it cared; raising at close would mask an error being unwound.
+                    logger.warning("pack store failed during close: %s", exc)
+                assert not self._pack_writer._pieces, "PackWriter has unflushed chunks; call flush() before close()"
+            # close() may run again after the store was already closed (idempotent close), so we can
+            # only persist while the store is open. Persisting is also a no-op unless chunks were added
+            # this session (only F_NEW entries are serialized, and an empty incremental write is skipped).
+            # guard on is_chunk_index_loaded so we never trigger a lazy rebuild just to persist on close.
+            if self.store_opened and self.is_chunk_index_loaded:
+                from .cache import write_chunkindex_to_repo
+
+                try:
+                    write_chunkindex_to_repo(self, self.chunks, incremental=True)
+                except Exception as exc:
+                    if not aborting:
+                        raise
+                    # unwinding, often a store error: this persist writing to that same store would
+                    # raise again and mask it.  the persisted index is only a cache (rebuilt when
+                    # missing or stale), so losing this write costs a rebuild, not data.
+                    logger.warning("failed to persist the chunk index during close: %s", exc)
+        finally:
+            # release the lock and close the store even when the above raised (e.g. the unflushed-
+            # chunks assertion): a lock left behind would block other clients until it goes stale.
+            # while any error is unwinding (aborting, or the try block above raised), a failing
+            # release is logged, not raised, so it cannot mask that error.
+            unwinding = aborting or sys.exc_info()[0] is not None
+            if self.lock:
+                # ignore_not_found: if the lock was already gone (e.g. it went stale and another
+                # client killed it, or refresh() aborted with LockTimeout), a NotLocked raised
+                # here would mask the original error; a missing lock is nothing to release.
+                try:
+                    self.lock.release(ignore_not_found=True)
+                    self.lock = None
+                except Exception as exc:
+                    if not unwinding:
+                        raise
+                    # when the store is dead, the release fails, too; the lock goes stale eventually.
+                    logger.warning("failed to release the lock during close: %s", exc)
+                    self.lock = None
+            if self.store_opened:
+                try:
+                    self.store.close()
+                except Exception as exc:
+                    if not unwinding:
+                        raise
+                    # when the store is dead (e.g. the remote borg serve exited), closing it fails, too.
+                    logger.debug("failed to close the store during close: %s", exc)
+                self.store_opened = False
+            self.opened = False
+            self._pack_cache.clear()
+
+    def info(self):
+        """return some infos about the repo (must be opened first)"""
+        # note: don't do anything expensive here or separate the lock refresh into a separate method.
+        self._lock_refresh()  # do not remove, see do_with_lock()
+        info = dict(id=self.id, version=self.version)
+        return info
+
+    def check(self, repair=False, max_duration=0, max_age=0, repo_only=None, validate=None, authenticate=None):
+        """Check repository consistency.
+
+        packs/ and index/ objects are named by the store hash of their content, so a pack or index
+        file is intact iff store.hash(name) still equals name. The whole pack is hashed; the REST
+        backend computes the hash server-side, so for it nothing is downloaded. An index/ object's
+        content is the key's envelope around a chunk index fragment (see store_encrypt_store), so its
+        name is the store hash of the envelope and this check needs no key; reading the index for the
+        missing-pack cross-check below does.
+
+        The index is hashed first and the packs only if it is intact. The packs could be hashed even
+        with a corrupt index, but a corrupt index already means the user has to repair it, and that
+        rebuild re-reads every pack anyway - so a read-only check just stops and reports it instead of
+        continuing. A read-only check never rebuilds the index: reading every pack to do so would be
+        far too slow and expensive for a routine (e.g. cron) check. With repair=True, the packs are
+        verified (see max_age), then each pack recorded corrupt is salvaged (see authenticate) and the index updated by
+        the salvage is stored. With repo_only, and if no pack is left corrupt, a corrupt index is then
+        rebuilt from the packs' object headers and stored. Without repo_only, the archives phase rebuilds
+        and stores the index (see ArchiveChecker.check and ArchiveChecker.finish), refs #10434. Packs are
+        verified by the store hash, which is content-addressing rather than a MAC, so that check detects
+        accidental corruption but not tampering; the rebuild therefore checks every object with validate,
+        see below, refs #9901, #10026. Pack ids found corrupt are kept in cache/checked-packs, refs #9696.
+        That object is stored in the key's envelope, too, so check() needs the key (see set_key).
+
+        A pack recorded corrupt fails the check, also on a partial run that stops before re-reaching
+        it. The record clears at the check that finds the pack intact again or gone (removed by
+        compact, or replaced by a salvaged pack); prune() does this from packs/.
+
+        A run that finds a corrupt or missing pack, salvages a pack or skips a pack byte range in the
+        index rebuild clears cache/checked-archives (see ArchiveTracker), refs #10025.
+
+        It also reports missing packs (refs #9898): pack ids the chunk index references but that are
+        absent from packs/. The index is read from its fragments only and its referenced pack ids are
+        compared with the packs present in the store; store.info() confirms that each pack the listing
+        lacks is missing. This cross-check runs before the pack loop, so max_duration bounds it and it
+        runs on partial runs too. The entries of the chunks in the missing packs are removed from
+        self.chunks; with repair=True, the index is also stored to index/, else the stored index is
+        unchanged. It is skipped when the index cannot be
+        read from its fragments (an invalid index is regenerated from the packs on next use, so it can
+        never reference a missing pack; a pack that is truly gone then surfaces as missing chunks in the
+        archives check). A fragment that matches its name, but fails the authentication of the key's
+        envelope or does not deserialize, is an index error: with repair=True, the index is rebuilt
+        from the packs.
+
+        max_age (seconds, 0 = verify every pack): skip packs whose intact record is younger than
+        max_age, accepting a future timestamp up to MAX_CLOCK_SKEW (clock skew). Results are recorded
+        regardless of max_age. Packs recorded corrupt are never skipped, so a repair sees a current
+        result for every pack it salvages. max_age is ignored if repair and repo_only run with a
+        corrupt index (an index error of the store hash check or of the cross-check), because the
+        index is rebuilt from the packs verified in this run (see above).
+
+        repo_only: whether this is a repository-only run. Required if repair. In repair mode, if True, a
+        corrupt index is rebuilt here (see above), and damage repair does not fix, i.e. a corrupt pack left
+        unsalvaged, a missing pack, a skipped pack byte range (see validate) or a salvage that may have
+        lost chunks (see authenticate), fails the check. If False, these are left to the archives phase: it
+        rebuilds the index, can repair a corrupt pack holding metadata (or file content with
+        --verify-data), and reports and repairs the archives that reference chunks the index lacks.
+
+        validate: validate(chunk_id, obj) -> bool, True if obj (an object's header plus its metadata
+        slot) is the repo object with id chunk_id, see repoobj.object_validator. Required if repair.
+        The pack salvage (see salvage_pack) and the index rebuild check every object with it; the rebuild
+        leaves an object it rejects out of the index.
+        A skipped pack byte range is the pack content the rebuild discards at one place: a rejected
+        object plus the bytes up to the next object it accepts, or the rest of the pack if it accepts
+        none. Each skipped range counts as one error.
+
+        authenticate: authenticate(chunk_id, obj) -> bool, True if obj (an object's header, metadata slot
+        and data slot) is the repo object with id chunk_id, see repoobj.whole_object_authenticator. In
+        repair mode, each pack recorded corrupt is salvaged with validate and authenticate (see
+        _salvage_corrupt_packs). If None, no pack is salvaged. A salvage may have lost chunks if it removed
+        index entries, or if the index could not be read from its fragments: which chunks the dropped bytes
+        held is unknown then. A pack that reads intact at the salvage is recorded intact and fails the
+        check, repo_only or not: its content is fine, but two reads of it disagreed, which is a fault of
+        the storage or the transfer that no repair fixes.
+        """
+        assert validate is not None or not repair
+        assert repo_only is not None or not repair
+
+        def verify(namespace, name):
+            # name is the store hash of the object's content, so it is intact iff store.hash() matches.
+            key = f"{namespace}/{name}"
+            try:
+                ok = self.store.hash(key, algorithm=STORE_HASH_NAME) == name
+            except StoreObjectNotFound:
+                return True  # vanished since store.list(); not an error
+            if not ok:
+                logger.error(f"Store object {key} is corrupted: content does not match its name (store hash).")
+            return ok
+
+        def store_list(namespace):
+            try:
+                return list(self.store.list(namespace))
+            except StoreObjectNotFound:
+                return []  # namespace does not exist
+
+        partial = bool(max_duration)
+        assert not (repair and partial)
+        mode = "partial" if partial else "full"
+        logger.info(f"Starting {mode} repository check")
+        tracker = PackTracker.load(self)
+        if not len(tracker):
+            logger.info("Starting from beginning.")
+        elif max_age:
+            logger.info(f"{len(tracker)} pack check results on record, reusing those younger than --max-age.")
+        elif partial:
+            logger.info(
+                f"{len(tracker)} pack check results on record, verifying the least-recently-checked packs first."
+            )
+        else:
+            logger.info(f"{len(tracker)} pack check results on record, verifying every pack.")
+        t_start = time.monotonic()
+        t_last_checkpoint = t_start
+        index_files = index_errors = 0
+        pack_files = pack_errors = pack_skipped = 0
+        invalid_pack_names = 0  # objects in packs/ whose name is not a valid pack name, counted in pack_errors
+        salvaged = salvage_lossy = 0  # packs salvaged, and those of them that may have lost chunks
+        reread_intact = 0  # packs that failed the pack check and read intact at the salvage
+        chunks = None  # the index read from its fragments; None if it was not read
+        missing_pack_ids = []  # packs referenced by the index but absent from packs/ (refs #9898)
+        stale_entries = 0  # number of index entries removed for missing_pack_ids
+        index_repaired = False
+        drops = 0  # number of pack byte ranges the index rebuild skipped
+        packs_scanned = False
+        # index and packs get separate progress indicators, each running from 0% to 100%.
+        # the index is checked first and in full, on partial checks too: it is small, and index errors
+        # stop the pack check below.
+        index_infos = store_list("index")
+        # with the invalid marker set, the index/ fragments may be missing entries or point at deleted
+        # packs (see write_chunkindex_invalid). The next use rebuilds the index from the packs, so warn.
+        from .cache import chunkindex_is_invalid, build_chunkindex_from_repo, write_chunkindex_to_repo
+        from .cache import ChunkIndexRebuildInterrupted, CorruptChunkIndexFragment
+
+        index_invalid = chunkindex_is_invalid(self)
+        if index_invalid:
+            logger.warning("chunk index is invalid (interrupted operation); it will be rebuilt on next use.")
+        index_pi = ProgressIndicatorPercent(total=len(index_infos), msg="Checking index %3.0f%%", msgid="check.index")
+        for info in index_infos:
+            self._lock_refresh()
+            index_pi.show(increase=1)
+            index_files += 1
+            if not verify("index", info.name):
+                index_errors += 1
+        if index_infos:
+            index_pi.show(current=len(index_infos))  # finish at 100%
+        index_pi.finish()
+        if index_errors == 0 or repair:
+            # verify the packs; during repair, rebuild the corrupt index from them afterwards.
+            # --repair forbids --max-duration, so the partial handling in the loop stays inactive
+            # during a repair. max_age reuse is active, unless it is reset after the cross-check below.
+            packs_scanned = True
+            # packs are the bulk of the work and the part --max-duration spreads over several checks.
+            pack_infos = store_list("packs")
+            # drop objects whose name is not a valid pack name and count them as errors; the code
+            # below decodes each name via hex_to_bin, which only accepts valid names.
+            valid_pack_infos = []
+            for info in pack_infos:
+                if _valid_object_name(info.name):
+                    valid_pack_infos.append(info)
+                else:
+                    logger.error(f"Store object packs/{info.name} has an invalid name.")
+                    pack_errors += 1
+                    invalid_pack_names += 1
+            pack_infos = valid_pack_infos
+            present_pack_ids = {hex_to_bin(info.name) for info in pack_infos}
+            # cross-check the chunk index against packs/ to find referenced-but-absent packs (refs #9898).
+            # run before the pack loop so max_duration bounds it and partial checks cover it too. read
+            # the index from its fragments only: a full rebuild reads every pack (too slow) and writes
+            # to the repo (a check must not). skip it if the index is known to be corrupt (see above): its
+            # fragments can not be loaded completely then, and the repair rebuilds it from the packs.
+            if not index_invalid and not index_errors and not sig_int:
+                try:
+                    chunks = build_chunkindex_from_repo(self, fragments_only=True)
+                except CorruptChunkIndexFragment as err:
+                    # the fragment matches its name, but it fails the authentication of the key's envelope
+                    # (tampered, or not written with this key) or does not deserialize.
+                    logger.error(
+                        f"Store object {err.args[0]} is corrupted: it fails the authentication or does not "
+                        "deserialize."
+                    )
+                    index_errors += 1
+                    chunks = None
+                if chunks is None:
+                    logger.warning(
+                        "Cannot cross-check packs against the chunk index: the index could not be loaded "
+                        "from its fragments; skipping missing-pack detection."
+                    )
+                else:
+                    referenced_pack_ids = {
+                        entry.pack_id
+                        for _, entry in chunks.iteritems()
+                        # F_PENDING marks a chunk whose pack location is unresolved, so its pack_id
+                        # is a placeholder rather than a real pack; skip such entries.
+                        if not (entry.flags & ChunkIndex.F_PENDING)
+                    }
+                    # set the session chunk index (.chunks) so later reads reuse it; clear_new() has
+                    # run, so close() does not write it back.
+                    self.chunks = chunks
+                    # packs the index references, but that are absent from packs/ (store.info() confirms
+                    # each one): data loss.
+                    missing_pack_ids = sorted(
+                        pack_id
+                        for pack_id in referenced_pack_ids - present_pack_ids
+                        if not self.store.info("packs/" + bin_to_hex(pack_id)).exists
+                    )
+                    if missing_pack_ids:
+                        stale_entries = remove_missing_pack_entries(chunks, missing_pack_ids)
+                        if repair:
+                            # incremental=False: store all entries. force_write: store the index even if
+                            # it is empty. delete_other: delete the old index/ fragments.
+                            write_chunkindex_to_repo(
+                                self, chunks, incremental=False, force_write=True, delete_other=True
+                            )
+                    # packs no index entry references: not an error, so info + ids at debug only.
+                    orphan_pack_ids = sorted(present_pack_ids - referenced_pack_ids)
+                    if orphan_pack_ids:
+                        logger.info(f"{len(orphan_pack_ids)} pack(s) are not referenced by the index.")
+                        for pack_id in orphan_pack_ids:
+                            logger.debug(f"Orphan pack: {bin_to_hex(pack_id)}")
+            # index_errors is final here: the cross-check above can add to the errors of the store hash check.
+            if repair and index_errors and repo_only:
+                logger.warning(
+                    "Repository index is corrupted; verifying all packs before deciding whether to "
+                    "rebuild it from them."
+                )
+                if max_age:
+                    # the rebuild below reads the packs of this run, so no intact record is reused.
+                    logger.info("Ignoring --max-age: every pack is verified for the index rebuild.")
+                    max_age = 0
+            elif repair and index_errors:
+                logger.warning(
+                    "Repository index is corrupted; verifying the packs, the archives check rebuilds the index."
+                )
+            if partial:
+                # a partial check stops after max_duration; verify the least-recently-checked packs
+                # first so repeated runs cover every pack. sort by recorded check time, unrecorded
+                # (time 0) first.
+                def recorded_ts(info):
+                    entry = tracker.get(hex_to_bin(info.name))
+                    return entry.timestamp if entry is not None else 0
+
+                pack_infos.sort(key=recorded_ts)
+            pack_pi = ProgressIndicatorPercent(total=len(pack_infos), msg="Checking packs %3.0f%%", msgid="check.packs")
+            for info in pack_infos:
+                if sig_int:  # on Ctrl-C, stop; tracker.prune() below persists the records past the loop
+                    logger.info(f"Interrupted repository check, {pack_files} packs checked so far.")
+                    break
+                self._lock_refresh()
+                pack_pi.show(increase=1)  # advance for skipped packs too, so the bar tracks packs/, not work done
+                pack_id = hex_to_bin(info.name)
+                # skip a pack recorded intact within the last max_age seconds.
+                if tracker.is_recent(pack_id, max_age):
+                    pack_skipped += 1
+                    continue
+                pack_files += 1
+                ok = verify("packs", info.name)
+                if not ok:
+                    pack_errors += 1
+                tracker.record(pack_id, ok)
+                now = time.monotonic()
+                # a checkpoint rewrites the whole table (41 bytes per pack), so keep the interval long.
+                if now > t_last_checkpoint + 30 * 60:
+                    t_last_checkpoint = now
+                    logger.info(f"Checkpointing at pack {info.name}.")
+                    tracker.save()
+                if partial and now > t_start + max_duration:
+                    logger.info(f"Finished partial repository check, {len(tracker)} pack check results on record.")
+                    break
+            else:
+                if pack_infos:
+                    pack_pi.show(current=len(pack_infos))  # finish at 100%
+                logger.info("Finished checking packs.")
+            pack_pi.finish()
+            # salvage before the index rebuild below, which rebuilds only if no pack is left corrupt.
+            try:
+                if repair and not sig_int and pack_files + pack_skipped == len(pack_infos):
+                    # a pack skipped by max_age has an intact record, so it is not salvaged anyway and
+                    # counts as scanned here; only an interrupted or time-boxed loop must block a salvage.
+                    salvaged, salvage_lossy, reread_intact = self._salvage_corrupt_packs(
+                        tracker, present_pack_ids, chunks, validate=validate, authenticate=authenticate
+                    )
+            finally:
+                # also on an exception: drop the records of the packs salvaged so far.
+                tracker.prune(present_pack_ids)
+            # rebuild only on a repository-only repair, if no pack is left corrupt and every pack was verified
+            # this run: sig_int breaks the loop early, so "no corrupt pack" must be paired with "all packs
+            # scanned" (pack_files == len(pack_infos)) to not rebuild from unverified packs. max_age was
+            # set to 0 after the index cross-check for exactly this path, so no pack was skipped.
+            if (
+                repair
+                and repo_only
+                and index_errors
+                and invalid_pack_names == 0
+                and not tracker.corrupt_ids()
+                and not sig_int
+                and pack_files == len(pack_infos)
+            ):
+
+                def note_drop():
+                    nonlocal drops
+                    drops += 1
+
+                # the exclusive check lock keeps the pack set fixed, so re-listing packs/ inside
+                # build_chunkindex_from_repo matches this verification. write_immediately persists the
+                # index and drops the corrupt fragments.
+                try:
+                    build_chunkindex_from_repo(
+                        self,
+                        slow_rebuild=True,
+                        validate=validate,
+                        on_drop=note_drop,
+                        write_immediately=True,
+                        interruptible=True,
+                    )
+                except ChunkIndexRebuildInterrupted:
+                    # nothing was stored: the corrupt fragments stay.
+                    drops = 0  # counted by the discarded rebuild, which covered only a part of the packs
+                    logger.warning('Index rebuild interrupted; the index stays corrupt, run "borg check --repair".')
+                else:
+                    self.invalidate_chunk_index()  # the rebuilt index is persisted; drop the in-memory copy
+                    index_repaired = True
+        else:
+            logger.error("Repository index is corrupted and must be repaired; skipping the pack check.")
+        # index_deferred: the archives phase rebuilds the corrupt index; it runs only if this check was not interrupted.
+        index_deferred = bool(index_errors) and repair and not repo_only and not sig_int
+        objs_errors = index_errors + pack_errors + len(missing_pack_ids) + drops
+        if pack_errors or missing_pack_ids or salvaged or drops:
+            # chunks the archives reference may be damaged or gone, so no archive check result holds.
+            ArchiveTracker.new(self).clear()
+        summary = (
+            f"Checked {index_files} index files ({index_errors} errors) "
+            f"and {pack_files} packs ({pack_errors} errors)."
+        )
+        if pack_skipped:
+            summary += f" Reused {pack_skipped} recent pack check result(s)."
+        logger.info(summary)
+        if missing_pack_ids:
+            # one id per line (the list can be long).
+            logger.error(f"{len(missing_pack_ids)} pack(s) referenced by the index are missing:")
+            for pack_id in missing_pack_ids:
+                logger.error(f"Missing pack: {bin_to_hex(pack_id)}")
+            logger.error("The chunks stored in these packs are lost.")
+            if repair:
+                logger.warning(f"Removed the index entries of their {stale_entries} chunk(s).")
+            else:
+                logger.error('Run "borg check --repair" to remove their entries from the repository index.')
+        if index_repaired:
+            logger.info("Repository index was corrupted and has been rebuilt from the packs.")
+        if drops:
+            logger.error(f"The index rebuild skipped {drops} pack byte range(s) it could not authenticate.")
+        if salvaged:
+            logger.warning(f"Salvaged {salvaged} corrupt pack(s), {salvage_lossy} of them may have lost chunks.")
+        # corrupt_ids() includes packs recorded corrupt in earlier runs; report them only when this
+        # run scanned the packs.
+        corrupt_ids = tracker.corrupt_ids() if packs_scanned else []
+        if corrupt_ids:
+            # one id per line, the list can be long.
+            logger.error(f"Found {len(corrupt_ids)} corrupt pack(s):")
+            for pack_id in corrupt_ids:
+                logger.error(f"Corrupt pack: {bin_to_hex(pack_id)}")
+        # fail if this run found errors, or any pack is recorded corrupt.
+        problems = objs_errors != 0 or bool(corrupt_ids)
+        # On Ctrl-C the check stopped early, so the summary only covers the packs seen so far.
+        done, so_far = ("Interrupted", " so far") if sig_int else ("Finished", "")
+        if not problems:
+            logger.info(f"{done} {mode} repository check, no problems found{so_far}.")
+        elif not repair:
+            logger.error(f"{done} {mode} repository check, errors found{so_far}.")
+        elif invalid_pack_names or corrupt_ids:
+            # corrupt packs not salvaged, e.g. packs in which no object authenticates.
+            if repo_only:
+                logger.error(f"{done} {mode} repository check, corrupt pack(s) left{so_far}.")
+            else:
+                # a full check's archives phase reads archive/item metadata (and file content with
+                # --verify-data), so it repairs a corrupt pack holding such objects; warn rather than fail.
+                deferred = "; index corrupt, the archives check rebuilds it from the packs" if index_deferred else ""
+                logger.warning(f"{done} {mode} repository check, corrupt pack(s) left{deferred}{so_far}.")
+        elif drops:
+            # drops come from a repository-only rebuild only; no archives phase follows it.
+            logger.error(
+                f"{done} {mode} repository check, "
+                f"index rebuilt without pack byte range(s) it could not authenticate{so_far}."
+            )
+        elif index_deferred:
+            logger.warning(
+                f"{done} {mode} repository check, index corrupt; the archives check rebuilds it from the packs."
+            )
+        elif index_errors and not index_repaired:
+            # the index is corrupt but was not rebuilt, e.g. the pack verification was interrupted
+            # before every pack was confirmed intact; the corrupt index is left in place.
+            logger.error(f"{done} {mode} repository check, index still corrupt{so_far}.")
+        elif missing_pack_ids and repo_only:
+            # missing packs: archives may still reference their chunks, a full check repairs these archives.
+            logger.error(
+                f'{done} {mode} repository check, missing pack(s) found{so_far}; run "borg check --repair" '
+                "without --repository-only to repair the archives that reference their chunks."
+            )
+        elif missing_pack_ids:
+            # missing packs: the archives phase repairs the archives that reference their chunks.
+            logger.warning(f"{done} {mode} repository check, missing pack(s) found{so_far}.")
+        elif salvage_lossy and repo_only:
+            # archives may still reference the lost chunks, a full check repairs these archives.
+            logger.error(
+                f"{done} {mode} repository check, corrupt pack(s) salvaged, chunks may be lost{so_far}; run "
+                '"borg check --repair" without --repository-only to repair the archives that reference them.'
+            )
+        elif salvage_lossy:
+            # the archives phase repairs the archives that reference the lost chunks.
+            logger.warning(f"{done} {mode} repository check, corrupt pack(s) salvaged, chunks may be lost{so_far}.")
+        elif reread_intact:
+            # the pack content is intact, so there is nothing to repair, but one read of it returned
+            # different bytes than the next: the storage or the transfer dropped or changed them.
+            logger.warning(
+                f"{done} {mode} repository check, {reread_intact} pack(s) read corrupt, then intact{so_far}; "
+                "the storage or the transfer may be unreliable."
+            )
+        else:
+            # the corrupt index was rebuilt and/or the corrupt packs were salvaged without losing chunks.
+            logger.info(f"{done} {mode} repository check, repaired{so_far}.")
+        # in repair mode, a corrupt index neither rebuilt here nor deferred fails, as does a pack that read
+        # corrupt and then intact: no repair fixes unreliable storage, so the run must not pass silently. a
+        # corrupt pack left, a missing pack, a skipped pack byte range or a salvage that may have lost chunks
+        # fails a repository-only run, a full check defers it to the archives phase.
+        if repair:
+            if index_errors and not index_repaired and not index_deferred:
+                return False
+            if reread_intact:
+                return False
+            return not (repo_only and (invalid_pack_names or corrupt_ids or missing_pack_ids or drops or salvage_lossy))
+        return not problems
+
+    def list(self, limit=None, marker=None):
+        """
+        list <limit> infos starting from after id <marker>.
+        each info is a tuple (id, storage_size).
+        """
+        # Yield chunk_ids from the chunk index. (Listing the packs/ dir would yield pack file names,
+        # i.e. pack_ids, which are not chunk_ids.) iteritems() has no marker arg, so we skip to
+        # <marker> ourselves; index order is stable unless the index is mutated, which is all the
+        # marker pagination needs.
+        self._lock_refresh()
+        collect = marker is None
+        result = []
+        for chunk_id, entry in self.chunks.iteritems():
+            if self.chunks.is_pending(chunk_id):
+                continue  # buffered in PackWriter (or its store still in flight), not read-able yet
+            if collect:
+                result.append((chunk_id, entry.obj_size))
+                if len(result) == limit:
+                    break
+            elif chunk_id == marker:
+                collect = True  # start collecting after the marker; do not include the marker itself
+        return result
+
+    def get(self, id, read_data=True, raise_missing=True):
+        self._lock_refresh()
+        entry = self.chunks.get(id)
+        if entry is None:
+            if raise_missing:
+                raise self.ObjectNotFound(id, str(self._location))
+            return None
+        if self.chunks.is_pending(id):
+            # the chunk may be in a pack whose background store is still in flight:
+            # join it, which resolves the chunk's pack location (read barrier).
+            self._pack_writer.join_inflight()
+            entry = self.chunks.get(id)  # re-fetch, the join updated the entry
+        if entry is None or self.chunks.is_pending(id):
+            # still pending: buffered but not flushed; a chunk must be flushed before any read, so this
+            # is a code bug (wrong flush/index ordering), not a missing object: raise regardless of
+            # raise_missing.  entry None: the join failed sometime earlier and dropped the entry.
+            raise self.PackLocationUnknown(id, str(self._location))
+        pack_id, obj_offset, obj_size = entry.pack_id, entry.obj_offset, entry.obj_size
+        id_hex = bin_to_hex(id)
+        # slice from the cached whole pack if get_many (or an earlier get) already loaded it;
+        # otherwise read ranges from the store without loading and caching the whole pack.
+        reader = self._pack_cache.get(pack_id)
+        if reader is None:
+            reader = PackReader(store=self.store, pack_id=pack_id)
+        try:
+            if read_data:
+                return reader.read(obj_offset, obj_size)
+            else:
+                # RepoObj layout supports separately encrypted metadata and data.
+                # We return enough bytes so the client can decrypt the metadata.
+                hdr_size = RepoObj.obj_header.size
+                extra_size = META_READ_SIZE - hdr_size
+                load_size = hdr_size + extra_size
+                # keep the read inside this object: a pack holds neighbouring objects, so don't pull
+                # bytes past obj_size into the next one. (an overshoot would be harmless -- parse_meta
+                # uses the header's length and ignores trailing bytes -- this is just tidy.) obj_size
+                # comes from the same index we already route with.
+                load_size = min(load_size, obj_size)
+                obj = reader.read(obj_offset, load_size)
+                hdr, problem = RepoObj.parse_header(obj)
+                if hdr is None:
+                    raise IntegrityError(f"{problem} [id {id_hex}]")
+                meta_size = hdr.meta_size
+                if meta_size > extra_size:
+                    # we did not get enough, need to load more, but not all.
+                    # this should be rare, as chunk metadata is rather small usually.
+                    retry_size = hdr_size + meta_size
+                    # same boundary as above: normally a no-op, just keeps the retry within this object.
+                    retry_size = min(retry_size, obj_size)
+                    obj = reader.read(obj_offset, retry_size)
+                meta = obj[hdr_size : hdr_size + meta_size]
+                if len(meta) != meta_size:
+                    raise IntegrityError(
+                        f"object too small: expected {meta_size} metadata bytes, got {len(meta)} bytes [id {id_hex}]"
+                    )
+                # obj, meta are memoryviews for an in-memory pack; return the header and meta as bytes.
+                return bytes(obj[:hdr_size]) + bytes(meta)
+        except StoreObjectNotFound:
+            if raise_missing:
+                raise self.ObjectNotFound(id, str(self._location)) from None
+            else:
+                return None
+
+    def clear_pack_cache(self):
+        """Drop all cached packs, so the next read fetches from the store."""
+        self._pack_cache.clear()
+
+    def _cached_pack_reader(self, pack_id):
+        """Return a PackReader holding the whole pack, loading it into the cache on a miss."""
+        reader = self._pack_cache.get(pack_id)
+        if reader is None:
+            key = "packs/" + bin_to_hex(pack_id)
+            reader = PackReader(pack_id=pack_id, pack_contents=self.store.load(key))
+            self._pack_cache[pack_id] = reader
+        return reader
+
+    def get_many(self, ids, read_data=True, raise_missing=True):
+        if not read_data:
+            # read_data=False returns only each object's header+meta, sized per object by get().
+            for id_ in ids:
+                yield self.get(id_, read_data=read_data, raise_missing=raise_missing)
+            return
+
+        for id_ in ids:
+            self._lock_refresh()
+            entry = self.chunks.get(id_)
+            if entry is None or self.chunks.is_pending(id_):
+                # id unknown or still buffered: get() raises or returns None accordingly
+                yield self.get(id_, read_data=True, raise_missing=raise_missing)
+                continue
+            try:
+                reader = self._cached_pack_reader(entry.pack_id)
+            except StoreObjectNotFound:
+                if raise_missing:
+                    raise self.PackNotFound(id_, entry.pack_id, str(self._location)) from None
+                yield None
+            else:
+                yield reader.read(entry.obj_offset, entry.obj_size)
+
+    def gather_many(self, ids, raise_missing=True):
+        """Yield the objects for ids in the requested order, reading them in batches with store.gather.
+
+        One store.gather call reads the byte ranges of up to GATHER_MAX_COUNT objects (or about GATHER_MAX_SIZE
+        bytes) from any number of packs, so a backend that supports it (e.g. REST) needs one roundtrip per batch
+        instead of one per object. This suits many small objects spread over many packs, like the archive
+        metadata objects (each usually in a tiny pack of its own) and the item metadata chunks of an archive
+        (written into the packs between file content chunks). get_many() loads whole packs instead, which
+        suits reading most of the objects of a pack.
+
+        raise_missing: like for get(). Ids whose objects cannot be gathered (unknown or still buffered ids, and
+        the ids of a batch that hit a missing or truncated pack) are read with get(), so they behave as there.
+        """
+        batch = []
+        batch_size = 0
+        for id_ in ids:
+            batch.append(id_)
+            entry = self.chunks.get(id_)
+            batch_size += entry.obj_size if entry is not None else 0
+            if len(batch) >= self.GATHER_MAX_COUNT or batch_size >= self.GATHER_MAX_SIZE:
+                yield from self._gather_batch(batch, raise_missing)
+                batch = []
+                batch_size = 0
+        if batch:
+            yield from self._gather_batch(batch, raise_missing)
+
+    def _gather_batch(self, ids, raise_missing):
+        """Return the objects for ids (one gather_many batch) in order, reading their ranges with one store.gather."""
+        self._lock_refresh()
+        results = [None] * len(ids)
+        sources = []  # (position in ids, (pack name, obj_offset, obj_size))
+        for i, id_ in enumerate(ids):
+            entry = self.chunks.get(id_)
+            if entry is None or self.chunks.is_pending(id_):
+                # id unknown or still buffered: get() raises or returns None accordingly
+                results[i] = self.get(id_, raise_missing=raise_missing)
+                continue
+            reader = self._pack_cache.get(entry.pack_id)
+            if reader is not None:
+                results[i] = reader.read(entry.obj_offset, entry.obj_size)  # slice from the cached whole pack
+            else:
+                sources.append((i, (bin_to_hex(entry.pack_id), entry.obj_offset, entry.obj_size)))
+        if sources:
+            try:
+                data = self.store.gather([source for _, source in sources], namespace="packs")
+            except (StoreObjectNotFound, ReadRangeError):
+                # a missing or truncated pack: read the objects one by one, so the ones in intact packs are
+                # still returned and the others get get()'s error handling.
+                for i, _ in sources:
+                    results[i] = self.get(ids[i], raise_missing=raise_missing)
+            else:
+                view = memoryview(data)
+                offset = 0
+                for i, (_, _, size) in sources:
+                    results[i] = view[offset : offset + size]
+                    offset += size
+        return results
+
+    def put(self, id, data):
+        """put a repo object
+
+        Buffers the chunk in the pack writer.  When the chunk fills the pack and
+        triggers a pack write, returns a list of (chunk_id, pack_id, obj_offset, obj_size)
+        tuples, one per written chunk; otherwise returns None.  With the background
+        store-thread (see PackWriter), the returned tuples are those of the *previous*
+        pack, whose store was joined before handing off the current one.
+        """
+        self._lock_refresh()
+        data_size = len(data)
+        if data_size > MAX_DATA_SIZE:
+            raise IntegrityError(f"More than allowed put data [{data_size} > {MAX_DATA_SIZE}]")
+        # PackWriter shares this repository's index, so add() triggers the lazy build itself.
+        return self._pack_writer.add(id, data)
+
+    def delete(self, id, *, validate, update_index=True, untrusted_pack_ids=frozenset()):
+        """Delete a single repo object by rewriting its pack without it (via compact_pack).
+
+        The rewrite deletes the old pack, so the index/ fragments point the pack's other objects at a
+        deleted pack until the index is stored again. The invalid marker (see write_chunkindex_invalid) is
+        written via compact_pack's before_old_pack_delete, just before the old pack is deleted.
+
+        Raises PermissionDenied before any store change unless the repo permissions grant write and delete
+        on packs/ and index/ (see assert_writable).
+
+        validate: passed to compact_pack.
+        update_index: True: store the full chunk index and delete the invalid marker. False: update the
+            in-memory index only; the marker stays until the index is stored and the marker deleted.
+        untrusted_pack_ids: passed to compact_pack.
+
+        Returns compact_pack's (new_pack_id, dropped_bytes): the id of the pack holding the other objects
+        of the old pack (None if there were none), and the number of bytes the rewrite dropped.
+        """
+        from .cache import write_chunkindex_to_repo, write_chunkindex_invalid, delete_chunkindex_invalid
+
+        self._lock_refresh()
+        self.assert_writable()
+        entry = self.chunks.get(id)
+        if entry is None:
+            raise self.ObjectNotFound(id, str(self._location))
+        pack_id = entry.pack_id
+        # keep every object the chunk index lists for this pack, except the one being deleted.
+        keep_ids = {cid for cid, e in self.chunks.iteritems() if e.pack_id == pack_id}
+        keep_ids.discard(id)
+        result = self.compact_pack(
+            pack_id,
+            keep_ids=keep_ids,
+            drop_ids={id},
+            validate=validate,
+            before_old_pack_delete=lambda: write_chunkindex_invalid(self),
+            untrusted_pack_ids=untrusted_pack_ids,
+        )
+        if update_index:
+            # close() only persists new entries incrementally, so write the full index here to record
+            # the removal for the next borg process.
+            write_chunkindex_to_repo(self, self.chunks, incremental=False, force_write=True, delete_other=True)
+            delete_chunkindex_invalid(self)
+        return result
+
+    def compact_pack(
+        self,
+        pack_id,
+        *,
+        keep_ids: set,
+        drop_ids: set,
+        validate,
+        chunks=None,
+        before_old_pack_delete=None,
+        untrusted_pack_ids=frozenset(),
+        superseded_ranges=None,
+    ):
+        """Rewrite pack <pack_id>, keeping <keep_ids> and dropping <drop_ids>, then delete the old pack.
+
+        keep_ids: chunk ids in this pack to copy into the new pack.
+        drop_ids: chunk ids in this pack to discard. Must not overlap keep_ids.
+        validate: passed to superseded_gap_ranges, whose ranges are dropped.
+        chunks: the ChunkIndex to look up the objects' pack locations in and to apply the index
+            updates to. Must be the index keep_ids and drop_ids were derived from. Default: self.chunks.
+        before_old_pack_delete: callable without arguments, called once just before the old pack is deleted.
+            Not called when no bytes are dropped, since the old pack then stays.
+        untrusted_pack_ids: passed to superseded_gap_ranges.
+        superseded_ranges: the (offset, size) ranges of the superseded duplicates to drop, as superseded_gap_ranges
+            returned them for this pack and this index. Default: superseded_gap_ranges is called here. If given,
+            validate and untrusted_pack_ids are not used.
+
+        Together, keep_ids and drop_ids must cover every object the chunk index lists for this pack;
+        an unlisted indexed object would keep its bytes in the new pack but its index entry would go
+        stale when the old pack is deleted. Gaps (byte ranges no index entry covers) are copied into
+        the new pack, except the superseded duplicates superseded_gap_ranges reports. An overlap
+        between listed objects, or an object claiming to end past the pack file, means index
+        corruption and raises IntegrityError.
+
+        The new pack is the old pack minus the dropped objects, built via store.defrag; kept objects are
+        repointed in the chunk index and dropped objects' chunk index entries are removed.
+
+        Returns (new_pack_id, dropped_bytes): new_pack_id is None if every byte was dropped, or the
+        unchanged pack_id if nothing was dropped; dropped_bytes is the on-disk bytes this rewrite freed
+        (unused indexed objects plus superseded duplicates), for --stats accounting.
+
+        Updates the in-memory chunk index only; requires the exclusive lock.
+        """
+        self._lock_refresh()
+        if chunks is None:
+            chunks = self.chunks
+        pack_key = "packs/" + bin_to_hex(pack_id)
+
+        assert keep_ids & drop_ids == set(), "an id cannot appear in both keep_ids and drop_ids"
+
+        # collect every listed object's range, tagged with whether it is kept, ordered by offset.
+        located = []  # (obj_offset, obj_id, obj_size, keep)
+        for obj_id in keep_ids | drop_ids:
+            keep = obj_id in keep_ids
+            entry = chunks[obj_id]
+            assert entry.pack_id == pack_id, f"{bin_to_hex(obj_id)} is not in pack {bin_to_hex(pack_id)}"
+            located.append((entry.obj_offset, obj_id, entry.obj_size, keep))
+        located.sort()
+
+        # validate the listed objects. an overlap is index corruption; so is an object ending past
+        # the pack file: store.defrag would short-read it into a truncated object in the new pack,
+        # then the intact source pack is deleted.
+        pack_size = self.store.info(pack_key).size
+        obj_ranges = [(offset, size) for offset, _, size, _ in located]
+        check_pack_objects(bin_to_hex(pack_id), obj_ranges, pack_size)
+
+        # record the dropped objects' byte ranges; every other byte (kept objects and gaps that no
+        # index entry covers) is copied into the new pack unchanged. superseded duplicates found in
+        # the gaps are dropped along with them (see superseded_gap_ranges).
+        drop_ranges = [(offset, size) for offset, _, size, keep in located if not keep]
+        if superseded_ranges is None:
+            reader = PackReader(store=self.store, pack_id=pack_id)
+            superseded_ranges = superseded_gap_ranges(
+                reader, chunks, pack_id, obj_ranges, pack_size, validate=validate, untrusted_pack_ids=untrusted_pack_ids
+            )
+        else:
+            # superseded duplicates lie in gaps: they overlap neither the listed objects nor each other.
+            covered = 0
+            for offset, size in sorted(obj_ranges + superseded_ranges):
+                assert offset >= covered, "superseded_ranges overlap an indexed object or each other"
+                covered = offset + size
+            assert covered <= pack_size, "superseded_ranges reach past the end of the pack"
+        drop_ranges += superseded_ranges
+        drop_ranges.sort()
+        dropped_bytes = sum(size for _, size in drop_ranges)  # on-disk bytes this rewrite frees, for --stats
+
+        # the new pack is the whole file minus the dropped ranges: copy the byte spans between them.
+        sources = []  # (pack_hex, offset, size) to copy, offset-ordered
+        pack_hex = bin_to_hex(pack_id)
+        cursor = 0
+        for offset, size in drop_ranges:
+            if offset > cursor:
+                sources.append((pack_hex, cursor, offset - cursor))
+            cursor = offset + size
+        if cursor < pack_size:
+            sources.append((pack_hex, cursor, pack_size - cursor))
+
+        # write the new pack (named by the store hash of its content) from those spans before touching the index
+        # or the old pack, so a failed read-back leaves everything unchanged. a span reading back short
+        # (defrag raises ReadRangeError) means the pack file is truncated or corrupt.
+        if sources:
+            try:
+                new_pack_id = hex_to_bin(self.store.defrag(sources, algorithm=STORE_HASH_NAME, namespace="packs"))
+            except ReadRangeError as e:
+                raise IntegrityError(f'pack {pack_hex}: {e}, run "borg check"') from e
+        else:
+            new_pack_id = None  # every byte was dropped: no replacement pack
+
+        # the new pack is not in the index/ fragments yet, so they still match the store; deleting the old
+        # pack makes them point at a deleted pack.
+        if before_old_pack_delete is not None and new_pack_id != pack_id:
+            before_old_pack_delete()
+
+        for drop_id in drop_ids:  # remove dropped objects from the index
+            del chunks[drop_id]
+
+        if new_pack_id is None:  # nothing kept: drop the pack, no replacement
+            self.store_delete(pack_key)
+            return None, dropped_bytes
+
+        # repoint kept objects at the new pack; an object's new offset is its old offset minus the
+        # dropped bytes lying before it. both lists are offset-ordered, so a single walk over the
+        # drop ranges keeps the running total of dropped bytes.
+        new_locations = []
+        dropped_before = 0
+        di = 0
+        for offset, obj_id, size, keep in located:
+            while di < len(drop_ranges) and drop_ranges[di][0] < offset:
+                dropped_before += drop_ranges[di][1]
+                di += 1
+            if keep:
+                new_locations.append((obj_id, new_pack_id, offset - dropped_before, size))
+        chunks.update_pack_info(new_locations)
+
+        # delete the old pack last, after the new one is stored and indexed, so kept bytes are never the
+        # only copy. with nothing dropped, defrag reproduced the pack (new_pack_id == pack_id) and
+        # deleting it would drop what we kept, so skip.
+        if new_pack_id != pack_id:
+            self.store_delete(pack_key)
+        return new_pack_id, dropped_bytes
+
+    def merge_packs(self, pack_ids, *, chunks=None, max_size=None):
+        """Combine several small packs into fewer, larger ones to reduce the pack count.
+
+        pack_ids: the packs to merge, whole files; afterwards the source packs are deleted.
+        chunks: the ChunkIndex to read object locations from and to apply the index updates to.
+            Must be the index pack_ids were derived from. Default: self.chunks.
+        max_size: byte cap for each merged pack. Default: the repository's configured pack size limit.
+
+        Whole pack files are copied, not individual indexed objects, so bytes no index entry covers
+        (a chunk copy superseded by a later put, or objects from a backup that crashed before
+        writing its index) are carried into the merged pack too.
+
+        Each source pack's index entries are checked for overlap or for claiming bytes past the
+        pack's actual end before anything is written; either means a corrupt index. Raises
+        IntegrityError in that case and leaves the store untouched; repair is "borg check --repair".
+
+        Packs are merged one batch at a time, each batch's sources deleted once its merged pack is
+        stored and indexed. So a crash or Ctrl-C between batches never destroys the only stored copy
+        of an object, and the store holds at most one batch of extra packs at a time. The packs not
+        yet merged are merged on the next run.
+        """
+        self._lock_refresh()
+        if chunks is None:
+            chunks = self.chunks
+        if max_size is None:
+            max_size = self.pack_max_size
+        pack_ids = set(pack_ids)
+
+        # collect every still-indexed object of the selected packs, grouped per source pack, ordered by offset.
+        per_pack = defaultdict(list)  # pack_id -> [(obj_offset, obj_id, obj_size), ...]
+        for obj_id, entry in chunks.iteritems():
+            if entry.pack_id in pack_ids:
+                per_pack[entry.pack_id].append((entry.obj_offset, obj_id, entry.obj_size))
+        for objs in per_pack.values():
+            objs.sort()
+
+        # get each source pack's real file size; drop any pack already gone from the store (its
+        # index entry is stale). store.info() reports a missing object via info.exists, not by raising.
+        pack_size = {}
+        for pid in list(pack_ids):
+            info = self.store.info("packs/" + bin_to_hex(pid))
+            if not info.exists:
+                logger.warning(f"Pack {bin_to_hex(pid)} to merge was already gone.")
+                pack_ids.discard(pid)
+                per_pack.pop(pid, None)
+                continue
+            pack_size[pid] = info.size
+
+        # validate every remaining pack before writing anything (see docstring).
+        for pid in pack_ids:
+            check_pack_objects(bin_to_hex(pid), ((offset, size) for offset, _, size in per_pack[pid]), pack_size[pid])
+
+        # greedily batch whole pack files so each output pack stays within max_size, in sorted id
+        # order so batch composition is reproducible.
+        batches = []  # each batch: [pack_id, ...]
+        current, current_size = [], 0
+        for pid in sorted(pack_ids):
+            size = pack_size[pid]
+            if current and current_size + size > max_size:
+                batches.append(current)
+                current, current_size = [], 0
+            current.append(pid)
+            current_size += size
+        if current:
+            batches.append(current)
+
+        # write each batch as a new pack (named by the store hash of its content) and repoint its objects: an
+        # object's new offset is the running byte total of the packs before its pack in the batch,
+        # plus its old offset within that pack.
+        pi = ProgressIndicatorPercent(total=len(batches), msg="Merging packs %3.0f%%", msgid="repository.merge_packs")
+        produced = set()  # merged pack ids; a one-pack batch reproduces its source's id
+        for batch in batches:
+            if sig_int:
+                break
+            self._lock_refresh()  # refresh the lock per batch, the loop can run for a while
+            sources = [(bin_to_hex(pid), 0, pack_size[pid]) for pid in batch]
+            try:
+                new_pack_id = hex_to_bin(self.store.defrag(sources, algorithm=STORE_HASH_NAME, namespace="packs"))
+            except ReadRangeError as e:  # a source pack shrank or is corrupt
+                raise IntegrityError(f'merge_packs: {e}, run "borg check"') from e
+            produced.add(new_pack_id)
+            new_locations = []
+            pack_base = 0
+            for pid in batch:
+                for offset, obj_id, size in per_pack[pid]:
+                    new_locations.append((obj_id, new_pack_id, pack_base + offset, size))
+                pack_base += pack_size[pid]
+            chunks.update_pack_info(new_locations)
+            # delete this batch's sources; skip any pack a batch reproduced (a one-pack batch hashes
+            # to the same content-addressed name), which now holds the merged data.
+            for pid in batch:
+                if pid in produced:
+                    continue
+                try:
+                    self.store_delete("packs/" + bin_to_hex(pid))
+                except StoreObjectNotFound:
+                    logger.warning(f"Pack {bin_to_hex(pid)} to merge was already gone.")
+            pi.show(increase=1)
+        pi.finish()
+
+    def transform_pack(
+        self, pack_id, ids, transform, *, validate, chunks=None, before_change=None, untrusted_pack_ids=frozenset()
+    ):
+        """Rewrite pack <pack_id>, passing each indexed object's bytes through <transform>.
+
+        ids: the chunk ids of this pack's objects. Must cover every object the chunk index lists
+            for this pack (same contract as compact_pack's keep_ids/drop_ids): an unlisted indexed
+            object would keep its bytes in the new pack, but its index entry would go stale when
+            the old pack is deleted.
+        transform: called as transform(chunk_id, obj_bytes) with an object's stored bytes; returns
+            the replacement bytes, or obj_bytes itself (the identical bytes object) to keep the
+            object unchanged. The chunk id (and thus the plaintext) must not change; sizes may.
+        validate: passed to superseded_gap_ranges, whose ranges are dropped.
+        chunks: the ChunkIndex to look up the objects' pack locations in and to apply the index
+            updates to. Must be the index <ids> was derived from. Default: self.chunks.
+        before_change: called once, just before the first store modification; use it to invalidate
+            stored chunk indexes for crash safety (see #9748). Not called when the pack is kept.
+        untrusted_pack_ids: passed to superseded_gap_ranges.
+
+        The whole pack file is loaded into memory (bounded by the pack size limit). Gaps (byte ranges
+        no index entry covers) are copied into the new pack, except the superseded duplicates
+        superseded_gap_ranges reports. An overlap between indexed objects, or an object claiming to
+        end past the pack file, means index corruption and raises IntegrityError, before anything is
+        written.
+
+        If every object is kept and no gap bytes are dropped, the store and the chunk index are not
+        touched at all. Otherwise the new pack (named by the store hash of its content) is stored, the indexed
+        objects are repointed at it, and the old pack is deleted last, so the objects' bytes are
+        never the only copy.
+
+        Returns (new_pack_id, new_size): the rewritten pack's id and byte size, or
+        (pack_id, <old size>) when the pack was kept unchanged.
+
+        Updates the in-memory chunk index only; the caller holds the exclusive lock and writes the
+        index back to the store afterwards.
+        """
+        self._lock_refresh()
+        if chunks is None:
+            chunks = self.chunks
+        pack_hex = bin_to_hex(pack_id)
+        pack_key = "packs/" + pack_hex
+
+        pack_contents = self.store.load(pack_key)
+        pack_size = len(pack_contents)
+        reader = PackReader(pack_id=pack_id, pack_contents=pack_contents)
+
+        # collect the listed objects' ranges, ordered by offset, and validate them (see docstring).
+        located = []  # (obj_offset, obj_id, obj_size)
+        for obj_id in ids:
+            entry = chunks[obj_id]
+            assert entry.pack_id == pack_id, f"{bin_to_hex(obj_id)} is not in pack {pack_hex}"
+            located.append((entry.obj_offset, obj_id, entry.obj_size))
+        located.sort()
+        obj_ranges = [(offset, size) for offset, _, size in located]
+        check_pack_objects(pack_hex, obj_ranges, pack_size)
+        drop_ranges = superseded_gap_ranges(
+            reader, chunks, pack_id, obj_ranges, pack_size, validate=validate, untrusted_pack_ids=untrusted_pack_ids
+        )
+
+        # assemble the new pack in offset order: transformed objects, dropped ranges skipped, all
+        # other bytes copied verbatim. the two range lists never overlap (drops lie in gaps), so a
+        # single offset-sorted walk over both handles the interleaving.
+        events = [(offset, size, obj_id) for offset, obj_id, size in located]
+        events += [(offset, size, None) for offset, size in drop_ranges]  # None: a range to drop
+        events.sort(key=lambda event: event[0])
+        pieces = []  # byte spans of the new pack, in order
+        new_locations = []  # (obj_id, new_offset, new_size) of each object
+        changed = bool(drop_ranges)
+        cursor = 0  # position in the old pack
+        new_offset = 0  # position in the new pack
+        for offset, size, obj_id in events:
+            if offset > cursor:  # verbatim span (gap bytes) before this event
+                pieces.append(pack_contents[cursor:offset])
+                new_offset += offset - cursor
+            if obj_id is not None:
+                obj_bytes = pack_contents[offset : offset + size]
+                new_bytes = transform(obj_id, obj_bytes)
+                if new_bytes is not obj_bytes:
+                    changed = True
+                pieces.append(new_bytes)
+                new_locations.append((obj_id, new_offset, len(new_bytes)))
+                new_offset += len(new_bytes)
+            # else: a dropped range, skip its bytes
+            cursor = offset + size
+        if cursor < pack_size:  # verbatim span after the last event
+            pieces.append(pack_contents[cursor:])
+
+        if not changed:
+            return pack_id, pack_size
+        pack_data = b"".join(pieces)
+        new_pack_id = store_hash(pack_data).digest()
+        if new_pack_id == pack_id:  # the transforms reproduced the pack byte-identically
+            return pack_id, pack_size
+
+        if before_change is not None:
+            before_change()
+        # store the new pack before touching the index or the old pack, so a failure leaves
+        # everything unchanged.
+        self.store.store("packs/" + bin_to_hex(new_pack_id), pack_data)
+        chunks.update_pack_info([(obj_id, new_pack_id, offset, size) for obj_id, offset, size in new_locations])
+        # delete the old pack last, after the new one is stored and indexed, so the objects' bytes
+        # are never the only copy.
+        self.store_delete(pack_key)
+        return new_pack_id, len(pack_data)
+
+    def salvage_pack(self, pack_id, *, validate, authenticate, chunks=None, before_old_pack_delete=None):
+        """Replace pack <pack_id> by a pack holding only the objects in it that authenticate.
+
+        A pack is named by the store hash (STORE_HASH_NAME) of its content.
+
+        validate: validate(chunk_id, obj) -> bool, True if obj (an object's header and metadata slot)
+            is the repo object with id chunk_id, see repoobj.object_validator. The pack is walked with
+            PackReader.iter_headers(validate).
+        authenticate: authenticate(chunk_id, obj) -> bool, True if obj (a whole object: header, metadata
+            slot and data slot) is the repo object with id chunk_id, see repoobj.whole_object_authenticator.
+            It must verify the tags of both slots.
+        chunks: the ChunkIndex to update. Default: self.chunks.
+        before_old_pack_delete: callable without arguments, called once after the replacement pack is
+            stored and before chunks is updated and the old pack is deleted; use it to invalidate stored
+            chunk indexes for crash safety (see #9748). Not called if the old pack is not deleted, see
+            SALVAGE_DONE.
+
+        Every object the walk yields and authenticate accepts is kept, whether the chunk index lists
+        it or not. Everything else is dropped: objects authenticate rejects, byte ranges the walk
+        skips, and trailing bytes too few for an object header. The replacement pack is the kept
+        objects' bytes in their old order.
+
+        Returns a SalvageResult. The store and the chunk index change only for SALVAGE_DONE:
+        - SALVAGE_READS_DIFFER: the loaded bytes hash to the pack's name although the store hash did
+          not, or a second load of the pack differs from the first, e.g. due to corruption in memory
+          or in transfer. Objects are dropped only if both loads return the same bytes.
+        - SALVAGE_READ_ERROR: reading the pack raised OSError, StoreBackendConnectionError or
+          ReadRangeError. All reads happen before the first store change.
+        - SALVAGE_DONE: the replacement pack is stored, before_old_pack_delete is called, chunks is
+          updated, then the old pack is deleted. If the replacement pack has the old pack's name
+          (the kept bytes are the undamaged pack), storing it overwrites the old pack, and
+          before_old_pack_delete and the delete are skipped. An exception in one of these steps leaves
+          the steps before it done.
+
+        The chunk index update: an entry of this pack is pointed at the kept object at its offset,
+        or else at a kept copy of the same chunk id, or else removed. A kept object whose chunk id
+        has no entry gets one with flags F_USED and size 0 (the plaintext size is unknown). Entries
+        of other packs and F_PENDING entries stay as they are.
+
+        Raises Error before any store access if uses_pack_store_cache is set (then two loads can
+        return the same cached copy). Raises Repository.PermissionDenied unless the repo permissions
+        allow compaction (see assert_writable), and StoreObjectNotFound if the pack is missing. Other
+        store backend errors propagate.
+
+        Updates the in-memory chunk index only; the caller holds the exclusive lock and writes the
+        index back to the store afterwards.
+        """
+        if self.uses_pack_store_cache:
+            raise Error("Pack salvage refused: with BORG_STORE_CACHE, pack reads may return the cached copy.")
+        self._lock_refresh()
+        if chunks is None:
+            chunks = self.chunks
+        self.assert_writable()
+        pack_hex = bin_to_hex(pack_id)
+        pack_key = "packs/" + pack_hex
+
+        def unchanged(status):
+            return SalvageResult(status, None, [], 0, [])
+
+        try:
+            if self.store.hash(pack_key, algorithm=STORE_HASH_NAME) == pack_hex:
+                return unchanged(SALVAGE_INTACT)
+            pack_contents = self.store.load(pack_key)
+            if store_hash(pack_contents).digest() == pack_id:
+                return unchanged(SALVAGE_READS_DIFFER)
+            reader = PackReader(pack_id=pack_id, pack_contents=pack_contents)
+            kept_old = []  # (chunk_id, old offset, size) of each kept object, offset-ordered
+            for chunk_id, offset, size in reader.iter_headers(validate=validate):
+                if authenticate(chunk_id, reader.read(offset, size)):
+                    kept_old.append((chunk_id, offset, size))
+            if not kept_old:
+                return unchanged(SALVAGE_NOTHING_AUTHENTICATES)
+            if self.store.load(pack_key) != pack_contents:
+                return unchanged(SALVAGE_READS_DIFFER)
+        except (OSError, StoreBackendConnectionError, ReadRangeError) as exc:
+            logger.warning(f"pack {pack_hex}: {exc}, not salvaging it.")
+            return unchanged(SALVAGE_READ_ERROR)
+
+        new_pack_data = b"".join(pack_contents[offset : offset + size] for _, offset, size in kept_old)
+        # equal to pack_id if the kept bytes are the undamaged pack, e.g. when the damage is appended bytes.
+        new_pack_id = store_hash(new_pack_data).digest()
+        kept = []  # (chunk_id, new offset, size)
+        new_offset = 0
+        for chunk_id, _, size in kept_old:
+            kept.append((chunk_id, new_offset, size))
+            new_offset += size
+        dropped_bytes = len(pack_contents) - len(new_pack_data)
+
+        self.store_store("packs/" + bin_to_hex(new_pack_id), new_pack_data)
+        if before_old_pack_delete is not None and new_pack_id != pack_id:
+            before_old_pack_delete()
+
+        new_by_old_offset = {old[1]: new for old, new in zip(kept_old, kept)}
+        new_by_id = {}  # chunk_id -> its first kept copy
+        for new in kept:
+            new_by_id.setdefault(new[0], new)
+        # collect first: the index must not be mutated while iterating it.
+        listed = [
+            (chunk_id, entry.obj_offset)
+            for chunk_id, entry in chunks.iteritems()
+            if entry.pack_id == pack_id and not (entry.flags & ChunkIndex.F_PENDING)
+        ]
+        new_locations = []
+        removed_ids = []
+        for chunk_id, old_offset in listed:
+            new = new_by_old_offset.get(old_offset)
+            if new is None or new[0] != chunk_id:
+                new = new_by_id.get(chunk_id)
+            if new is None:
+                del chunks[chunk_id]
+                removed_ids.append(chunk_id)
+            else:
+                new_locations.append((chunk_id, new_pack_id, new[1], new[2]))
+        chunks.update_pack_info(new_locations)
+        for chunk_id, (_, offset, size) in new_by_id.items():
+            if chunk_id not in chunks:
+                chunks[chunk_id] = ChunkIndexEntry(
+                    flags=ChunkIndex.F_USED, size=0, pack_id=new_pack_id, obj_offset=offset, obj_size=size
+                )
+
+        if new_pack_id != pack_id:  # else storing the replacement pack overwrote the old one
+            self.store_delete(pack_key)
+        self._pack_cache.pop(pack_id, None)
+        return SalvageResult(SALVAGE_DONE, new_pack_id, kept, dropped_bytes, removed_ids)
+
+    def _salvage_corrupt_packs(self, tracker, present_pack_ids, chunks, *, validate, authenticate):
+        """Salvage each pack in packs/ that tracker records corrupt with salvage_pack.
+
+        tracker: the PackTracker. The record of a salvaged pack is dropped, a pack that reads intact is
+            recorded intact and counted (see the return value).
+        present_pack_ids: the set of pack ids in packs/. Only these packs are salvaged. The id of a
+            salvaged pack is replaced by the id of its replacement pack.
+        chunks: the ChunkIndex read from the index/ fragments, or None if it could not be read. It is
+            updated and, after a salvage, stored, so the repository index is current as soon as this
+            returns. If None, salvage_pack updates an empty ChunkIndex, which is not stored, and the
+            stored index stays marked invalid (see write_chunkindex_invalid).
+        validate, authenticate: passed to salvage_pack. If authenticate is None, no pack is salvaged.
+
+        Returns (number of packs salvaged, number of those that may have lost chunks, number of packs that
+        read intact). A salvage may have lost chunks if it removed index entries, or if chunks is None.
+        """
+        from .cache import list_chunkindex_hashes, chunkindex_is_invalid, write_chunkindex_to_repo
+        from .cache import write_chunkindex_invalid, delete_chunkindex_invalid
+
+        corrupt_ids = [pack_id for pack_id in tracker.corrupt_ids() if pack_id in present_pack_ids]
+        if not corrupt_ids:
+            return 0, 0, 0
+        if authenticate is None:
+            logger.error(
+                f"Not salvaging {len(corrupt_ids)} corrupt pack(s): objects can not be authenticated with "
+                "BORG_WORKAROUNDS=authenticated_no_key."
+            )
+            return 0, 0, 0
+        if self.uses_pack_store_cache:
+            logger.error(f"Not salvaging {len(corrupt_ids)} corrupt pack(s): BORG_STORE_CACHE is set.")
+            return 0, 0, 0
+        try:
+            self.assert_writable()
+        except self.PermissionDenied as err:
+            logger.error(f"Not salvaging {len(corrupt_ids)} corrupt pack(s): {err}")
+            return 0, 0, 0
+        index = chunks if chunks is not None else ChunkIndex()
+        # the stored index points at the packs salvage_pack deletes, so mark it invalid before the first
+        # delete, unless there is none or it is marked invalid already.
+        mark_needed = bool(list_chunkindex_hashes(self)) and not chunkindex_is_invalid(self)
+        marked = False
+
+        def mark_index_invalid():
+            nonlocal marked
+            if mark_needed and not marked:
+                write_chunkindex_invalid(self)
+                marked = True
+
+        salvaged = lossy = reread_intact = 0
+        pi = ProgressIndicatorPercent(
+            total=len(corrupt_ids), msg="Salvaging packs %3.0f%%", msgid="check.salvage_packs"
+        )
+        for pack_id in corrupt_ids:
+            if sig_int:
+                logger.info(f"Interrupted pack salvage, {salvaged} pack(s) salvaged so far.")
+                break
+            pi.show(increase=1)
+            pack_hex = bin_to_hex(pack_id)
+            result = self.salvage_pack(
+                pack_id,
+                validate=validate,
+                authenticate=authenticate,
+                chunks=index,
+                before_old_pack_delete=mark_index_invalid,
+            )
+            if result.status == SALVAGE_INTACT:
+                tracker.record(pack_id, True)
+                reread_intact += 1
+                logger.warning(
+                    f"Pack {pack_hex} read corrupt, then intact; it is kept as it is. The storage or the "
+                    "transfer may be unreliable."
+                )
+            elif result.status == SALVAGE_DONE:
+                salvaged += 1
+                # with an empty index, which chunks the dropped bytes held is unknown.
+                lossy += bool(result.removed_ids or chunks is None)
+                tracker.forget(pack_id)  # pack_id is deleted, or holds the replacement pack
+                present_pack_ids.discard(pack_id)
+                present_pack_ids.add(result.new_pack_id)
+                logger.warning(
+                    f"Salvaged corrupt pack {pack_hex}: kept {len(result.kept)} object(s) in pack "
+                    f"{bin_to_hex(result.new_pack_id)}, dropped {result.dropped_bytes} byte(s), removed "
+                    f"{len(result.removed_ids)} index entry(s)."
+                )
+                for chunk_id in result.removed_ids:
+                    logger.debug(f"Removed index entry: {bin_to_hex(chunk_id)}")
+            else:
+                logger.error(f"Corrupt pack {pack_hex} was not salvaged: {result.status}.")
+        else:
+            pi.show(current=len(corrupt_ids))  # finish at 100%
+        pi.finish()
+        if chunks is None:
+            return salvaged, lossy, reread_intact
+        if salvaged:
+            # the old index/ fragments hold entries salvage_pack changed or removed, so store every entry
+            # (incremental=False), also if there is none (force_write=True), and delete the old fragments
+            # (delete_other=True).
+            write_chunkindex_to_repo(self, chunks, incremental=False, force_write=True, delete_other=True)
+        if marked:
+            # the stored index is current again; write_chunkindex_to_repo deletes the marker only if it
+            # deleted a fragment.
+            delete_chunkindex_invalid(self)
+        return salvaged, lossy, reread_intact
+
+    def acquire_lock(self):
+        """Lock the repository (as requested by open()), loading its key first if no key was set yet.
+
+        The key is needed first, because the lock objects are stored in its envelope (see storelocking).
+        This is also why a passphrase prompt comes before waiting for the lock.
+        """
+        assert self.lock is None
+        exclusive, lock_wait = self._lock_args
+        self.lock = self._make_lock(exclusive=exclusive, timeout=lock_wait).acquire()
 
     def break_lock(self):
-        Lock(os.path.join(self.path, 'lock')).break_lock()
+        """Delete all lock objects (not just ours). Loads the key first if no key was set yet, see acquire_lock()."""
+        self._make_lock().break_lock()
+
+    def _make_lock(self, **kwargs):
+        """Return a Lock whose lock objects are sealed with the repository's key (loaded first, if needed).
+
+        The Lock keeps using the key it was made with, also if set_key() sets another key later, so that
+        our own lock objects always stay readable for us.
+        """
+        if self.key is None:
+            self.set_key(self._key_loader(self) if self._key_loader is not None else key_factory(self))
+        key, aad = self.key, self._store_obj_aad("locks", True)
+
+        def seal(value):
+            # encrypt_oneshot: a LockRefresher thread may refresh the lock while the main thread encrypts.
+            return key.encrypt_oneshot(b"", value, aad=aad)
+
+        def unseal(envelope):
+            return key.decrypt(b"", envelope, aad=aad)
+
+        return Lock(self.store, repository=self._location.canonical_path(), seal=seal, unseal=unseal, **kwargs)
 
     def migrate_lock(self, old_id, new_id):
         # note: only needed for local repos
         if self.lock is not None:
             self.lock.migrate_lock(old_id, new_id)
 
-    def open(self, path, exclusive, lock_wait=None, lock=True):
-        self.path = path
+    def store_list(self, name, *, deleted=False):
+        self._lock_refresh()
         try:
-            st = os.stat(path)
-        except FileNotFoundError:
-            raise self.DoesNotExist(path)
-        if not stat.S_ISDIR(st.st_mode):
-            raise self.InvalidRepository(path)
-        if lock:
-            self.lock = Lock(os.path.join(path, 'lock'), exclusive, timeout=lock_wait).acquire()
-        else:
-            self.lock = None
-        self.config = ConfigParser(interpolation=None)
-        try:
-            with open(os.path.join(self.path, 'config')) as fd:
-                self.config.read_file(fd)
-        except FileNotFoundError:
-            self.close()
-            raise self.InvalidRepository(self.path)
-        if 'repository' not in self.config.sections() or self.config.getint('repository', 'version') != 1:
-            self.close()
-            raise self.InvalidRepository(path)
-        self.max_segment_size = parse_file_size(self.config.get('repository', 'max_segment_size'))
-        if self.max_segment_size >= MAX_SEGMENT_SIZE_LIMIT:
-            self.close()
-            raise self.InvalidRepositoryConfig(path, 'max_segment_size >= %d' % MAX_SEGMENT_SIZE_LIMIT)  # issue 3592
-        self.segments_per_dir = self.config.getint('repository', 'segments_per_dir')
-        self.additional_free_space = parse_file_size(self.config.get('repository', 'additional_free_space', fallback=0))
-        # append_only can be set in the constructor
-        # it shouldn't be overridden (True -> False) here
-        self.append_only = self.append_only or self.config.getboolean('repository', 'append_only', fallback=False)
-        if self.storage_quota is None:
-            # self.storage_quota is None => no explicit storage_quota was specified, use repository setting.
-            self.storage_quota = parse_file_size(self.config.get('repository', 'storage_quota', fallback=0))
-        self.id = unhexlify(self.config.get('repository', 'id').strip())
-        self.io = LoggedIO(self.path, self.max_segment_size, self.segments_per_dir)
-        if self.check_segment_magic:
-            # read a segment and check whether we are dealing with a non-upgraded Attic repository
-            segment = self.io.get_latest_segment()
-            if segment is not None and self.io.get_segment_magic(segment) == ATTIC_MAGIC:
-                self.close()
-                raise self.AtticRepository(path)
+            return list(self.store.list(name, deleted=deleted))
+        except StoreObjectNotFound:
+            return []
 
-    def close(self):
-        if self.lock:
-            if self.io:
-                self.io.close()
-            self.io = None
-            self.lock.release()
-            self.lock = None
+    def store_load(self, name, *, size=None, offset=0):
+        self._lock_refresh()
+        return self.store.load(name, size=size, offset=offset)
 
-    def commit(self, save_space=False, compact=True, threshold=0.1, cleanup_commits=False):
-        """Commit transaction
+    def store_store(self, name, value):
+        self._lock_refresh()
+        return self.store.store(name, value)
+
+    def set_key(self, key):
+        """Set the key that protects the lock, index/ and cache/ store objects, see store_encrypt_store()."""
+        self.key = key
+
+    def _store_obj_aad(self, name, hashed_name):
+        # the AAD of a store object's envelope: the repository id and the full object name, or for a hashed-name
+        # object its namespace. the tag keeps these two apart, e.g. the namespace "index" and an object named "index".
+        return STORE_OBJ_AAD + self.id + (b"h" if hashed_name else b"n") + name.encode()
+
+    def store_encrypt_store(self, name, value, *, hashed_name=False):
+        """Store value under name, wrapped in the key's envelope.
+
+        "encrypt" means "apply the key's envelope", exactly like for the objects in the packs (see
+        KeyBase.encrypt): encrypted and authenticated in the encrypting modes, authenticated only in
+        the authenticated-* modes.
+
+        The repository id is bound into the envelope as AAD (see _store_obj_aad), and:
+        hashed_name=False: name is the full object name and is bound into the envelope as AAD.
+        hashed_name=True: name is a namespace (e.g. "index"); the object is stored as
+        <name>/<hex store hash of the envelope> and the namespace is the AAD (the full name does not
+        exist before the envelope does).
+
+        Returns the full name the object was stored under. Raises KeyRequired if no key was set.
         """
-        # save_space is not used anymore, but stays for RPC/API compatibility.
-        if self.transaction_doomed:
-            exception = self.transaction_doomed
-            self.rollback()
-            raise exception
-        self.check_free_space()
-        self.log_storage_quota()
-        segment = self.io.write_commit()
-        self.segments.setdefault(segment, 0)
-        self.compact[segment] += LoggedIO.header_fmt.size
-        if compact and not self.append_only:
-            if cleanup_commits:
-                # due to bug #2850, there might be a lot of commit-only segment files.
-                # this is for a one-time cleanup of these 17byte files.
-                for segment, filename in self.io.segment_iterator():
-                    if os.path.getsize(filename) == 17:
-                        self.segments[segment] = 0
-                        self.compact[segment] = LoggedIO.header_fmt.size
-            self.compact_segments(threshold)
-        self.write_index()
-        self.rollback()
+        if self.key is None:
+            raise self.KeyRequired(str(self._location), name)
+        envelope = self.key.encrypt(b"", value, aad=self._store_obj_aad(name, hashed_name))
+        if hashed_name:
+            name = f"{name}/{store_hash(envelope).hexdigest()}"
+        self.store_store(name, envelope)
+        return name
 
-    def _read_integrity(self, transaction_id, key):
-        integrity_file = 'integrity.%d' % transaction_id
-        integrity_path = os.path.join(self.path, integrity_file)
+    def store_load_decrypt(self, name, *, hashed_name=False):
+        """Load an object stored by store_encrypt_store(), verify and unwrap its envelope.
+
+        hashed_name=True: name is <namespace>/<hex store hash> and the namespace is the AAD. The stored
+        bytes are not hashed to verify the name: the authentication of the envelope already proves that
+        the content is correct (borg check verifies the names, see check()).
+
+        Returns the payload (bytes or a memoryview). Raises StoreObjectNotFound if the object is
+        missing, IntegrityError if the envelope authentication fails, KeyRequired if no key was set.
+        """
+        if self.key is None:
+            raise self.KeyRequired(str(self._location), name)
+        envelope = self.store_load(name)
+        aad_name = name.rsplit("/", 1)[0] if hashed_name else name
         try:
-            with open(integrity_path, 'rb') as fd:
-                integrity = msgpack.unpack(fd)
-        except FileNotFoundError:
+            return self.key.decrypt(b"", envelope, aad=self._store_obj_aad(aad_name, hashed_name))
+        except IntegrityError as err:
+            raise IntegrityError(f"Store object {name}: authentication failed") from err
+
+    def save_defaults(self, defaults):
+        """Store the repository defaults (the config/defaults store object).
+
+        defaults: a dict mapping option names to their default values as strings, e.g.
+        {"compression": "zstd,3"}, or {} for no defaults. The commands use such a default if the option
+        was not given (see with_repository).
+
+        "borg repo-create" always writes the object, so a repository without it lost it (see
+        load_defaults). Unlike config/config, which is read before the key is known, the object is stored
+        in the key's envelope (see store_encrypt_store), so changing the defaults (e.g. removing an
+        "obfuscate" compression) needs the key: a changed object fails the authentication, a removed one
+        is missing, and the commands refuse to run either way.
+        """
+        self.store_encrypt_store(DEFAULTS_NAME, msgpack.packb(defaults))
+        self._defaults = dict(defaults)
+
+    def load_defaults(self):
+        """Return the repository defaults stored by save_defaults(), {} if there are none.
+
+        The store object is only read once, later calls return the same defaults.
+
+        Raises DefaultsMissing if the object is missing (it was removed or lost, "borg check --repair"
+        stores empty defaults), IntegrityError if the envelope authentication fails,
+        InvalidRepositoryConfig if the content is not a dict of strings.
+        """
+        if self._defaults is not None:
+            return dict(self._defaults)
+        try:
+            data = self.store_load_decrypt(DEFAULTS_NAME)
+        except StoreObjectNotFound:
+            raise self.DefaultsMissing(self._location.canonical_path()) from None
+        except IntegrityError as err:
+            raise IntegrityError(f'{err.args[0]}. Run "borg check --repair" to store empty defaults.') from err
+        try:
+            defaults = msgpack.unpackb(data)
+        except msgpack.UnpackException:
+            defaults = None
+        if not (
+            isinstance(defaults, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in defaults.items())
+        ):
+            raise self.InvalidRepositoryConfig(self._location.canonical_path(), f"{DEFAULTS_NAME} is malformed")
+        self._defaults = defaults
+        return dict(defaults)
+
+    def store_delete(self, name, *, deleted=False):
+        self._lock_refresh()
+        return self.store.delete(name, deleted=deleted)
+
+    def assert_writable(self):
+        """Raise PermissionDenied if the repo permissions forbid compaction.
+
+        Compaction stores new packs and index fragments and deletes the old ones, so it needs
+        write (w/W) and delete (D) access to the packs/ and index/ namespaces. self.permissions
+        is None when no restrictions apply (BORG_REPO_PERMISSIONS=all).
+        """
+        if self.permissions is None:
             return
-        if integrity.get(b'version') != 2:
-            logger.warning('Unknown integrity data version %r in %s', integrity.get(b'version'), integrity_file)
-            return
-        return integrity[key].decode()
-
-    def open_index(self, transaction_id, auto_recover=True):
-        if transaction_id is None:
-            return NSIndex()
-        index_path = os.path.join(self.path, 'index.%d' % transaction_id)
-        integrity_data = self._read_integrity(transaction_id, b'index')
-        try:
-            with IntegrityCheckedFile(index_path, write=False, integrity_data=integrity_data) as fd:
-                return NSIndex.read(fd)
-        except (ValueError, OSError, FileIntegrityError) as exc:
-            logger.warning('Repository index missing or corrupted, trying to recover from: %s', exc)
-            os.unlink(index_path)
-            if not auto_recover:
-                raise
-            self.prepare_txn(self.get_transaction_id())
-            # don't leave an open transaction around
-            self.commit(compact=False)
-            return self.open_index(self.get_transaction_id())
-
-    def prepare_txn(self, transaction_id, do_cleanup=True):
-        self._active_txn = True
-        if self.do_lock and not self.lock.got_exclusive_lock():
-            if self.exclusive is not None:
-                # self.exclusive is either True or False, thus a new client is active here.
-                # if it is False and we get here, the caller did not use exclusive=True although
-                # it is needed for a write operation. if it is True and we get here, something else
-                # went very wrong, because we should have a exclusive lock, but we don't.
-                raise AssertionError("bug in code, exclusive lock should exist here")
-            # if we are here, this is an old client talking to a new server (expecting lock upgrade).
-            # or we are replaying segments and might need a lock upgrade for that.
-            try:
-                self.lock.upgrade()
-            except (LockError, LockErrorT):
-                # if upgrading the lock to exclusive fails, we do not have an
-                # active transaction. this is important for "serve" mode, where
-                # the repository instance lives on - even if exceptions happened.
-                self._active_txn = False
-                raise
-        if not self.index or transaction_id is None:
-            try:
-                self.index = self.open_index(transaction_id, auto_recover=False)
-            except (ValueError, OSError, FileIntegrityError) as exc:
-                logger.warning('Checking repository transaction due to previous error: %s', exc)
-                self.check_transaction()
-                self.index = self.open_index(transaction_id, auto_recover=False)
-        if transaction_id is None:
-            self.segments = {}  # XXX bad name: usage_count_of_segment_x = self.segments[x]
-            self.compact = FreeSpace()  # XXX bad name: freeable_space_of_segment_x = self.compact[x]
-            self.storage_quota_use = 0
-            self.shadow_index.clear()
-        else:
-            if do_cleanup:
-                self.io.cleanup(transaction_id)
-            hints_path = os.path.join(self.path, 'hints.%d' % transaction_id)
-            index_path = os.path.join(self.path, 'index.%d' % transaction_id)
-            integrity_data = self._read_integrity(transaction_id, b'hints')
-            try:
-                with IntegrityCheckedFile(hints_path, write=False, integrity_data=integrity_data) as fd:
-                    hints = msgpack.unpack(fd)
-            except (msgpack.UnpackException, FileNotFoundError, FileIntegrityError) as e:
-                logger.warning('Repository hints file missing or corrupted, trying to recover: %s', e)
-                if not isinstance(e, FileNotFoundError):
-                    os.unlink(hints_path)
-                # index must exist at this point
-                os.unlink(index_path)
-                self.check_transaction()
-                self.prepare_txn(transaction_id)
-                return
-            if hints[b'version'] == 1:
-                logger.debug('Upgrading from v1 hints.%d', transaction_id)
-                self.segments = hints[b'segments']
-                self.compact = FreeSpace()
-                self.storage_quota_use = 0
-                self.shadow_index = {}
-                for segment in sorted(hints[b'compact']):
-                    logger.debug('Rebuilding sparse info for segment %d', segment)
-                    self._rebuild_sparse(segment)
-                logger.debug('Upgrade to v2 hints complete')
-            elif hints[b'version'] != 2:
-                raise ValueError('Unknown hints file version: %d' % hints[b'version'])
-            else:
-                self.segments = hints[b'segments']
-                self.compact = FreeSpace(hints[b'compact'])
-                self.storage_quota_use = hints.get(b'storage_quota_use', 0)
-                self.shadow_index = hints.get(b'shadow_index', {})
-            self.log_storage_quota()
-            # Drop uncommitted segments in the shadow index
-            for key, shadowed_segments in self.shadow_index.items():
-                for segment in list(shadowed_segments):
-                    if segment > transaction_id:
-                        shadowed_segments.remove(segment)
-
-    def write_index(self):
-        def flush_and_sync(fd):
-            fd.flush()
-            os.fsync(fd.fileno())
-
-        def rename_tmp(file):
-            os.rename(file + '.tmp', file)
-
-        hints = {
-            b'version': 2,
-            b'segments': self.segments,
-            b'compact': self.compact,
-            b'storage_quota_use': self.storage_quota_use,
-            b'shadow_index': self.shadow_index,
-        }
-        integrity = {
-            # Integrity version started at 2, the current hints version.
-            # Thus, integrity version == hints version, for now.
-            b'version': 2,
-        }
-        transaction_id = self.io.get_segments_transaction_id()
-        assert transaction_id is not None
-
-        # Log transaction in append-only mode
-        if self.append_only:
-            with open(os.path.join(self.path, 'transactions'), 'a') as log:
-                print('transaction %d, UTC time %s' % (
-                      transaction_id, datetime.utcnow().strftime(ISO_FORMAT)), file=log)
-
-        # Write hints file
-        hints_name = 'hints.%d' % transaction_id
-        hints_file = os.path.join(self.path, hints_name)
-        with IntegrityCheckedFile(hints_file + '.tmp', filename=hints_name, write=True) as fd:
-            msgpack.pack(hints, fd)
-            flush_and_sync(fd)
-        integrity[b'hints'] = fd.integrity_data
-
-        # Write repository index
-        index_name = 'index.%d' % transaction_id
-        index_file = os.path.join(self.path, index_name)
-        with IntegrityCheckedFile(index_file + '.tmp', filename=index_name, write=True) as fd:
-            # XXX: Consider using SyncFile for index write-outs.
-            self.index.write(fd)
-            flush_and_sync(fd)
-        integrity[b'index'] = fd.integrity_data
-
-        # Write integrity file, containing checksums of the hints and index files
-        integrity_name = 'integrity.%d' % transaction_id
-        integrity_file = os.path.join(self.path, integrity_name)
-        with open(integrity_file + '.tmp', 'wb') as fd:
-            msgpack.pack(integrity, fd)
-            flush_and_sync(fd)
-
-        # Rename the integrity file first
-        rename_tmp(integrity_file)
-        sync_dir(self.path)
-        # Rename the others after the integrity file is hypothetically on disk
-        rename_tmp(hints_file)
-        rename_tmp(index_file)
-        sync_dir(self.path)
-
-        # Remove old auxiliary files
-        current = '.%d' % transaction_id
-        for name in os.listdir(self.path):
-            if not name.startswith(('index.', 'hints.', 'integrity.')):
-                continue
-            if name.endswith(current):
-                continue
-            os.unlink(os.path.join(self.path, name))
-        self.index = None
-
-    def check_free_space(self):
-        """Pre-commit check for sufficient free space to actually perform the commit."""
-        # As a baseline we take four times the current (on-disk) index size.
-        # At this point the index may only be updated by compaction, which won't resize it.
-        # We still apply a factor of four so that a later, separate invocation can free space
-        # (journaling all deletes for all chunks is one index size) or still make minor additions
-        # (which may grow the index up to twice its current size).
-        # Note that in a subsequent operation the committed index is still on-disk, therefore we
-        # arrive at index_size * (1 + 2 + 1).
-        # In that order: journaled deletes (1), hashtable growth (2), persisted index (1).
-        required_free_space = self.index.size() * 4
-
-        # Conservatively estimate hints file size:
-        # 10 bytes for each segment-refcount pair, 10 bytes for each segment-space pair
-        # Assume maximum of 5 bytes per integer. Segment numbers will usually be packed more densely (1-3 bytes),
-        # as will refcounts and free space integers. For 5 MiB segments this estimate is good to ~20 PB repo size.
-        # Add 4K to generously account for constant format overhead.
-        hints_size = len(self.segments) * 10 + len(self.compact) * 10 + 4096
-        required_free_space += hints_size
-
-        required_free_space += self.additional_free_space
-        if not self.append_only:
-            full_segment_size = self.max_segment_size + MAX_OBJECT_SIZE
-            if len(self.compact) < 10:
-                # This is mostly for the test suite to avoid overestimated free space needs. This can be annoying
-                # if TMP is a small-ish tmpfs.
-                compact_working_space = 0
-                for segment, free in self.compact.items():
-                    try:
-                        compact_working_space += self.io.segment_size(segment) - free
-                    except FileNotFoundError:
-                        # looks like self.compact is referring to a non-existent segment file, ignore it.
-                        pass
-                logger.debug('check_free_space: few segments, not requiring a full free segment')
-                compact_working_space = min(compact_working_space, full_segment_size)
-                logger.debug('check_free_space: calculated working space for compact as %d bytes', compact_working_space)
-                required_free_space += compact_working_space
-            else:
-                # Keep one full worst-case segment free in non-append-only mode
-                required_free_space += full_segment_size
-
-        try:
-            free_space = shutil.disk_usage(self.path).free
-        except OSError as os_error:
-            logger.warning('Failed to check free space before committing: ' + str(os_error))
-            return
-        logger.debug('check_free_space: required bytes {}, free bytes {}'.format(required_free_space, free_space))
-        if free_space < required_free_space:
-            if self.created:
-                logger.error('Not enough free space to initialize repository at this location.')
-                self.destroy()
-            else:
-                self._rollback(cleanup=True)
-            formatted_required = format_file_size(required_free_space)
-            formatted_free = format_file_size(free_space)
-            raise self.InsufficientFreeSpaceError(formatted_required, formatted_free)
-
-    def log_storage_quota(self):
-        if self.storage_quota:
-            logger.info('Storage quota: %s out of %s used.',
-                        format_file_size(self.storage_quota_use), format_file_size(self.storage_quota))
-
-    def compact_segments(self, threshold):
-        """Compact sparse segments by copying data into new segments
-        """
-        if not self.compact:
-            logger.debug('nothing to do: compact empty')
-            return
-        freed_space = 0
-        index_transaction_id = self.get_index_transaction_id()
-        segments = self.segments
-        unused = []  # list of segments, that are not used anymore
-
-        def complete_xfer(intermediate=True):
-            # complete the current transfer (when some target segment is full)
-            nonlocal unused
-            # commit the new, compact, used segments
-            segment = self.io.write_commit(intermediate=intermediate)
-            self.segments.setdefault(segment, 0)
-            self.compact[segment] += LoggedIO.header_fmt.size
-            logger.debug('complete_xfer: wrote %scommit at segment %d', 'intermediate ' if intermediate else '', segment)
-            # get rid of the old, sparse, unused segments. free space.
-            for segment in unused:
-                logger.debug('complete_xfer: deleting unused segment %d', segment)
-                count = self.segments.pop(segment)
-                assert count == 0, 'Corrupted segment reference count - corrupted index or hints'
-                self.io.delete_segment(segment)
-                del self.compact[segment]
-            unused = []
-
-        logger.debug('Compaction started (threshold is %i%%).', threshold * 100)
-        pi = ProgressIndicatorPercent(total=len(self.compact), msg='Compacting segments %3.0f%%', step=1,
-                                      msgid='repository.compact_segments')
-        for segment, freeable_space in sorted(self.compact.items()):
-            if not self.io.segment_exists(segment):
-                logger.warning('segment %d not found, but listed in compaction data', segment)
-                del self.compact[segment]
-                pi.show()
-                continue
-            segment_size = self.io.segment_size(segment)
-            freeable_ratio = 1.0 * freeable_space / segment_size
-            # we want to compact if:
-            # - we can free a considerable relative amount of space (freeable_ratio over some threshold)
-            if not (freeable_ratio > threshold):
-                logger.debug('not compacting segment %d (freeable: %2.2f%% [%d bytes])',
-                             segment, freeable_ratio * 100.0, freeable_space)
-                pi.show()
-                continue
-            freed_space += freeable_space  # this is what we THINK we can free
-            segments.setdefault(segment, 0)
-            logger.debug('compacting segment %d with usage count %d (freeable: %2.2f%% [%d bytes])',
-                         segment, segments[segment], freeable_ratio * 100.0, freeable_space)
-            for tag, key, offset, data in self.io.iter_objects(segment, include_data=True):
-                if tag == TAG_COMMIT:
-                    continue
-                in_index = self.index.get(key)
-                is_index_object = in_index == (segment, offset)
-                if tag == TAG_PUT and is_index_object:
-                    try:
-                        new_segment, offset = self.io.write_put(key, data, raise_full=True)
-                    except LoggedIO.SegmentFull:
-                        complete_xfer()
-                        new_segment, offset = self.io.write_put(key, data)
-                    self.index[key] = new_segment, offset
-                    segments.setdefault(new_segment, 0)
-                    segments[new_segment] += 1
-                    segments[segment] -= 1
-                elif tag == TAG_PUT and not is_index_object:
-                    # If this is a PUT shadowed by a later tag, then it will be gone when this segment is deleted after
-                    # this loop. Therefore it is removed from the shadow index.
-                    try:
-                        self.shadow_index[key].remove(segment)
-                    except (KeyError, ValueError):
-                        # do not remove entry with empty shadowed_segments list here,
-                        # it is needed for shadowed_put_exists code (see below)!
-                        pass
-                elif tag == TAG_DELETE and not in_index:
-                    # If the shadow index doesn't contain this key, then we can't say if there's a shadowed older tag,
-                    # therefore we do not drop the delete, but write it to a current segment.
-                    shadowed_put_exists = key not in self.shadow_index or any(
-                        # If the key is in the shadow index and there is any segment with an older PUT of this
-                        # key, we have a shadowed put.
-                        shadowed < segment for shadowed in self.shadow_index[key])
-                    delete_is_not_stable = index_transaction_id is None or segment > index_transaction_id
-
-                    if shadowed_put_exists or delete_is_not_stable:
-                        # (introduced in 6425d16aa84be1eaaf88)
-                        # This is needed to avoid object un-deletion if we crash between the commit and the deletion
-                        # of old segments in complete_xfer().
-                        #
-                        # However, this only happens if the crash also affects the FS to the effect that file deletions
-                        # did not materialize consistently after journal recovery. If they always materialize in-order
-                        # then this is not a problem, because the old segment containing a deleted object would be deleted
-                        # before the segment containing the delete.
-                        #
-                        # Consider the following series of operations if we would not do this, ie. this entire if:
-                        # would be removed.
-                        # Columns are segments, lines are different keys (line 1 = some key, line 2 = some other key)
-                        # Legend: P=TAG_PUT, D=TAG_DELETE, c=commit, i=index is written for latest commit
-                        #
-                        # Segment | 1     | 2   | 3
-                        # --------+-------+-----+------
-                        # Key 1   | P     | D   |
-                        # Key 2   | P     |     | P
-                        # commits |   c i |   c |   c i
-                        # --------+-------+-----+------
-                        #                       ^- compact_segments starts
-                        #                           ^- complete_xfer commits, after that complete_xfer deletes
-                        #                              segments 1 and 2 (and then the index would be written).
-                        #
-                        # Now we crash. But only segment 2 gets deleted, while segment 1 is still around. Now key 1
-                        # is suddenly undeleted (because the delete in segment 2 is now missing).
-                        # Again, note the requirement here. We delete these in the correct order that this doesn't happen,
-                        # and only if the FS materialization of these deletes is reordered or parts dropped this can happen.
-                        # In this case it doesn't cause outright corruption, 'just' an index count mismatch, which will be
-                        # fixed by borg-check --repair.
-                        #
-                        # Note that in this check the index state is the proxy for a "most definitely settled" repository state,
-                        # ie. the assumption is that *all* operations on segments <= index state are completed and stable.
-                        try:
-                            new_segment, size = self.io.write_delete(key, raise_full=True)
-                        except LoggedIO.SegmentFull:
-                            complete_xfer()
-                            new_segment, size = self.io.write_delete(key)
-                        self.compact[new_segment] += size
-                        segments.setdefault(new_segment, 0)
-                    else:
-                        # we did not keep the delete tag for key (see if-branch)
-                        if not self.shadow_index[key]:
-                            # shadowed segments list is empty -> remove it
-                            del self.shadow_index[key]
-            assert segments[segment] == 0, 'Corrupted segment reference count - corrupted index or hints'
-            unused.append(segment)
-            pi.show()
-        pi.finish()
-        complete_xfer(intermediate=False)
-        logger.info('compaction freed about %s repository space.', format_file_size(freed_space))
-        logger.debug('compaction completed.')
-
-    def replay_segments(self, index_transaction_id, segments_transaction_id):
-        # fake an old client, so that in case we do not have an exclusive lock yet, prepare_txn will upgrade the lock:
-        remember_exclusive = self.exclusive
-        self.exclusive = None
-        self.prepare_txn(index_transaction_id, do_cleanup=False)
-        try:
-            segment_count = sum(1 for _ in self.io.segment_iterator())
-            pi = ProgressIndicatorPercent(total=segment_count, msg='Replaying segments %3.0f%%',
-                                          msgid='repository.replay_segments')
-            for i, (segment, filename) in enumerate(self.io.segment_iterator()):
-                pi.show(i)
-                if index_transaction_id is not None and segment <= index_transaction_id:
-                    continue
-                if segment > segments_transaction_id:
-                    break
-                objects = self.io.iter_objects(segment)
-                self._update_index(segment, objects)
-            pi.finish()
-            self.write_index()
-        finally:
-            self.exclusive = remember_exclusive
-            self.rollback()
-
-    def _update_index(self, segment, objects, report=None):
-        """some code shared between replay_segments and check"""
-        self.segments[segment] = 0
-        for tag, key, offset, size in objects:
-            if tag == TAG_PUT:
-                try:
-                    # If this PUT supersedes an older PUT, mark the old segment for compaction and count the free space
-                    s, _ = self.index[key]
-                    self.compact[s] += size
-                    self.segments[s] -= 1
-                except KeyError:
-                    pass
-                self.index[key] = segment, offset
-                self.segments[segment] += 1
-                self.storage_quota_use += size
-            elif tag == TAG_DELETE:
-                try:
-                    # if the deleted PUT is not in the index, there is nothing to clean up
-                    s, offset = self.index.pop(key)
-                except KeyError:
-                    pass
-                else:
-                    if self.io.segment_exists(s):
-                        # the old index is not necessarily valid for this transaction (e.g. compaction); if the segment
-                        # is already gone, then it was already compacted.
-                        self.segments[s] -= 1
-                        size = self.io.read(s, offset, key, read_data=False)
-                        self.storage_quota_use -= size
-                        self.compact[s] += size
-            elif tag == TAG_COMMIT:
-                continue
-            else:
-                msg = 'Unexpected tag {} in segment {}'.format(tag, segment)
-                if report is None:
-                    raise self.CheckNeeded(msg)
-                else:
-                    report(msg)
-        if self.segments[segment] == 0:
-            self.compact[segment] += self.io.segment_size(segment)
-
-    def _rebuild_sparse(self, segment):
-        """Rebuild sparse bytes count for a single segment relative to the current index."""
-        try:
-            segment_size = self.io.segment_size(segment)
-        except FileNotFoundError:
-            # segment does not exist any more, remove it from the mappings
-            # note: no need to self.compact.pop(segment), as we start from empty mapping.
-            self.segments.pop(segment)
-            return
-
-        if self.segments[segment] == 0:
-            self.compact[segment] = segment_size
-            return
-
-        self.compact[segment] = 0
-        for tag, key, offset, size in self.io.iter_objects(segment, read_data=False):
-            if tag == TAG_PUT:
-                if self.index.get(key, (-1, -1)) != (segment, offset):
-                    # This PUT is superseded later
-                    self.compact[segment] += size
-            elif tag == TAG_DELETE:
-                # The outcome of the DELETE has been recorded in the PUT branch already
-                self.compact[segment] += size
-
-    def check(self, repair=False, save_space=False, max_duration=0):
-        """Check repository consistency
-
-        This method verifies all segment checksums and makes sure
-        the index is consistent with the data stored in the segments.
-        """
-        if self.append_only and repair:
-            raise ValueError(self.path + " is in append-only mode")
-        error_found = False
-
-        def report_error(msg):
-            nonlocal error_found
-            error_found = True
-            logger.error(msg)
-
-        logger.info('Starting repository check')
-        assert not self._active_txn
-        try:
-            transaction_id = self.get_transaction_id()
-            current_index = self.open_index(transaction_id)
-            logger.debug('Read committed index of transaction %d', transaction_id)
-        except Exception as exc:
-            transaction_id = self.io.get_segments_transaction_id()
-            current_index = None
-            logger.debug('Failed to read committed index (%s)', exc)
-        if transaction_id is None:
-            logger.debug('No segments transaction found')
-            transaction_id = self.get_index_transaction_id()
-        if transaction_id is None:
-            logger.debug('No index transaction found, trying latest segment')
-            transaction_id = self.io.get_latest_segment()
-        if transaction_id is None:
-            report_error('This repository contains no valid data.')
-            return False
-        if repair:
-            self.io.cleanup(transaction_id)
-        segments_transaction_id = self.io.get_segments_transaction_id()
-        logger.debug('Segment transaction is    %s', segments_transaction_id)
-        logger.debug('Determined transaction is %s', transaction_id)
-        self.prepare_txn(None)  # self.index, self.compact, self.segments, self.shadow_index all empty now!
-        segment_count = sum(1 for _ in self.io.segment_iterator())
-        logger.debug('Found %d segments', segment_count)
-
-        partial = bool(max_duration)
-        assert not (repair and partial)
-        mode = 'partial' if partial else 'full'
-        if partial:
-            # continue a past partial check (if any) or start one from beginning
-            last_segment_checked = self.config.getint('repository', 'last_segment_checked', fallback=-1)
-            logger.info('skipping to segments >= %d', last_segment_checked + 1)
-        else:
-            # start from the beginning and also forget about any potential past partial checks
-            last_segment_checked = -1
-            self.config.remove_option('repository', 'last_segment_checked')
-            self.save_config(self.path, self.config)
-        t_start = time.monotonic()
-        pi = ProgressIndicatorPercent(total=segment_count, msg='Checking segments %3.1f%%', step=0.1,
-                                      msgid='repository.check')
-        for i, (segment, filename) in enumerate(self.io.segment_iterator()):
-            pi.show(i)
-            if segment <= last_segment_checked:
-                continue
-            if segment > transaction_id:
-                continue
-            logger.debug('checking segment file %s...', filename)
-            try:
-                objects = list(self.io.iter_objects(segment))
-            except IntegrityError as err:
-                report_error(str(err))
-                objects = []
-                if repair:
-                    self.io.recover_segment(segment, filename)
-                    objects = list(self.io.iter_objects(segment))
-            if not partial:
-                self._update_index(segment, objects, report_error)
-            if partial and time.monotonic() > t_start + max_duration:
-                logger.info('finished partial segment check, last segment checked is %d', segment)
-                self.config.set('repository', 'last_segment_checked', str(segment))
-                self.save_config(self.path, self.config)
-                break
-        else:
-            logger.info('finished segment check at segment %d', segment)
-            self.config.remove_option('repository', 'last_segment_checked')
-            self.save_config(self.path, self.config)
-
-        pi.finish()
-        # self.index, self.segments, self.compact now reflect the state of the segment files up to <transaction_id>
-        # We might need to add a commit tag if no committed segment is found
-        if repair and segments_transaction_id is None:
-            report_error('Adding commit tag to segment {}'.format(transaction_id))
-            self.io.segment = transaction_id + 1
-            self.io.write_commit()
-        if not partial:
-            logger.info('Starting repository index check')
-            if current_index and not repair:
-                # current_index = "as found on disk"
-                # self.index = "as rebuilt in-memory from segments"
-                if len(current_index) != len(self.index):
-                    report_error('Index object count mismatch.')
-                    logger.error('committed index: %d objects', len(current_index))
-                    logger.error('rebuilt index:   %d objects', len(self.index))
-                else:
-                    logger.info('Index object count match.')
-                line_format = 'ID: %-64s rebuilt index: %-16s committed index: %-16s'
-                not_found = '<not found>'
-                for key, value in self.index.iteritems():
-                    current_value = current_index.get(key, not_found)
-                    if current_value != value:
-                        logger.warning(line_format, bin_to_hex(key), value, current_value)
-                for key, current_value in current_index.iteritems():
-                    if key in self.index:
-                        continue
-                    value = self.index.get(key, not_found)
-                    if current_value != value:
-                        logger.warning(line_format, bin_to_hex(key), value, current_value)
-            if repair:
-                self.write_index()
-        self.rollback()
-        if error_found:
-            if repair:
-                logger.info('Finished %s repository check, errors found and repaired.', mode)
-            else:
-                logger.error('Finished %s repository check, errors found.', mode)
-        else:
-            logger.info('Finished %s repository check, no problems found.', mode)
-        return not error_found or repair
-
-    def scan_low_level(self):
-        """Very low level scan over all segment file entries.
-
-        It does NOT care about what's committed and what not.
-        It does NOT care whether an object might be deleted or superseded later.
-        It just yields anything it finds in the segment files.
-
-        This is intended as a last-resort way to get access to all repo contents of damaged repos,
-        when there is uncommitted, but valuable data in there...
-        """
-        for segment, filename in self.io.segment_iterator():
-            try:
-                for tag, key, offset, data in self.io.iter_objects(segment, include_data=True):
-                    yield key, data, tag, segment, offset
-            except IntegrityError as err:
-                logger.error('Segment %d (%s) has IntegrityError(s) [%s] - skipping.' % (segment, filename, str(err)))
-
-    def _rollback(self, *, cleanup):
-        """
-        """
-        if cleanup:
-            self.io.cleanup(self.io.get_segments_transaction_id())
-        self.index = None
-        self._active_txn = False
-        self.transaction_doomed = None
-
-    def rollback(self):
-        # note: when used in remote mode, this is time limited, see RemoteRepository.shutdown_time.
-        self._rollback(cleanup=False)
-
-    def __len__(self):
-        if not self.index:
-            self.index = self.open_index(self.get_transaction_id())
-        return len(self.index)
-
-    def __contains__(self, id):
-        if not self.index:
-            self.index = self.open_index(self.get_transaction_id())
-        return id in self.index
-
-    def list(self, limit=None, marker=None):
-        """
-        list <limit> IDs starting from after id <marker> - in index (pseudo-random) order.
-        """
-        if not self.index:
-            self.index = self.open_index(self.get_transaction_id())
-        return [id_ for id_, _ in islice(self.index.iteritems(marker=marker), limit)]
-
-    def scan(self, limit=None, marker=None):
-        """
-        list <limit> IDs starting from after id <marker> - in on-disk order, so that a client
-        fetching data in this order does linear reads and reuses stuff from disk cache.
-
-        We rely on repository.check() has run already (either now or some time before) and that:
-
-        - if we are called from a borg check command, self.index is a valid, fresh, in-sync repo index.
-        - if we are called from elsewhere, either self.index or the on-disk index is valid and in-sync.
-        - the repository segments are valid (no CRC errors).
-          if we encounter CRC errors in segment entry headers, rest of segment is skipped.
-        """
-        if limit is not None and limit < 1:
-            raise ValueError('please use limit > 0 or limit = None')
-        if not self.index:
-            transaction_id = self.get_transaction_id()
-            self.index = self.open_index(transaction_id)
-        at_start = marker is None
-        # smallest valid seg is <uint32> 0, smallest valid offs is <uint32> 8
-        start_segment, start_offset = (0, 0) if at_start else self.index[marker]
-        result = []
-        for segment, filename in self.io.segment_iterator(start_segment):
-            obj_iterator = self.io.iter_objects(segment, start_offset, read_data=False, include_data=False)
-            while True:
-                try:
-                    tag, id, offset, size = next(obj_iterator)
-                except (StopIteration, IntegrityError):
-                    # either end-of-segment or an error - we can not seek to objects at
-                    # higher offsets than one that has an error in the header fields
-                    break
-                if start_offset > 0:
-                    # we are using a marker and the marker points to the last object we have already
-                    # returned in the previous scan() call - thus, we need to skip this one object.
-                    # also, for the next segment, we need to start at offset 0.
-                    start_offset = 0
-                    continue
-                if tag == TAG_PUT and (segment, offset) == self.index.get(id):
-                    # we have found an existing and current object
-                    result.append(id)
-                    if len(result) == limit:
-                        return result
-        return result
-
-    def get(self, id):
-        if not self.index:
-            self.index = self.open_index(self.get_transaction_id())
-        try:
-            segment, offset = self.index[id]
-            return self.io.read(segment, offset, id)
-        except KeyError:
-            raise self.ObjectNotFound(id, self.path) from None
-
-    def get_many(self, ids, is_preloaded=False):
-        for id_ in ids:
-            yield self.get(id_)
-
-    def put(self, id, data, wait=True):
-        """put a repo object
-
-        Note: when doing calls with wait=False this gets async and caller must
-              deal with async results / exceptions later.
-        """
-        if not self._active_txn:
-            self.prepare_txn(self.get_transaction_id())
-        try:
-            segment, offset = self.index[id]
-        except KeyError:
-            pass
-        else:
-            # note: doing a delete first will do some bookkeeping.
-            # we do not want to update the shadow_index here, because
-            # we know already that we will PUT to this id, so it will
-            # be in the repo index (and we won't need it in the shadow_index).
-            self._delete(id, segment, offset, update_shadow_index=False)
-        segment, offset = self.io.write_put(id, data)
-        self.storage_quota_use += len(data) + self.io.put_header_fmt.size
-        self.segments.setdefault(segment, 0)
-        self.segments[segment] += 1
-        self.index[id] = segment, offset
-        if self.storage_quota and self.storage_quota_use > self.storage_quota:
-            self.transaction_doomed = self.StorageQuotaExceeded(
-                format_file_size(self.storage_quota), format_file_size(self.storage_quota_use))
-            raise self.transaction_doomed
-
-    def delete(self, id, wait=True):
-        """delete a repo object
-
-        Note: when doing calls with wait=False this gets async and caller must
-              deal with async results / exceptions later.
-        """
-        if not self._active_txn:
-            self.prepare_txn(self.get_transaction_id())
-        try:
-            segment, offset = self.index.pop(id)
-        except KeyError:
-            raise self.ObjectNotFound(id, self.path) from None
-        # if we get here, there is an object with this id in the repo,
-        # we write a DEL here that shadows the respective PUT.
-        # after the delete, the object is not in the repo index any more,
-        # for the compaction code, we need to update the shadow_index in this case.
-        self._delete(id, segment, offset, update_shadow_index=True)
-
-    def _delete(self, id, segment, offset, *, update_shadow_index):
-        # common code used by put and delete
-        if update_shadow_index:
-            self.shadow_index.setdefault(id, []).append(segment)
-        self.segments[segment] -= 1
-        size = self.io.read(segment, offset, id, read_data=False)
-        self.storage_quota_use -= size
-        self.compact[segment] += size
-        segment, size = self.io.write_delete(id)
-        self.compact[segment] += size
-        self.segments.setdefault(segment, 0)
-
-    def async_response(self, wait=True):
-        """Get one async result (only applies to remote repositories).
-
-        async commands (== calls with wait=False, e.g. delete and put) have no results,
-        but may raise exceptions. These async exceptions must get collected later via
-        async_response() calls. Repeat the call until it returns None.
-        The previous calls might either return one (non-None) result or raise an exception.
-        If wait=True is given and there are outstanding responses, it will wait for them
-        to arrive. With wait=False, it will only return already received responses.
-        """
-
-    def preload(self, ids):
-        """Preload objects (only applies to remote repositories)
-        """
-
-
-class LoggedIO:
-
-    class SegmentFull(Exception):
-        """raised when a segment is full, before opening next"""
-
-    header_fmt = struct.Struct('<IIB')
-    assert header_fmt.size == 9
-    put_header_fmt = struct.Struct('<IIB32s')
-    assert put_header_fmt.size == 41
-    header_no_crc_fmt = struct.Struct('<IB')
-    assert header_no_crc_fmt.size == 5
-    crc_fmt = struct.Struct('<I')
-    assert crc_fmt.size == 4
-
-    _commit = header_no_crc_fmt.pack(9, TAG_COMMIT)
-    COMMIT = crc_fmt.pack(crc32(_commit)) + _commit
-
-    def __init__(self, path, limit, segments_per_dir, capacity=90):
-        self.path = path
-        self.fds = LRUCache(capacity, dispose=self._close_fd)
-        self.segment = 0
-        self.limit = limit
-        self.segments_per_dir = segments_per_dir
-        self.offset = 0
-        self._write_fd = None
-        self._fds_cleaned = 0
-
-    def close(self):
-        self.close_segment()
-        self.fds.clear()
-        self.fds = None  # Just to make sure we're disabled
-
-    def _close_fd(self, ts_fd):
-        ts, fd = ts_fd
-        safe_fadvise(fd.fileno(), 0, 0, 'DONTNEED')
-        fd.close()
-
-    def segment_iterator(self, segment=None, reverse=False):
-        if segment is None:
-            segment = 0 if not reverse else 2 ** 32 - 1
-        data_path = os.path.join(self.path, 'data')
-        start_segment_dir = segment // self.segments_per_dir
-        dirs = os.listdir(data_path)
-        if not reverse:
-            dirs = [dir for dir in dirs if dir.isdigit() and int(dir) >= start_segment_dir]
-        else:
-            dirs = [dir for dir in dirs if dir.isdigit() and int(dir) <= start_segment_dir]
-        dirs = sorted(dirs, key=int, reverse=reverse)
-        for dir in dirs:
-            filenames = os.listdir(os.path.join(data_path, dir))
-            if not reverse:
-                filenames = [filename for filename in filenames if filename.isdigit() and int(filename) >= segment]
-            else:
-                filenames = [filename for filename in filenames if filename.isdigit() and int(filename) <= segment]
-            filenames = sorted(filenames, key=int, reverse=reverse)
-            for filename in filenames:
-                # Note: Do not filter out logically deleted segments  (see "File system interaction" above),
-                # since this is used by cleanup and txn state detection as well.
-                yield int(filename), os.path.join(data_path, dir, filename)
-
-    def get_latest_segment(self):
-        for segment, filename in self.segment_iterator(reverse=True):
-            return segment
-        return None
-
-    def get_segments_transaction_id(self):
-        """Return the last committed segment.
-        """
-        for segment, filename in self.segment_iterator(reverse=True):
-            if self.is_committed_segment(segment):
-                return segment
-        return None
-
-    def cleanup(self, transaction_id):
-        """Delete segment files left by aborted transactions
-        """
-        self.segment = transaction_id + 1
-        count = 0
-        for segment, filename in self.segment_iterator(reverse=True):
-            if segment > transaction_id:
-                if segment in self.fds:
-                    del self.fds[segment]
-                truncate_and_unlink(filename)
-                count += 1
-            else:
-                break
-        logger.debug('Cleaned up %d uncommitted segment files (== everything after segment %d).',
-                     count, transaction_id)
-
-    def is_committed_segment(self, segment):
-        """Check if segment ends with a COMMIT_TAG tag
-        """
-        try:
-            iterator = self.iter_objects(segment)
-        except IntegrityError:
-            return False
-        with open(self.segment_filename(segment), 'rb') as fd:
-            try:
-                fd.seek(-self.header_fmt.size, os.SEEK_END)
-            except OSError as e:
-                # return False if segment file is empty or too small
-                if e.errno == errno.EINVAL:
-                    return False
-                raise e
-            if fd.read(self.header_fmt.size) != self.COMMIT:
-                return False
-        seen_commit = False
-        while True:
-            try:
-                tag, key, offset, _ = next(iterator)
-            except IntegrityError:
-                return False
-            except StopIteration:
-                break
-            if tag == TAG_COMMIT:
-                seen_commit = True
-                continue
-            if seen_commit:
-                return False
-        return seen_commit
-
-    def segment_filename(self, segment):
-        return os.path.join(self.path, 'data', str(segment // self.segments_per_dir), str(segment))
-
-    def get_write_fd(self, no_new=False, want_new=False, raise_full=False):
-        if not no_new and (want_new or self.offset and self.offset > self.limit):
-            if raise_full:
-                raise self.SegmentFull
-            self.close_segment()
-        if not self._write_fd:
-            if self.segment % self.segments_per_dir == 0:
-                dirname = os.path.join(self.path, 'data', str(self.segment // self.segments_per_dir))
-                if not os.path.exists(dirname):
-                    os.mkdir(dirname)
-                    sync_dir(os.path.join(self.path, 'data'))
-            self._write_fd = SyncFile(self.segment_filename(self.segment), binary=True)
-            self._write_fd.write(MAGIC)
-            self.offset = MAGIC_LEN
-            if self.segment in self.fds:
-                # we may have a cached fd for a segment file we already deleted and
-                # we are writing now a new segment file to same file name. get rid of
-                # of the cached fd that still refers to the old file, so it will later
-                # get repopulated (on demand) with a fd that refers to the new file.
-                del self.fds[self.segment]
-        return self._write_fd
-
-    def get_fd(self, segment):
-        # note: get_fd() returns a fd with undefined file pointer position,
-        # so callers must always seek() to desired position afterwards.
-        now = time.monotonic()
-
-        def open_fd():
-            fd = open(self.segment_filename(segment), 'rb')
-            self.fds[segment] = (now, fd)
-            return fd
-
-        def clean_old():
-            # we regularly get rid of all old FDs here:
-            if now - self._fds_cleaned > FD_MAX_AGE // 8:
-                self._fds_cleaned = now
-                for k, ts_fd in list(self.fds.items()):
-                    ts, fd = ts_fd
-                    if now - ts > FD_MAX_AGE:
-                        # we do not want to touch long-unused file handles to
-                        # avoid ESTALE issues (e.g. on network filesystems).
-                        del self.fds[k]
-
-        clean_old()
-        try:
-            ts, fd = self.fds[segment]
-        except KeyError:
-            fd = open_fd()
-        else:
-            # we only have fresh enough stuff here.
-            # update the timestamp of the lru cache entry.
-            self.fds.upd(segment, (now, fd))
-        return fd
-
-    def close_segment(self):
-        # set self._write_fd to None early to guard against reentry from error handling code paths:
-        fd, self._write_fd = self._write_fd, None
-        if fd is not None:
-            self.segment += 1
-            self.offset = 0
-            fd.close()
-
-    def delete_segment(self, segment):
-        if segment in self.fds:
-            del self.fds[segment]
-        try:
-            truncate_and_unlink(self.segment_filename(segment))
-        except FileNotFoundError:
-            pass
-
-    def segment_exists(self, segment):
-        filename = self.segment_filename(segment)
-        # When deleting segments, they are first truncated. If truncate(2) and unlink(2) are split
-        # across FS transactions, then logically deleted segments will show up as truncated.
-        return os.path.exists(filename) and os.path.getsize(filename)
-
-    def segment_size(self, segment):
-        return os.path.getsize(self.segment_filename(segment))
-
-    def get_segment_magic(self, segment):
-        fd = self.get_fd(segment)
-        fd.seek(0)
-        return fd.read(MAGIC_LEN)
-
-    def iter_objects(self, segment, offset=0, include_data=False, read_data=True):
-        """
-        Return object iterator for *segment*.
-
-        If read_data is False then include_data must be False as well.
-        Integrity checks are skipped: all data obtained from the iterator must be considered informational.
-
-        The iterator returns four-tuples of (tag, key, offset, data|size).
-        """
-        fd = self.get_fd(segment)
-        fd.seek(offset)
-        if offset == 0:
-            # we are touching this segment for the first time, check the MAGIC.
-            # Repository.scan() calls us with segment > 0 when it continues an ongoing iteration
-            # from a marker position - but then we have checked the magic before already.
-            if fd.read(MAGIC_LEN) != MAGIC:
-                raise IntegrityError('Invalid segment magic [segment {}, offset {}]'.format(segment, 0))
-            offset = MAGIC_LEN
-        header = fd.read(self.header_fmt.size)
-        while header:
-            size, tag, key, data = self._read(fd, self.header_fmt, header, segment, offset,
-                                              (TAG_PUT, TAG_DELETE, TAG_COMMIT),
-                                              read_data=read_data)
-            if include_data:
-                yield tag, key, offset, data
-            else:
-                yield tag, key, offset, size
-            offset += size
-            # we must get the fd via get_fd() here again as we yielded to our caller and it might
-            # have triggered closing of the fd we had before (e.g. by calling io.read() for
-            # different segment(s)).
-            # by calling get_fd() here again we also make our fd "recently used" so it likely
-            # does not get kicked out of self.fds LRUcache.
-            fd = self.get_fd(segment)
-            fd.seek(offset)
-            header = fd.read(self.header_fmt.size)
-
-    def recover_segment(self, segment, filename):
-        logger.info('attempting to recover ' + filename)
-        if segment in self.fds:
-            del self.fds[segment]
-        if os.path.getsize(filename) < MAGIC_LEN + self.header_fmt.size:
-            # this is either a zero-byte file (which would crash mmap() below) or otherwise
-            # just too small to be a valid non-empty segment file, so do a shortcut here:
-            with SaveFile(filename, binary=True) as fd:
-                fd.write(MAGIC)
-            return
-        with SaveFile(filename, binary=True) as dst_fd:
-            with open(filename, 'rb') as src_fd:
-                # note: file must not be 0 size or mmap() will crash.
-                with mmap.mmap(src_fd.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    # memoryview context manager is problematic, see https://bugs.python.org/issue35686
-                    data = memoryview(mm)
-                    d = data
-                    try:
-                        dst_fd.write(MAGIC)
-                        while len(d) >= self.header_fmt.size:
-                            crc, size, tag = self.header_fmt.unpack(d[:self.header_fmt.size])
-                            if size < self.header_fmt.size or size > len(d):
-                                d = d[1:]
-                                continue
-                            if crc32(d[4:size]) & 0xffffffff != crc:
-                                d = d[1:]
-                                continue
-                            dst_fd.write(d[:size])
-                            d = d[size:]
-                    finally:
-                        del d
-                        data.release()
-
-    def read(self, segment, offset, id, read_data=True):
-        """
-        Read entry from *segment* at *offset* with *id*.
-
-        If read_data is False the size of the entry is returned instead and integrity checks are skipped.
-        The return value should thus be considered informational.
-        """
-        if segment == self.segment and self._write_fd:
-            self._write_fd.sync()
-        fd = self.get_fd(segment)
-        fd.seek(offset)
-        header = fd.read(self.put_header_fmt.size)
-        size, tag, key, data = self._read(fd, self.put_header_fmt, header, segment, offset, (TAG_PUT, ), read_data)
-        if id != key:
-            raise IntegrityError('Invalid segment entry header, is not for wanted id [segment {}, offset {}]'.format(
-                segment, offset))
-        return data if read_data else size
-
-    def _read(self, fd, fmt, header, segment, offset, acceptable_tags, read_data=True):
-        # some code shared by read() and iter_objects()
-        try:
-            hdr_tuple = fmt.unpack(header)
-        except struct.error as err:
-            raise IntegrityError('Invalid segment entry header [segment {}, offset {}]: {}'.format(
-                segment, offset, err)) from None
-        if fmt is self.put_header_fmt:
-            crc, size, tag, key = hdr_tuple
-        elif fmt is self.header_fmt:
-            crc, size, tag = hdr_tuple
-            key = None
-        else:
-            raise TypeError("_read called with unsupported format")
-        if size > MAX_OBJECT_SIZE:
-            # if you get this on an archive made with borg < 1.0.7 and millions of files and
-            # you need to restore it, you can disable this check by using "if False:" above.
-            raise IntegrityError('Invalid segment entry size {} - too big [segment {}, offset {}]'.format(
-                size, segment, offset))
-        if size < fmt.size:
-            raise IntegrityError('Invalid segment entry size {} - too small [segment {}, offset {}]'.format(
-                size, segment, offset))
-        length = size - fmt.size
-        if read_data:
-            data = fd.read(length)
-            if len(data) != length:
-                raise IntegrityError('Segment entry data short read [segment {}, offset {}]: expected {}, got {} bytes'.format(
-                    segment, offset, length, len(data)))
-            if crc32(data, crc32(memoryview(header)[4:])) & 0xffffffff != crc:
-                raise IntegrityError('Segment entry checksum mismatch [segment {}, offset {}]'.format(
-                    segment, offset))
-            if key is None and tag in (TAG_PUT, TAG_DELETE):
-                key, data = data[:32], data[32:]
-        else:
-            if key is None and tag in (TAG_PUT, TAG_DELETE):
-                key = fd.read(32)
-                length -= 32
-                if len(key) != 32:
-                    raise IntegrityError('Segment entry key short read [segment {}, offset {}]: expected {}, got {} bytes'.format(
-                        segment, offset, 32, len(key)))
-            oldpos = fd.tell()
-            seeked = fd.seek(length, os.SEEK_CUR) - oldpos
-            data = None
-            if seeked != length:
-                raise IntegrityError('Segment entry data short seek [segment {}, offset {}]: expected {}, got {} bytes'.format(
-                        segment, offset, length, seeked))
-        if tag not in acceptable_tags:
-            raise IntegrityError('Invalid segment entry header, did not get acceptable tag [segment {}, offset {}]'.format(
-                segment, offset))
-        return size, tag, key, data
-
-    def write_put(self, id, data, raise_full=False):
-        data_size = len(data)
-        if data_size > MAX_DATA_SIZE:
-            # this would push the segment entry size beyond MAX_OBJECT_SIZE.
-            raise IntegrityError('More than allowed put data [{} > {}]'.format(data_size, MAX_DATA_SIZE))
-        fd = self.get_write_fd(want_new=(id == Manifest.MANIFEST_ID), raise_full=raise_full)
-        size = data_size + self.put_header_fmt.size
-        offset = self.offset
-        header = self.header_no_crc_fmt.pack(size, TAG_PUT)
-        crc = self.crc_fmt.pack(crc32(data, crc32(id, crc32(header))) & 0xffffffff)
-        fd.write(b''.join((crc, header, id, data)))
-        self.offset += size
-        return self.segment, offset
-
-    def write_delete(self, id, raise_full=False):
-        fd = self.get_write_fd(want_new=(id == Manifest.MANIFEST_ID), raise_full=raise_full)
-        header = self.header_no_crc_fmt.pack(self.put_header_fmt.size, TAG_DELETE)
-        crc = self.crc_fmt.pack(crc32(id, crc32(header)) & 0xffffffff)
-        fd.write(b''.join((crc, header, id)))
-        self.offset += self.put_header_fmt.size
-        return self.segment, self.put_header_fmt.size
-
-    def write_commit(self, intermediate=False):
-        # Intermediate commits go directly into the current segment - this makes checking their validity more
-        # expensive, but is faster and reduces clobber. Final commits go into a new segment.
-        fd = self.get_write_fd(want_new=not intermediate)
-        if intermediate:
-            fd.sync()
-        header = self.header_no_crc_fmt.pack(self.header_fmt.size, TAG_COMMIT)
-        crc = self.crc_fmt.pack(crc32(header) & 0xffffffff)
-        fd.write(b''.join((crc, header)))
-        self.close_segment()
-        return self.segment - 1  # close_segment() increments it
-
-
-assert LoggedIO.put_header_fmt.size == 41  # see constants.MAX_OBJECT_SIZE
+        for namespace in ("packs", "index"):
+            granted = set(self.permissions.get(namespace, self.permissions.get("", "")))
+            if not (granted & set("wW")) or "D" not in granted:
+                raise self.PermissionDenied(
+                    f"compaction needs write (w/W) and delete (D) permissions on {namespace}/, "
+                    f"but only {''.join(sorted(granted))!r} is granted (BORG_REPO_PERMISSIONS)."
+                )
+
+    def store_move(self, name, new_name=None, *, delete=False, undelete=False, deleted=False):
+        self._lock_refresh()
+        return self.store.move(name, new_name, delete=delete, undelete=undelete, deleted=deleted)

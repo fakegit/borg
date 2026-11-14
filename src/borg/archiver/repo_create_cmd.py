@@ -1,0 +1,326 @@
+from ._common import with_repository, with_other_repository, Highlander
+from ..cache import Cache, write_chunkindex_to_repo
+from ..constants import *  # NOQA
+from ..crypto.key import key_creator, encryption_argument_names, id_hash_argument_names
+from ..helpers import CancelledByUser
+from ..helpers import location_validator, Location, ChunkerParams, CompressionSpec
+from ..hashindex import ChunkIndex
+from ..helpers.argparsing import ArgumentParser
+from ..manifest import Manifest
+
+from ..logger import create_logger
+
+logger = create_logger()
+
+
+# Short descriptions of the --encryption modes, for the shell completions (see completion_cmd).
+# Modes without an entry here still complete, just without a description.
+ENCRYPTION_DESCRIPTIONS = {
+    "aes256-ocb": "AES256 in OCB mode: encryption and authentication",
+    "chacha20-poly1305": "ChaCha20 with Poly1305: encryption and authentication",
+    "authenticated-sha256": "no encryption, authentication via HMAC-SHA-256",
+    "authenticated-blake3": "no encryption, authentication via keyed BLAKE3",
+}
+
+
+class RepoCreateMixIn:
+    @with_repository(create=True, exclusive=True, manifest=False)
+    @with_other_repository(manifest=True)
+    def do_repo_create(self, args, repository, *, other_repository=None, other_manifest=None):
+        """Creates a new, empty repository."""
+        other_key = other_manifest.key if other_manifest is not None else None
+        path = args.location.canonical_path()
+        logger.info('Initializing repository at "%s"' % path)
+        if other_key is not None:
+            other_key.copy_crypt_key = args.copy_crypt_key
+        key = None
+        try:
+            key = key_creator(repository, args, other_key=other_key)
+            # the lock needs the key, see Repository.acquire_lock(). until save_config() below, the store is
+            # not a repository (see Repository.create()), so no other client can use it before we lock it.
+            repository.acquire_lock()
+            # writing the config is what makes the store a repository, see Repository.create().
+            repository.save_config(key)
+            defaults = {}
+            if args.compression is not None:
+                defaults["compression"] = str(args.compression)
+            if args.chunker_params not in (None, DEFAULT_CHUNKER_PARAMS):
+                defaults["chunker_params"] = ",".join(str(p) for p in args.chunker_params)
+            # always written, also when empty: a missing object means it was removed, see load_defaults().
+            repository.save_defaults(defaults)
+            # we know repo/packs/ still does not have any chunks stored in it, but for some stores, there
+            # might be a lot of empty directories and listing them all might be rather slow, so we better
+            # store an empty ChunkIndex now, so that the first repo operation does not have to build the
+            # ChunkIndex the slow way by listing all the directories.
+            write_chunkindex_to_repo(repository, ChunkIndex(), clear=True, force_write=True)
+        except BaseException as exc:
+            # an interrupted or failed repo-create must not leave a (partial) repository behind, nor a keyfile.
+            if key is not None and key.storage == KeyBlobStorage.KEYFILE:
+                key.remove(key.target)
+            repository.destroy()
+            if isinstance(exc, (EOFError, KeyboardInterrupt)):
+                raise CancelledByUser()
+            raise
+        manifest = Manifest(key, repository)
+        with Cache(repository, manifest, warn_if_unencrypted=False):
+            pass
+        logger.warning(
+            "\n"
+            "IMPORTANT: you will need both KEY AND PASSPHRASE to access this repository!\n"
+            "\n"
+            "Key storage location depends on the mode:\n"
+            "- repokey modes: key is stored in the repository directory.\n"
+            "- keyfile modes: key is stored in the home directory of this user.\n"
+            "\n"
+            "For any mode, you should:\n"
+            "1. Export the Borg key and store the result in a safe place:\n"
+            "   borg key export -r REPOSITORY           encrypted-key-backup\n"
+            "   borg key export -r REPOSITORY --paper   encrypted-key-backup.txt\n"
+            "   borg key export -r REPOSITORY --qr-html encrypted-key-backup.html\n"
+            "2. Write down the Borg key passphrase and store it in a safe place."
+        )
+        logger.warning(
+            "\n"
+            "Reserve some repository storage space now for emergencies like 'disk full'\n"
+            "by running:\n"
+            "    borg repo-space --reserve 1G"
+        )
+
+    def build_parser_repo_create(self, subparsers, common_parser, mid_common_parser):
+        from ._common import process_epilog
+
+        repo_create_epilog = process_epilog(
+            """
+        This command creates a new, empty repository. A repository is a ``borgstore`` store
+        containing the deduplicated data from zero or more archives.
+
+        Repository creation can be quite slow for some kinds of stores (e.g. for ``sftp:``) -
+        this is due to borgstore pre-creating all directories needed, making usage of the
+        store faster.
+
+        Encryption mode TL;DR
+        +++++++++++++++++++++
+
+        The encryption mode can only be configured when creating a new repository - you can
+        neither configure it on a per-archive basis nor change the mode of an existing repository.
+        This example will likely NOT give optimum performance on your machine (performance
+        tips will come below):
+
+        ::
+
+            borg repo-create --encryption aes256-ocb --key-location repokey
+
+        Borg will:
+
+        1. Ask you to come up with a passphrase.
+        2. Create a borg key (which contains some random secrets. See :ref:`key_files`).
+        3. Derive a "key encryption key" from your passphrase
+        4. Encrypt and sign the key with the key encryption key
+        5. Store the encrypted borg key in the repository (as an object in the ``keys/``
+           namespace of the store). This is why it is essential to use a secure passphrase.
+        6. Encrypt and sign your backups to prevent anyone from reading or forging them unless they
+           have the key and know the passphrase. Make sure to keep a backup of
+           your key **outside** the repository - do not lock yourself out by
+           "leaving your keys inside your car" (see :ref:`borg_key_export`).
+           The encryption is done locally - if you use a remote repository, the remote machine
+           never sees your passphrase, your unencrypted key or your unencrypted files.
+           Chunking and ID generation are also based on your key to improve
+           your privacy.
+        7. Use the key when extracting files to decrypt them and to verify that the contents of
+           the backups have not been accidentally or maliciously altered.
+
+        Picking a passphrase
+        ++++++++++++++++++++
+
+        Make sure you use a good passphrase. Not too short, not too simple. The real
+        encryption / decryption key is encrypted with / locked by your passphrase.
+        If an attacker gets your key, they cannot unlock and use it without knowing the
+        passphrase.
+
+        Be careful with special or non-ASCII characters in your passphrase:
+
+        - Borg processes the passphrase as Unicode (and encodes it as UTF-8),
+          so it does not have problems dealing with even the strangest characters.
+        - BUT: that does not necessarily apply to your OS/VM/keyboard configuration.
+
+        So better use a long passphrase made from simple ASCII characters than one that
+        includes non-ASCII stuff or characters that are hard or impossible to enter on
+        a different keyboard layout.
+
+        You can change your passphrase for existing repositories at any time; it will not affect
+        the encryption/decryption key or other secrets.
+
+        Borg also accepts an empty passphrase. The repository is still encrypted with a random
+        key then, but that key is not protected: with ``repokey`` storage, anybody who can read
+        the repository can also unlock the key, which is as good as no encryption at all (with
+        ``keyfile`` storage, the key is only on your client, so an empty passphrase may be
+        acceptable if e.g. the client's disk is encrypted). You can add a passphrase later with
+        ``borg key change-passphrase``. ``borg repo-info`` shows whether the key has an empty
+        passphrase.
+
+        Choosing a crypto suite
+        +++++++++++++++++++++++
+
+        Depending on your hardware, hashing and crypto performance may vary widely.
+        The easiest way to find out what is fastest is to run ``borg benchmark cpu``.
+
+        ``--encryption`` (**required**) selects the mode:
+
+        - ``aes256-ocb``: AES256 in OCB mode (encryption + authentication).
+        - ``chacha20-poly1305``: ChaCha20 + Poly1305 (encryption + authentication).
+        - ``authenticated-sha256`` / ``authenticated-blake3``: no encryption, but authentication
+          (tamper detection) using HMAC-SHA-256 resp. keyed BLAKE3.
+
+        ``--id-hash`` selects the id hash function of the **encrypted** modes:
+
+        - ``sha256`` (default): HMAC-SHA-256.
+        - ``blake3``: BLAKE3. Often faster on CPUs without SHA hardware acceleration.
+
+        For the modes that do not encrypt, the hash is not just used for the chunk ids, it also is
+        what protects your data - therefore it is part of the mode name there and ``--id-hash``
+        does not apply to them.
+
+        ``--key-location`` selects where the key is stored (orthogonal to the crypto suite):
+
+        - ``repokey`` (default): the key is stored in the repository (under ``keys/``). Pick this
+          if you want ease-of-use and "passphrase" security is good enough.
+        - ``keyfile``: the key is stored in your home directory (in ``~/.config/borg/keys``). Pick
+          this if you want "passphrase and having-the-key" security.
+
+        You can move the key between these locations later with ``borg key change-location``.
+        This also applies to the ``authenticated-*`` modes: they do not encrypt your data, but they
+        still have a key (used for the id hash and the authentication), so ``--key-location``
+        selects where that key is stored, just like for the encrypted modes.
+
+        If you do **not** want to encrypt the contents of your backups, but still want to detect
+        malicious tampering, use ``--encryption authenticated-sha256`` (or ``-blake3``). These
+        modes are like an encrypted mode minus the data encryption.
+        To normally work with ``authenticated-*`` repositories, you will need the passphrase, but
+        there is an emergency workaround; see ``BORG_WORKAROUNDS=authenticated_no_key`` docs.
+
+        Repository defaults
+        +++++++++++++++++++
+
+        ``--compression`` sets the repository's default compression: the commands that compress
+        data (``borg create``, ``borg recreate``, ``borg import-tar``, ``borg transfer``,
+        ``borg repo-compress``) use it if no compression was given via ``--compression``, the
+        environment or the default config file (``default.yaml``). Without a repository default,
+        they use lz4. See ``borg help compression`` for the compression specs.
+
+        ``--chunker-params`` sets the repository's default chunker parameters: ``borg create`` and
+        ``borg import-tar`` use them if no chunker parameters were given (in the same ways as above).
+        ``borg recreate`` and ``borg transfer`` only rechunk if ``--chunker-params`` is given, with
+        ``--chunker-params default``, they rechunk to the repository's default chunker parameters.
+        Without a repository default, the built-in default chunker parameters are used.
+
+        This is useful if several clients back up into the same repository or if some commands are
+        run manually: they all compress and chunk the same way without having to give these options.
+        Using the same chunker parameters is important for deduplication.
+        ``borg repo-info`` shows the defaults.
+
+        The defaults are stored in the repository and protected by the repository key: changing them
+        (e.g. removing an ``obfuscate`` compression) needs the key. The defaults object is always
+        written, also when no default was given, so removing it is noticed, too: the commands refuse
+        to run if it is missing or fails the authentication. ``borg check`` reports such an object,
+        ``borg check --repair`` replaces it by empty defaults (the built-in defaults are used then).
+
+        Creating a related repository
+        +++++++++++++++++++++++++++++
+
+        You can use ``borg repo-create --other-repo ORIG_REPO ...`` to create a related repository
+        that uses the same secret key material as the given other/original repository.
+
+        By default, only the ID key and chunker secret will be the same (these are important
+        for deduplication) and the AE crypto keys will be newly generated random keys.
+
+        Optionally, if you use ``--copy-crypt-key`` you can also keep the same crypt_key
+        (used for authenticated encryption). This might be desired, for example, if you want to have fewer
+        keys to manage.
+
+        Creating related repositories is useful, for example, if you want to use ``borg transfer`` later.
+
+        Creating a related repository for data migration from Borg 1.2 or 1.4
+        +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        You can use ``borg repo-create --other-repo ORIG_REPO --from-borg1 ...`` to create a related
+        repository that uses the same secret key material as the given other/original repository.
+
+        Then use ``borg transfer --other-repo ORIG_REPO --from-borg1 ...`` to transfer the archives.
+        """
+        )
+        subparser = ArgumentParser(
+            parents=[common_parser], description=self.do_repo_create.__doc__, epilog=repo_create_epilog
+        )
+        subparsers.add_subcommand("repo-create", subparser, help="create a new, empty repository")
+        subparser.add_argument(
+            "--other-repo",
+            metavar="SRC_REPOSITORY",
+            dest="other_location",
+            type=location_validator(other=True),
+            default=Location(other=True),
+            action=Highlander,
+            help="reuse the key material from the other repository",
+        )
+        subparser.add_argument(
+            "--from-borg1", dest="v1_legacy", action="store_true", help="other repository is Borg 1.x"
+        )
+        subparser.add_argument(
+            "-e",
+            "--encryption",
+            metavar="ENCRYPTION",
+            dest="encryption",
+            required=True,
+            choices=encryption_argument_names(),
+            action=Highlander,
+            help="select the mode: 'aes256-ocb', 'chacha20-poly1305', 'authenticated-sha256' "
+            "or 'authenticated-blake3' **(required)**",
+        )
+        subparser.add_argument(
+            "-i",
+            "--id-hash",
+            metavar="HASH",
+            dest="id_hash",
+            choices=id_hash_argument_names(),
+            default=None,  # None: not given. Do not default to sha256 here, see key_creator.
+            action=Highlander,
+            help="select the id hash function of the encrypted modes: 'sha256' or 'blake3'. "
+            "The 'authenticated-sha256' and 'authenticated-blake3' modes name their hash themselves.",
+        )
+        subparser.add_argument(
+            "--key-location",
+            metavar="LOCATION",
+            dest="key_location",
+            choices=("repokey", "keyfile"),
+            default="repokey",
+            action=Highlander,
+            help="where to store the key: 'repokey' (in the repository, default) or 'keyfile' "
+            "(in the local keys directory).",
+        )
+        subparser.add_argument(
+            "-C",
+            "--compression",
+            metavar="COMPRESSION",
+            dest="compression",
+            type=CompressionSpec,
+            default=None,
+            action=Highlander,
+            help="set the default compression of the repository, see the output of the "
+            '"borg help compression" command for details. Default: no repository default (lz4 is used).',
+        )
+        subparser.add_argument(
+            "--chunker-params",
+            metavar="PARAMS",
+            dest="chunker_params",
+            type=ChunkerParams,
+            default=None,
+            action=Highlander,
+            help="set the default chunker parameters of the repository (same format as for borg create). "
+            "Default: no repository default (%s,%d,%d,%d,%d is used)." % CHUNKER_PARAMS,
+        )
+        subparser.add_argument(
+            "--copy-crypt-key",
+            dest="copy_crypt_key",
+            action="store_true",
+            help="copy the crypt_key (used for authenticated encryption) from the key of the other repository "
+            "(default: new random key).",
+        )

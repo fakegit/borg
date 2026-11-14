@@ -1,8 +1,6 @@
-.\" Man page generated from reStructuredText.
+.\" Man page generated from reStructuredText
+.\" by the Docutils 0.22.4 manpage writer.
 .
-.TH BORG-EXTRACT 1 "2021-02-06" "" "borg backup tool"
-.SH NAME
-borg-extract \- Extract archive contents
 .
 .nr rst2man-indent-level 0
 .
@@ -30,30 +28,91 @@ level margin: \\n[rst2man-indent\\n[rst2man-indent-level]]
 .\" new: \\n[rst2man-indent\\n[rst2man-indent-level]]
 .in \\n[rst2man-indent\\n[rst2man-indent-level]]u
 ..
+.TH "borg-extract" "1" "2026-09-27" "" "borg backup tool"
+.SH Name
+borg-extract \- Extracts archive contents.
 .SH SYNOPSIS
 .sp
-borg [common options] extract [options] ARCHIVE [PATH...]
+borg [common options] extract [options] NAME [PATH...]
 .SH DESCRIPTION
 .sp
-This command extracts the contents of an archive. By default the entire
-archive is extracted but a subset of files and directories can be selected
-by passing a list of \fBPATHs\fP as arguments. The file selection can further
-be restricted by using the \fB\-\-exclude\fP option.
+This command extracts the contents of an archive.
 .sp
-See the output of the "borg help patterns" command for more help on exclude patterns.
+By default, the entire archive is extracted, but a subset of files and directories
+can be selected by passing a list of \fBPATH\fP arguments. The default interpretation
+for the paths to extract is \fIpp:\fP which is a literal path\-prefix match. If you want
+to use e.g. a wildcard, you must select a different pattern style such as \fIsh:\fP or
+\fIfm:\fP\&. See \fIborg_patterns\fP for more information.
+.sp
+The file selection can be further restricted by using the \fB\-\-exclude\fP option.
+For more help on include/exclude patterns, see the \fIborg_patterns\fP command output.
 .sp
 By using \fB\-\-dry\-run\fP, you can do all extraction steps except actually writing the
-output data: reading metadata and data chunks from the repo, checking the hash/hmac,
-decrypting, decompressing.
+output data: reading metadata and data chunks from the repository, checking the hash/HMAC,
+decrypting, and decompressing.
 .sp
 \fB\-\-progress\fP can be slower than no progress display, since it makes one additional
 pass over the archive metadata.
 .sp
-\fBNOTE:\fP
+Extracting into a non\-empty directory replaces existing files that are in the way and
+leaves all other existing files as they are. The result is a mix of the files that were
+there before and the extracted files, which might not be what you want \- especially not
+by accident in a directory that is in use (e.g. your home directory). Thus, borg refuses
+to extract into a non\-empty directory unless \fB\-\-continue\fP is given (\fB\-\-dry\-run\fP and
+\fB\-\-stdout\fP do not write into the directory, so they always work). The usual way to
+restore is to extract into a new, empty directory: after that, the directory has exactly
+the contents of the extracted archive (or of the selected part of it).
+.sp
+\fB\-\-continue\fP extracts into a non\-empty directory. It is made for continuing a previously
+interrupted extraction of the same archive into the same directory: an existing regular
+file that has the same type, permissions (mode), size and modification time as the
+archived file is considered to be fully extracted already and is skipped. Everything else
+is extracted, replacing existing files. Files that are in the directory, but not in the
+archive, are left as they are. \fB\-\-continue\fP is thus also needed to restore files into an
+existing directory tree. Note that a file that was damaged without a change of its size
+and modification time (e.g. by bit rot) is skipped, not replaced: remove it before
+extracting it.
+.sp
+If a file\(aqs content chunks are missing from the repository or are corrupted (they fail
+authentication, decryption or decompression), the extraction does not abort: each such
+chunk is written as all\-zero data of the correct size, an error naming the chunk is logged,
+the file is reported with a warning and the exit code is a warning. The extracted file thus
+has the correct size and metadata, but wrong (all\-zero) content where the damaged chunks
+were. Run \fBborg check\fP to find out which chunks and archives are affected. This also
+applies to \fB\-\-dry\-run\fP (which thus can be used to find unreadable files) and \fB\-\-stdout\fP\&.
+.sp
+When using \fB\-\-stats\fP, borg reports the store statistics (lines prefixed with
+\(dqStore\(dq) for the extraction: per\-operation call counts and timings, the load/store
+data volumes and throughput, and cache hits/misses. This includes \fB\-\-dry\-run\fP
+extractions.
+.sp
+\fBNote:\fP
 .INDENT 0.0
 .INDENT 3.5
-Currently, extract always writes into the current working directory ("."),
+Currently, extract always writes into the current working directory (\(dq.\(dq),
 so make sure you \fBcd\fP to the right place before calling \fBborg extract\fP\&.
+.sp
+When parent directories are not extracted (because of using file/directory selection
+or any other reason), Borg cannot restore parent directories\(aq metadata, e.g., owner,
+group, permissions, etc.
+.UNINDENT
+.UNINDENT
+.sp
+\fBNote:\fP
+.INDENT 0.0
+.INDENT 3.5
+Restoring some file metadata requires root privileges (or equivalent
+capabilities). This includes the owner and group of files, device nodes,
+privileged file flags (like immutable or append\-only) and privileged
+extended attributes (like Linux capabilities or \fBtrusted.*\fP xattrs).
+.sp
+When running as a normal user, borg still extracts the file contents, but
+the extracted files are owned by the invoking user (the failure to restore
+ownership is silently ignored: no warning, exit code unaffected), privileged
+flags are skipped while the other flags are still set, and privileged xattrs
+and device nodes are skipped with a warning. \fB\-\-numeric\-ids\fP does not
+change this, it only selects whether the archived numeric IDs or the archived
+user/group names are used. To restore all metadata, run \fBborg extract\fP as root.
 .UNINDENT
 .UNINDENT
 .SH OPTIONS
@@ -62,37 +121,46 @@ See \fIborg\-common(1)\fP for common options of Borg commands.
 .SS arguments
 .INDENT 0.0
 .TP
-.B ARCHIVE
-archive to extract
+.B NAME
+specify the archive name
 .TP
 .B PATH
 paths to extract; patterns are supported
 .UNINDENT
-.SS optional arguments
+.SS options
 .INDENT 0.0
 .TP
-.B \-\-list
-output verbose list of items (files, dirs, ...)
+.B  \-\-list
+output a verbose list of items (files, dirs, ...)
 .TP
-.B \-n\fP,\fB  \-\-dry\-run
+.B  \-s\fP,\fB  \-\-stats
+print store statistics for the extraction
+.TP
+.B  \-n\fP,\fB  \-\-dry\-run
 do not actually change any files
 .TP
-.B \-\-numeric\-owner
-only obey numeric user and group identifiers
+.B  \-\-numeric\-ids
+only use numeric user and group identifiers
 .TP
-.B \-\-nobsdflags
-deprecated, use \fB\-\-noflags\fP instead
-.TP
-.B \-\-noflags
+.B  \-\-noflags
 do not extract/set flags (e.g. NODUMP, IMMUTABLE)
 .TP
-.B \-\-stdout
+.B  \-\-noacls
+do not extract/set ACLs
+.TP
+.B  \-\-noxattrs
+do not extract/set xattrs
+.TP
+.B  \-\-stdout
 write all extracted data to stdout
 .TP
-.B \-\-sparse
-create holes in output sparse file from all\-zero chunks
+.B  \-\-sparse
+create holes in the output sparse file from all\-zero chunks
+.TP
+.B  \-\-continue
+extract into a non\-empty directory, e.g. to continue a previously interrupted extraction of the same archive: skip files that are fully extracted already, replace other existing files
 .UNINDENT
-.SS Exclusion options
+.SS Include/Exclude options
 .INDENT 0.0
 .TP
 .BI \-e \ PATTERN\fR,\fB \ \-\-exclude \ PATTERN
@@ -102,10 +170,10 @@ exclude paths matching PATTERN
 read exclude patterns from EXCLUDEFILE, one per line
 .TP
 .BI \-\-pattern \ PATTERN
-experimental: include/exclude paths matching PATTERN
+include/exclude paths matching PATTERN
 .TP
 .BI \-\-patterns\-from \ PATTERNFILE
-experimental: read include/exclude patterns from PATTERNFILE, one per line
+read include/exclude patterns from PATTERNFILE, one per line
 .TP
 .BI \-\-strip\-components \ NUMBER
 Remove the specified number of leading path elements. Paths with fewer elements will be silently skipped.
@@ -114,33 +182,36 @@ Remove the specified number of leading path elements. Paths with fewer elements 
 .INDENT 0.0
 .INDENT 3.5
 .sp
-.nf
-.ft C
-# Extract entire archive
-$ borg extract /path/to/repo::my\-files
+.EX
+# Extract entire archive (into the current directory, which must be empty)
+$ borg extract my\-files
+
+# Continue an interrupted extraction (or extract into a non\-empty directory)
+$ borg extract \-\-continue my\-files
 
 # Extract entire archive and list files while processing
-$ borg extract \-\-list /path/to/repo::my\-files
+$ borg extract \-\-list my\-files
 
 # Verify whether an archive could be successfully extracted, but do not write files to disk
-$ borg extract \-\-dry\-run /path/to/repo::my\-files
+$ borg extract \-\-dry\-run my\-files
 
-# Extract the "src" directory
-$ borg extract /path/to/repo::my\-files home/USERNAME/src
+# Extract the \(dqsrc\(dq directory
+$ borg extract my\-files home/USERNAME/src
 
-# Extract the "src" directory but exclude object files
-$ borg extract /path/to/repo::my\-files home/USERNAME/src \-\-exclude \(aq*.o\(aq
+# Extract the \(dqsrc\(dq directory but exclude object files
+$ borg extract my\-files home/USERNAME/src \-\-exclude \(aq*.o\(aq
+
+# Extract only the C files
+$ borg extract my\-files \(aqsh:home/USERNAME/src/*.c\(aq
 
 # Restore a raw device (must not be active/in use/mounted at that time)
-$ borg extract \-\-stdout /path/to/repo::my\-sdx | dd of=/dev/sdx bs=10M
-.ft P
-.fi
+$ borg extract \-\-stdout my\-sdx | dd of=/dev/sdx bs=10M
+.EE
 .UNINDENT
 .UNINDENT
 .SH SEE ALSO
 .sp
 \fIborg\-common(1)\fP, \fIborg\-mount(1)\fP
-.SH AUTHOR
+.SH Author
 The Borg Collective
-.\" Generated by docutils manpage writer.
-.
+.\" End of generated man page.

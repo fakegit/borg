@@ -7,8 +7,8 @@ Data structures and file formats
 ================================
 
 This page documents the internal data structures and storage
-mechanisms of Borg. It is partly based on `mailing list
-discussion about internals`_ and also on static code analysis.
+mechanisms of Borg. It is partly based on mailing list
+discussions and also on static code analysis.
 
 .. todo:: Clarify terms, perhaps create a glossary.
           ID (client?) vs. key (repository?),
@@ -19,277 +19,273 @@ discussion about internals`_ and also on static code analysis.
 Repository
 ----------
 
-.. Some parts of this description were taken from the Repository docstring
+Borg stores its data in a `Repository`, which is a key-value store implemented
+on top of ``borgstore`` (``borgstore.store.Store``, see ``repository.py``).
+Store object names are organised in namespaces, and borg uses these:
+``archives/``, ``cache/``, ``config/``, ``index/``, ``keys/``, ``locks/`` and
+``packs/``.
 
-Borg stores its data in a `Repository`, which is a file system based
-transactional key-value store. Thus the repository does not know about
-the concept of archives or items.
+Names within a namespace are flat, except for ``packs/``: it is configured
+with one nesting level, so a pack file's name is prefixed with a directory
+named after the first byte (2 hex digits) of the object name.
 
-Each repository has the following file structure:
+.. _store_hash:
 
-README
-  simple text file telling that this is a Borg repository
+Several store objects are content-addressed: they are named by the **store hash**
+of their content. The store hash is the unkeyed 256 bit BLAKE3 hash, see
+``store_hash()`` in ``crypto/key.py``. It is the same for every repository and independent of the key/encryption mode
+(unlike the chunk id hash, which the key mode selects).
 
-config
-  repository configuration
+config/
+  config
+    the repository config (see :ref:`repo_config`), a text object
+  defaults
+    the repository defaults (see :ref:`repo_defaults`), in the key's store object
+    envelope (see below). ``borg repo-create`` always writes it.
+  space-reserve.N
+    purely random binary data to reserve space, e.g. for disk-full emergencies.
+    These objects are created and removed by ``borg repo-space``.
 
-data/
-  directory where the actual data is stored
+There is one pointer object per archive in this namespace, its name is the
+hex-encoded archive ID (see :ref:`archive`):
 
-hints.%d
-  hints for repository compaction
+archives/
+  0000... .. ffff...
 
-index.%d
-  repository index
+The (encrypted and compressed) repository objects are not stored one store
+object each: many of them are batched into a **pack** file and that pack file
+is stored as a single store object. Its name is the hex-encoded store hash of
+the pack file's content:
 
-lock.roster and lock.exclusive/*
-  used by the locking system to manage shared and exclusive locks
+packs/
+  00/ .. ff/
+    0000... .. ffff...
 
-Transactionality is achieved by using a log (aka journal) to record changes. The log is a series of numbered files
-called segments_. Each segment is a series of log entries. The segment number together with the offset of each
-entry relative to its segment start establishes an ordering of the log entries. This is the "definition" of
-time for the purposes of the log.
+index/
+  0000... .. ffff...
+    the chunks index (chunk ID -> location within a pack file), stored as a set
+    of immutable index fragments, each in the key's store object envelope (see
+    below). A fragment's name is the hex-encoded store hash of the stored envelope.
 
-.. _config-file:
+See :ref:`packs` for the pack file format, the ``index/`` namespace and how
+both are written and compacted.
 
-Config file
-~~~~~~~~~~~
+cache/
+  checked-packs
+    repository check results (pack id -> timestamp, result), as a hashtable in the
+    key's store object envelope (see below). Records are kept across checks:
+    ``check --max-age`` skips packs whose intact record is younger than the given age, and partial checks
+    (``--max-duration``) verify the least-recently-checked packs first so repeated
+    runs cover the whole repository. Records of corrupt packs are always re-verified;
+    ``check --repair`` salvages each pack still recorded corrupt (see :ref:`packs`) and
+    records a pack that reads intact at the salvage as intact. Records of packs no longer
+    listed in packs/ are pruned when a check finishes.
+  checked-archives
+    archives check results (archive id -> timestamp, result), in the same format as
+    ``checked-packs``. A result is ok if the check could read all metadata of the archive
+    and found every chunk it references in the chunks index. ``check --max-age`` skips
+    archives whose ok record is younger than the given age, and partial checks
+    (``--max-duration``) check the archives without an ok record first, then the
+    least-recently-checked ones. ``check --repair`` and ``check --verify-data`` check every
+    archive. All records are removed when a check finds a corrupt or missing pack or a
+    defect chunk, when it salvages a pack, and when the archives check starts with
+    ``--repair``. No records are stored while a pack is recorded corrupt in
+    ``checked-packs``. Records of archives no longer in archives/ (soft-deleted ones
+    included) are pruned when an archives check finishes.
+  referenced-by-archive.<hex-encoded archive ID>
+    what one archive references (object ID -> plaintext object size), plus the file
+    count and content size of that archive, in the key's store object envelope (see
+    below). It lets a following ``borg compact`` or ``borg analyze`` skip re-reading
+    the items of an unchanged archive.
+  chunkindex-invalid
+    a marker object: while it is present, the chunks index in ``index/`` is considered
+    invalid, because its fragments may be missing entries or point at deleted packs.
+    It is written before deleting index fragments, before a single-object delete removes
+    the old pack, by ``borg check --repair`` after storing packs, before it re-reads
+    them and stores the index, and before the first pack a salvage deletes. It is removed
+    after the last fragment is deleted or once the complete current index is stored.
 
-Each repository has a ``config`` file which is a ``INI``-style file
-and looks like this::
+Note that this ``cache/`` namespace is inside the repository (and thus shared by
+all clients); it is not the client-local cache described in
+:ref:`the files cache <cache>`.
 
-    [repository]
-    version = 1
-    segments_per_dir = 1000
-    max_segment_size = 524288000
-    id = 57d6c1d52ce76a836b532b0e42e677dec6af9fca3673db511279358828a21ed6
+keys/
+    When using repokey mode, the encrypted, passphrase protected borg keys are
+    stored here as a base64 encoded text. The store hash of the
+    stored borg key is used for the name.
 
-This is where the ``repository.id`` is stored. It is a unique
-identifier for repositories. It will not change if you move the
-repository around so you can make a local transfer then decide to move
-the repository to another (even remote) location at a later time.
+    A repository may contain *multiple* such borg keys (one per passphrase) to
+    support the :ref:`multiple borg keys <borgcrypto_multiple_keys>` feature.
+    keyfile and repokey borg keys use the same format and naming (only the
+    storage location differs).
+
+locks/
+  used by the locking system to manage shared and exclusive locks, see
+  :ref:`storelocking`. The lock objects are stored in the store object envelope
+  (see below).
+
+.. _store_object_envelope:
+
+The index fragments, the lock objects, ``checked-packs``, ``checked-archives``, the
+``referenced-by-archive.*`` objects and ``config/defaults`` are stored in the **store object envelope**: the repository key's ``encrypt()``,
+exactly as for the metadata and data slots of the objects in a pack (see
+:ref:`security_encryption`), with an empty id and an AAD of
+``b"borg-store-object\0"`` followed by the repository id, the tag ``b"n"`` and the
+object name. For the index fragments and the lock objects, whose name is the store hash
+of the envelope and does not exist before it, the AAD holds the tag ``b"h"`` and the
+namespace (``index`` or ``locks``) instead: the tags keep a namespace and an object of the same name apart. So these
+objects are protected like the objects in the packs: encrypted and authenticated in
+the encrypting modes, authenticated only in the ``authenticated-*`` modes. The AAD
+binds an object to its repository and name: an object copied to another name, or
+from another repository using the same key material, fails the authentication.
+Reading or writing them needs the key (``Repository.set_key()``); an object that
+fails the authentication is treated like a corrupted one: ``borg check`` reports a
+corrupt index fragment and ``borg check --repair`` rebuilds the chunks index from the
+packs; any other command that needs the chunks index aborts, except ``borg compact``
+and ``borg repo-compress``, which rebuild it from the packs, as they rewrite the whole
+chunks index anyway (under an exclusive lock). A corrupted cache is ignored and
+rebuilt. A lock object that fails the authentication is treated as a foreign exclusive
+lock, see :ref:`storelocking`. The commands that use ``config/defaults`` abort if it is
+missing or fails the authentication, ``borg check --repair`` replaces it by empty defaults
+(see :ref:`repo_defaults`). The ``chunkindex-invalid`` marker has no content and is
+stored as is.
+
+.. _sealed_stream:
+
+Sealed streams
+~~~~~~~~~~~~~~
+
+Data that may be too big to be kept in memory twice is protected as a **sealed
+stream** (``borg.crypto.sealed_stream``): the byte stream is cut into frames of 1 MiB
+(the last frame holds the rest, it may be empty), and every frame is put into the
+key's envelope, so it is encrypted and authenticated in the encrypting modes and
+authenticated only in the ``authenticated-*`` modes::
+
+    stream := frame+
+    frame  := flag (1 byte: 0 = more frames follow, 1 = last frame)
+              length (4 bytes, unsigned, little endian: the length of the envelope)
+              envelope (the key's encrypt_oneshot() of the payload, empty id)
+
+The AAD of a frame's envelope is a *context* given by the user of the sealed stream,
+followed by the frame number (8 bytes, big endian, counting from 0) and the flag (1
+byte). The context starts with a domain prefix of its own and contains what the stream
+belongs to (e.g. the repository id and a name). So a frame can not be changed, moved
+to another position or into another stream, and a stream that ends before its last
+frame, claims an earlier frame to be the last one or has data after its last frame is
+rejected. What a sealed stream can not detect is the replacement of the whole stream
+by an older stream with the same context.
+
+Every frame is sealed in a one-off session (a new random session id, IV 0), so
+sealed streams can be used from any thread. Each frame costs a session key derivation
+(a few microseconds), which is negligible for 1 MiB of payload.
+
 
 Keys
 ~~~~
 
-Repository keys are byte-strings of fixed length (32 bytes), they
-don't have a particular meaning (except for the Manifest_).
+Repository object IDs (which are used as key into the key-value store) are
+byte strings of fixed length (256-bit, 32 bytes), computed like this::
 
-Normally the keys are computed like this::
+  key = id = id_hash(plaintext_data)  # plain = not encrypted, not compressed, not obfuscated
 
-  key = id = id_hash(unencrypted_data)
+For the **encrypted** modes (``aes256-ocb``, ``chacha20-poly1305``), the id_hash
+function is selected via ``borg repo-create --id-hash``, independently of
+``--encryption``. It is a keyed MAC over the plaintext (keyed by ``id_key``):
+``sha256`` selects HMAC-SHA256, ``blake3`` selects a keyed BLAKE3.
 
-The id_hash function depends on the :ref:`encryption mode <borg_init>`.
+For the modes **without encryption** (``authenticated-sha256`` /
+``authenticated-blake3``), the id hash is what protects the data, so it is part
+of the mode name and not separately selectable (giving ``--id-hash`` in addition
+is only accepted if it agrees with the mode name). These modes have key material
+and thus use the same keyed MACs as the encrypted modes, see :ref:`tagged_envelope`.
 
 As the id / key is used for deduplication, id_hash must be a cryptographically
 strong hash or MAC.
 
-Segments
-~~~~~~~~
+Repository objects
+~~~~~~~~~~~~~~~~~~
 
-Objects referenced by a key are stored inline in files (`segments`) of approx.
-500 MB size in numbered subdirectories of ``repo/data``. The number of segments
-per directory is controlled by the value of ``segments_per_dir``. If you change
-this value in a non-empty repository, you may also need to relocate the segment
-files manually.
+Repository objects are not stored as separate store objects. Many of them are
+written into one **pack** file, which is then stored as a single store object
+below ``packs/``. Where an object lives inside which pack is recorded in the
+chunks index (see :ref:`index`), so reading one object is a single ranged read
+from its pack file.
 
-A segment starts with a magic number (``BORG_SEG`` as an eight byte ASCII string),
-followed by a number of log entries. Each log entry consists of:
+A repo object starts with a fixed-size, unencrypted header
+(``RepoObj.obj_header``, a ``Struct("<8sB32sII")``, 49 bytes), followed by the
+metadata and the data:
 
-* 32-bit size of the entry
-* CRC32 of the entire entry (for a PUT this includes the data)
-* entry tag: PUT, DELETE or COMMIT
-* PUT and DELETE follow this with the 32 byte key
-* PUT follow the key with the data
+* magic, 8 bytes: ``BORG_OBJ``
+* format version, 1 byte
+* chunk id, 32 bytes
+* meta size, 32-bit unsigned little-endian
+* data size, 32-bit unsigned little-endian
+* meta, meta size bytes
+* data, data size bytes
 
-Those files are strictly append-only and modified only once.
+The overall size of repository objects varies from very small (a small source
+file will be stored as a single repository object) to medium (big source files will
+be cut into medium-sized chunks of some MB).
 
-Tag is either ``PUT``, ``DELETE``, or ``COMMIT``.
+Metadata and data are separately encrypted and authenticated (depending on
+the user's choices), with the header bound into the authentication as
+additional authenticated data. See :ref:`pack-format` for the details of the
+header, the authentication and how objects are laid out within a pack file.
 
-When an object is written to the repository a ``PUT`` entry is written
-to the file containing the object id and data. If an object is deleted
-a ``DELETE`` entry is appended with the object id.
+See :ref:`data-encryption` for a graphic outlining the anatomy of the
+encryption.
 
-A ``COMMIT`` tag is written when a repository transaction is
-committed. The segment number of the segment containing
-a commit is the **transaction ID**.
+Repo object metadata
+~~~~~~~~~~~~~~~~~~~~
 
-When a repository is opened any ``PUT`` or ``DELETE`` operations not
-followed by a ``COMMIT`` tag are discarded since they are part of a
-partial/uncommitted transaction.
+Metadata is a MessagePack-encoded (and encrypted/authenticated) dict with:
 
-The size of individual segments is limited to 4 GiB, since the offset of entries
-within segments is stored in a 32-bit unsigned integer in the repository index.
+- type (the repo object type, a one-character string: ``A`` archive metadata,
+  ``C`` archive metadata stream chunk ids, ``S`` archive metadata stream chunk,
+  ``F`` file content stream chunk - see the ``ROBJ_*`` constants)
+- ctype (compression type 0..255)
+- clevel (compression level, one byte, interpreted depending on ctype - see
+  :ref:`data-compression`)
+- csize (overall compressed (and maybe obfuscated) data size)
+- psize (only when obfuscated: payload size without the obfuscation trailer)
+- olevel (only when obfuscated: the obfuscation level)
+- size (uncompressed size of the data)
 
-Index, hints and integrity
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+Having this separately encrypted metadata makes it more efficient to query
+the metadata without having to read, transfer and decrypt the (usually much
+bigger) data part.
 
-The **repository index** is stored in ``index.<TRANSACTION_ID>`` and is used to
-determine an object's location in the repository. It is a HashIndex_,
-a hash table using open addressing. It maps object keys_ to two
-unsigned 32-bit integers; the first integer gives the segment number,
-the second indicates the offset of the object's entry within the segment.
+The compression `ctype` and `clevel` is explained in :ref:`data-compression`.
 
-The **hints file** is a msgpacked file named ``hints.<TRANSACTION_ID>``.
-It contains:
-
-* version
-* list of segments
-* compact
-
-The **integrity file** is a msgpacked file named ``integrity.<TRANSACTION_ID>``.
-It contains checksums of the index and hints files and is described in the
-:ref:`Checksumming data structures <integrity_repo>` section below.
-
-If the index or hints are corrupted, they are re-generated automatically.
-If they are outdated, segments are replayed from the index state to the currently
-committed transaction.
 
 Compaction
 ~~~~~~~~~~
 
-For a given key only the last entry regarding the key, which is called current (all other entries are called
-superseded), is relevant: If there is no entry or the last entry is a DELETE then the key does not exist.
-Otherwise the last PUT defines the value of the key.
+``borg compact`` is used to free repository space. It will:
 
-By superseding a PUT (with either another PUT or a DELETE) the log entry becomes obsolete. A segment containing
-such obsolete entries is called sparse, while a segment containing no such entries is called compact.
+- get all object IDs (and where they are stored) from the chunks index
+- read all archives and determine which object IDs are in use
+- report object IDs used by archives, but not present in the repository
+  (data loss!)
+- really delete the soft-deleted archives (unless objects are missing - then
+  they are kept, so ``borg undelete`` stays possible until ``borg check
+  --repair`` has run)
+- free space one pack file at a time - a single object can not be removed from
+  a pack file, only a whole pack file can be deleted or rewritten:
 
-Since writing a ``DELETE`` tag does not actually delete any data and
-thus does not free disk space any log-based data store will need a
-compaction strategy (somewhat analogous to a garbage collector).
+  - a pack file holding only unused objects and superseded duplicates (copies of
+    chunks the chunks index records at another location) is deleted
+  - a pack file with some unused objects or superseded duplicates is rewritten
+    without them, but only if their bytes reach the ``--threshold`` percentage
+  - very small pack files are merged into bigger ones
+  - a pack file recorded corrupt by ``borg check`` is not rewritten or merged,
+    it is only deleted if its indexed objects are all unused
+- update the chunks index in ``index/`` accordingly
+- with ``--stats``, compute statistics about:
 
-Borg uses a simple forward compacting algorithm,
-which avoids modifying existing segments.
-Compaction runs when a commit is issued with ``compact=True`` parameter, e.g.
-by the ``borg compact`` command (unless the :ref:`append_only_mode` is active).
-One client transaction can manifest as multiple physical transactions,
-since compaction is transacted, too, and Borg does not distinguish between the two::
+  - compression and deduplication factors
+  - repository space usage and space freed
 
-  Perspective| Time -->
-  -----------+--------------
-  Client     | Begin transaction - Modify Data - Commit | <client waits for repository> (done)
-  Repository | Begin transaction - Modify Data - Commit | Compact segments - Commit   | (done)
-
-The compaction algorithm requires two inputs in addition to the segments themselves:
-
-(i) Which segments are sparse, to avoid scanning all segments (impractical).
-    Further, Borg uses a conditional compaction strategy: Only those
-    segments that exceed a threshold sparsity are compacted.
-
-    To implement the threshold condition efficiently, the sparsity has
-    to be stored as well. Therefore, Borg stores a mapping ``(segment
-    id,) -> (number of sparse bytes,)``.
-
-    The 1.0.x series used a simpler non-conditional algorithm,
-    which only required the list of sparse segments. Thus,
-    it only stored a list, not the mapping described above.
-(ii) Each segment's reference count, which indicates how many live objects are in a segment.
-     This is not strictly required to perform the algorithm. Rather, it is used to validate
-     that a segment is unused before deleting it. If the algorithm is incorrect, or the reference
-     count was not accounted correctly, then an assertion failure occurs.
-
-These two pieces of information are stored in the hints file (`hints.N`)
-next to the index (`index.N`).
-
-When loading a hints file, Borg checks the version contained in the file.
-The 1.0.x series writes version 1 of the format (with the segments list instead
-of the mapping, mentioned above). Since Borg 1.0.4, version 2 is read as well.
-The 1.1.x series writes version 2 of the format and reads either version.
-When reading a version 1 hints file, Borg 1.1.x will
-read all sparse segments to determine their sparsity.
-
-This process may take some time if a repository has been kept in append-only mode
-or ``borg compact`` has not been used for a longer time, which both has caused
-the number of sparse segments to grow.
-
-Compaction processes sparse segments from oldest to newest; sparse segments
-which don't contain enough deleted data to justify compaction are skipped. This
-avoids doing e.g. 500 MB of writing current data to a new segment when only
-a couple kB were deleted in a segment.
-
-Segments that are compacted are read in entirety. Current entries are written to
-a new segment, while superseded entries are omitted. After each segment an intermediary
-commit is written to the new segment. Then, the old segment is deleted
-(asserting that the reference count diminished to zero), freeing disk space.
-
-A simplified example (excluding conditional compaction and with simpler
-commit logic) showing the principal operation of compaction:
-
-.. figure:: compaction.png
-    :figwidth: 100%
-    :width: 100%
-
-(The actual algorithm is more complex to avoid various consistency issues, refer to
-the ``borg.repository`` module for more comments and documentation on these issues.)
-
-.. _internals_storage_quota:
-
-Storage quotas
-~~~~~~~~~~~~~~
-
-Quotas are implemented at the Repository level. The active quota of a repository
-is determined by the ``storage_quota`` `config` entry or a run-time override (via :ref:`borg_serve`).
-The currently used quota is stored in the hints file. Operations (PUT and DELETE) during
-a transaction modify the currently used quota:
-
-- A PUT adds the size of the *log entry* to the quota,
-  i.e. the length of the data plus the 41 byte header.
-- A DELETE subtracts the size of the deleted log entry from the quota,
-  which includes the header.
-
-Thus, PUT and DELETE are symmetric and cancel each other out precisely.
-
-The quota does not track on-disk size overheads (due to conditional compaction
-or append-only mode). In normal operation the inclusion of the log entry headers
-in the quota act as a faithful proxy for index and hints overheads.
-
-By tracking effective content size, the client can *always* recover from a full quota
-by deleting archives. This would not be possible if the quota tracked on-disk size,
-since journaling DELETEs requires extra disk space before space is freed.
-Tracking effective size on the other hand accounts DELETEs immediately as freeing quota.
-
-.. rubric:: Enforcing the quota
-
-The storage quota is meant as a robust mechanism for service providers, therefore
-:ref:`borg_serve` has to enforce it without loopholes (e.g. modified clients).
-The following sections refer to using quotas on remotely accessed repositories.
-For local access, consider *client* and *serve* the same.
-Accordingly, quotas cannot be enforced with local access,
-since the quota can be changed in the repository config.
-
-The quota is enforcible only if *all* :ref:`borg_serve` versions
-accessible to clients support quotas (see next section). Further, quota is
-per repository. Therefore, ensure clients can only access a defined set of repositories
-with their quotas set, using ``--restrict-to-repository``.
-
-If the client exceeds the storage quota the ``StorageQuotaExceeded`` exception is
-raised. Normally a client could ignore such an exception and just send a ``commit()``
-command anyway, circumventing the quota. However, when ``StorageQuotaExceeded`` is raised,
-it is stored in the ``transaction_doomed`` attribute of the repository.
-If the transaction is doomed, then commit will re-raise this exception, aborting the commit.
-
-The transaction_doomed indicator is reset on a rollback (which erases the quota-exceeding
-state).
-
-.. rubric:: Compatibility with older servers and enabling quota after-the-fact
-
-If no quota data is stored in the hints file, Borg assumes zero quota is used.
-Thus, if a repository with an enabled quota is written to with an older ``borg serve``
-version that does not understand quotas, then the quota usage will be erased.
-
-The client version is irrelevant to the storage quota and has no part in it.
-The form of error messages due to exceeding quota varies with client versions.
-
-A similar situation arises when upgrading from a Borg release that did not have quotas.
-Borg will start tracking quota use from the time of the upgrade, starting at zero.
-
-If the quota shall be enforced accurately in these cases, either
-
-- delete the ``index.N`` and ``hints.N`` files, forcing Borg to rebuild both,
-  re-acquiring quota data in the process, or
-- edit the msgpacked ``hints.N`` file (not recommended and thus not
-  documented further).
 
 The object graph
 ----------------
@@ -304,244 +300,138 @@ More on how this helps security in :ref:`security_structural_auth`.
     :figwidth: 100%
     :width: 100%
 
-.. _manifest:
+.. _repo_config:
 
-The manifest
-~~~~~~~~~~~~
+Repository config
+~~~~~~~~~~~~~~~~~
 
-The manifest is the root of the object hierarchy. It references
-all archives in a repository, and thus all data in it.
-Since no object references it, it cannot be stored under its ID key.
-Instead, the manifest has a fixed all-zero key.
+The repository config is the ``config/config`` store object (see Repository_), a
+plain text ``INI``-style file. It is the only object borg needs to read to open a
+repository. It looks like this::
 
-The manifest is rewritten each time an archive is created, deleted,
-or modified. It looks like this:
+    # This is a Borg Backup repository.
+    # See https://borgbackup.readthedocs.io/
 
-.. code-block:: python
+    [repository]
+    version = 5
+    id = 0a2744f216526be75ae14a5fa5b123127bb218558219f6203e09e4f220e45903
+    encryption = aes256-ocb
+    id_hash = sha256
 
-    {
-        b'version': 1,
-        b'timestamp': b'2017-05-05T12:42:23.042864',
-        b'item_keys': [b'acl_access', b'acl_default', ...],
-        b'config': {},
-        b'archives': {
-            b'2017-05-05-system-backup': {
-                b'id': b'<32 byte binary object ID>',
-                b'time': b'2017-05-05T12:42:22.942864',
-            },
-        },
-        b'tam': ...,
-    }
+*version* is the repository version. borg refuses to open a repository whose
+version it does not support (currently, only version 5 is supported).
 
-The *version* field can be either 1 or 2. The versions differ in the
-way feature flags are handled, described below.
+*id* is the unique repository ID (32 bytes, hex encoded). It does not change if
+the repository is moved to another location. The keys of the repository are
+bound to it (see :ref:`key_files`), and the client's cache and security
+directories are named after it.
 
-The *timestamp* field is used to avoid logical replay attacks where
-the server just resets the repository to a previous state.
+*encryption* and *id_hash* record the crypto suite of the repository's key, by
+the same names ``borg repo-create --encryption`` and ``--id-hash`` accept. This
+is how borg selects the key class when opening a repository, without reading any
+repository object. The config is plaintext and not authenticated; see
+:ref:`remote_access_security` for what protects against a swapped crypto suite.
+Where the key is stored (keyfile or repokey) is not recorded
+here: that is a property of each individual key, see :ref:`key_files`. Both
+entries are present, or none: a repository created via the Python API
+(``Repository.create()``) without a key has none, it can be used as a key/value
+store, but borg refuses to load a key for it.
 
-*item_keys* is a list containing all Item_ keys that may be encountered in
-the repository. It is used by *borg check*, which verifies that all keys
-in all items are a subset of these keys. Thus, an older version of *borg check*
-supporting this mechanism can correctly detect keys introduced in later versions.
+``borg repo-create`` writes the config once, after the key was created: writing
+it is what makes the store a repository. It then writes an empty chunks index
+(which needs the key), so the first use of the repository does not have to build
+it by listing the packs. A store without the config (e.g. the leftover of
+an interrupted ``borg repo-create``) is not a repository: borg reports it as not
+a valid repository, and ``borg repo-create`` refuses to create a repository in a
+non-empty location, saying whether it found a repository config there.
+``borg repo-delete --force`` destroys such a store, provided it looks like a borg
+store (it has the packs, archives, index and config namespaces, which
+``Repository.create()`` makes in advance), so that it can be removed without other
+access to the storage.
 
-The *tam* key is part of the :ref:`tertiary authentication mechanism <tam_description>`
-(formerly known as "tertiary authentication for metadata") and authenticates
-the manifest, since an ID check is not possible.
+The config is the one object ``borg check --repair`` can not restore. If a
+repository lost or damaged its config, it can be recreated by hand: the version
+is 5, the id is in the key (the ``BORG_KEY <id>`` header line of a keyfile or of
+a ``keys/`` object, see :ref:`key_files`), and the encryption mode and id hash
+are what ``borg repo-create`` was given (the key type byte of any repository
+object encodes them as well, see ``KeyType`` in ``constants.py``).
 
-*config* is a general-purpose location for additional metadata. All versions
-of Borg preserve its contents (it may have been a better place for *item_keys*,
-which is not preserved by unaware Borg versions, releases predating 1.0.4).
+.. _repo_defaults:
 
-Feature flags
-+++++++++++++
+Repository defaults
+~~~~~~~~~~~~~~~~~~~
 
-Feature flags are used to add features to data structures without causing
-corruption if older versions are used to access or modify them. The main issues
-to consider for a feature flag oriented design are flag granularity,
-flag storage, and cache_ invalidation.
+The ``config/defaults`` store object holds default values for command options,
+as a msgpacked dict mapping the option name to its value, both as strings::
 
-Feature flags are divided in approximately three categories, detailed below.
-Due to the nature of ID-based deduplication, write (i.e. creating archives) and
-read access are not symmetric; it is possible to create archives referencing
-chunks that are not readable with the current feature set. The third
-category are operations that require accurate reference counts, for example
-archive deletion and check.
+    {"compression": "zstd,3", "chunker_params": "fastcdc,19,23,21,2"}
 
-As the manifest is always updated and always read, it is the ideal place to store
-feature flags, comparable to the super-block of a file system. The only problem
-is to recover from a lost manifest, i.e. how is it possible to detect which feature
-flags are enabled, if there is no manifest to tell. This issue is left open at this time,
-but is not expected to be a major hurdle; it doesn't have to be handled efficiently, it just
-needs to be handled.
+*compression* is the default compression spec (see ``borg help compression``),
+set by ``borg repo-create --compression``. The commands with a ``--compression``
+option use it if no compression was given via the command line, the environment or
+the default config file; without it, they use lz4.
 
-Lastly, cache_ invalidation is handled by noting which feature
-flags were and which were not understood while manipulating a cache.
-This allows borg to detect whether the cache needs to be invalidated,
-i.e. rebuilt from scratch. See `Cache feature flags`_ below.
+*chunker_params* are the default :ref:`chunker-params <chunker-params>`, set by
+``borg repo-create --chunker-params``. ``borg create`` and ``borg import-tar`` use
+them if no chunker params were given (in the same ways as above), ``borg recreate``
+and ``borg transfer`` for ``--chunker-params default``; without them, the built-in
+default chunker params are used.
 
-The *config* key stores the feature flags enabled on a repository:
+Each entry is optional, a missing entry means that the repository has no default
+for it.
 
-.. code-block:: python
-
-    config = {
-        b'feature_flags': {
-            b'read': {
-                b'mandatory': [b'some_feature'],
-            },
-            b'check': {
-                b'mandatory': [b'other_feature'],
-            }
-            b'write': ...,
-            b'delete': ...
-        },
-    }
-
-The top-level distinction for feature flags is the operation the client intends
-to perform,
-
-| the *read* operation includes extraction and listing of archives,
-| the *write* operation includes creating new archives,
-| the *delete* (archives) operation,
-| the *check* operation requires full understanding of everything in the repository.
-|
-
-These are weakly set-ordered; *check* will include everything required for *delete*,
-*delete* will likely include *write* and *read*. However, *read* may require more
-features than *write* (due to ID-based deduplication, *write* does not necessarily
-require reading/understanding repository contents).
-
-Each operation can contain several sets of feature flags. Only one set,
-the *mandatory* set is currently defined.
-
-Upon reading the manifest, the Borg client has already determined which operation
-should be performed. If feature flags are found in the manifest, the set
-of feature flags supported by the client is compared to the mandatory set
-found in the manifest. If any unsupported flags are found (i.e. the mandatory set is
-not a subset of the features supported by the Borg client used), the operation
-is aborted with a *MandatoryFeatureUnsupported* error:
-
-    Unsupported repository feature(s) {'some_feature'}. A newer version of borg is required to access this repository.
-
-Older Borg releases do not have this concept and do not perform feature flags checks.
-These can be locked out with manifest version 2. Thus, the only difference between
-manifest versions 1 and 2 is that the latter is only accepted by Borg releases
-implementing feature flags.
-
-Therefore, as soon as any mandatory feature flag is enabled in a repository,
-the manifest version must be switched to version 2 in order to lock out all
-Borg releases unaware of feature flags.
-
-.. _Cache feature flags:
-.. rubric:: Cache feature flags
-
-`The cache`_ does not have its separate set of feature flags. Instead, Borg stores
-which flags were used to create or modify a cache.
-
-All mandatory manifest features from all operations are gathered in one set.
-Then, two sets of features are computed;
-
-- those features that are supported by the client and mandated by the manifest
-  are added to the *mandatory_features* set,
-- the *ignored_features* set comprised of those features mandated by the manifest,
-  but not supported by the client.
-
-Because the client previously checked compliance with the mandatory set of features
-required for the particular operation it is executing, the *mandatory_features* set
-will contain all necessary features required for using the cache safely.
-
-Conversely, the *ignored_features* set contains only those features which were not
-relevant to operating the cache. Otherwise, the client would not pass the feature
-set test against the manifest.
-
-When opening a cache and the *mandatory_features* set is not a subset of the features
-supported by the client, the cache is wiped out and rebuilt,
-since a client not supporting a mandatory feature that the cache was built with
-would be unable to update it correctly.
-The assumption behind this behaviour is that any of the unsupported features could have
-been reflected in the cache and there is no way for the client to discern whether
-that is the case.
-Meanwhile, it may not be practical for every feature to have clients using it track
-whether the feature had an impact on the cache.
-Therefore, the cache is wiped.
-
-When opening a cache and the intersection of *ignored_features* and the features
-supported by the client contains any elements, i.e. the client possesses features
-that the previous client did not have and those new features are enabled in the repository,
-the cache is wiped out and rebuilt.
-
-While the former condition likely requires no tweaks, the latter condition is formulated
-in an especially conservative way to play it safe. It seems likely that specific features
-might be exempted from the latter condition.
-
-.. rubric:: Defined feature flags
-
-Currently no feature flags are defined.
-
-From currently planned features, some examples follow,
-these may/may not be implemented and purely serve as examples.
-
-- A mandatory *read* feature could be using a different encryption scheme (e.g. session keys).
-  This may not be mandatory for the *write* operation - reading data is not strictly required for
-  creating an archive.
-- Any additions to the way chunks are referenced (e.g. to support larger archives) would
-  become a mandatory *delete* and *check* feature; *delete* implies knowing correct
-  reference counts, so all object references need to be understood. *check* must
-  discover the entire object graph as well, otherwise the "orphan chunks check"
-  could delete data still in use.
+Unlike the repository config, which borg must read before it knows the key, the
+defaults are stored in the :ref:`store object envelope <store_object_envelope>`,
+so they are authenticated: an attacker with write access to the storage can not
+change them (e.g. remove an ``obfuscate`` compression) without being noticed.
+``borg repo-create`` always writes the object, also when no default was given (an
+empty dict), so removing it is noticed as well: the commands that use the defaults
+refuse to run if the object is missing or fails the authentication. ``borg check``
+reports such an object and ``borg check --repair`` replaces it by empty defaults, so
+the repository can be used again (with the built-in defaults). Like the repository
+config, the defaults themselves can not be restored.
 
 .. _archive:
 
 Archives
 ~~~~~~~~
 
-Each archive is an object referenced by the manifest. The archive object
-itself does not store any of the data contained in the archive it describes.
+Each archive is an object referenced by an entry below archives/ (see
+Repository_). Such an entry is named after the hex-encoded archive ID and has
+**empty content** - the name is all the information it carries, because the
+archive ID is the chunk ID of the archive object. Deleting an archive only
+soft-deletes that entry (``borgstore`` renames it, appending a ``.del``
+suffix), so ``borg undelete`` can bring it back until ``borg compact`` removes
+it for good.
 
-Instead, it contains a list of chunks which form a msgpacked stream of items_.
-The archive object itself further contains some metadata:
+The archive object itself does not store any of the data contained in the
+archive it describes. Instead, it contains a list of chunks which form a
+msgpacked stream of items_. The archive object itself further contains some
+metadata:
 
-* *version*
-* *name*, which might differ from the name set in the manifest.
-  When :ref:`borg_check` rebuilds the manifest (e.g. if it was corrupted) and finds
-  more than one archive object with the same name, it adds a counter to the name
-  in the manifest, but leaves the *name* field of the archives as it was.
-* *items*, a list of chunk IDs containing item metadata (size: count * ~34B)
-* *cmdline*, the command line which was used to create the archive
+* *version*, 2 for archives created by borg 2
+* *name*, the archive name. As the archives/* entry only encodes the archive ID,
+  this is the only place the name is stored. When :ref:`borg_check` finds an
+  archive object that has no entry below archives/ (e.g. because the entry was
+  lost), it recreates the missing entry - which needs the archive ID only.
+* *item_ptrs*, a list of "pointer chunk" IDs.
+  Each "pointer chunk" contains a list of chunk IDs of item metadata.
+* *command_line*, the command line which was used to create the archive
 * *hostname*
 * *username*
-* *time* and *time_end* are the start and end timestamps, respectively
+* *cwd*, the current working directory borg was invoked in
+* *time* is the nominal archive timestamp - usually the time the archive was
+  started, but ``--timestamp`` overrides it. *start* and *end* are the
+  timestamps of when creating the archive actually started and finished.
 * *comment*, a user-specified archive comment
+* *tags*, the list of the archive's tags
 * *chunker_params* are the :ref:`chunker-params <chunker-params>` used for creating the archive.
   This is used by :ref:`borg_recreate` to determine whether a given archive needs rechunking.
-* Some other pieces of information related to recreate.
-
-.. _archive_limitation:
-
-.. rubric:: Note about archive limitations
-
-The archive is currently stored as a single object in the repository
-and thus limited in size to MAX_OBJECT_SIZE (20MiB).
-
-As one chunk list entry is ~40B, that means we can reference ~500.000 item
-metadata stream chunks per archive.
-
-Each item metadata stream chunk is ~128kiB (see hardcoded ITEMS_CHUNKER_PARAMS).
-
-So that means the whole item metadata stream is limited to ~64GiB chunks.
-If compression is used, the amount of storable metadata is bigger - by the
-compression factor.
-
-If the medium size of an item entry is 100B (small size file, no ACLs/xattrs),
-that means a limit of ~640 million files/directories per archive.
-
-If the medium size of an item entry is 2kB (~100MB size files or more
-ACLs/xattrs), the limit will be ~32 million files/directories per archive.
-
-If one tries to create an archive object bigger than MAX_OBJECT_SIZE, a fatal
-IntegrityError will be raised.
-
-A workaround is to create multiple archives with fewer items each, see
-also :issue:`1452`.
+* *size* and *nfiles*, the total size and the count of the source files in the
+  archive
+* *recreate_command_line*, the command line of the :ref:`borg_recreate` run
+  that produced this archive (only present in archives that went through
+  ``borg recreate``; ``borg transfer`` carries it over)
 
 .. _item:
 
@@ -552,18 +442,65 @@ Each item represents a file, directory or other file system item and is stored a
 dictionary created by the ``Item`` class that contains:
 
 * path
-* list of data chunks (size: count * ~40B)
+* chunks, the list of data chunks (size: count * ~40B)
+* size (only for items with a chunks list: the sum of the chunk sizes)
 * user
 * group
 * uid
 * gid
 * mode (item type + permissions)
-* source (for symlinks, and for hardlinks within one archive)
+* target (for symlinks: the link target)
+* hlid (for hardlinks)
 * rdev (for device files)
-* mtime, atime, ctime in nanoseconds
+* inode (the inode number, used by the files cache)
+* mtime, atime, ctime, birthtime in nanoseconds
 * xattrs
-* acl (various OS-dependent fields)
-* flags
+* acl_access, acl_default, acl_extended, acl_nfs4 (various OS-dependent fields)
+* bsdflags (BSD-style file flags)
+* digests, hash digests over the full content of a regular file, see :ref:`item_digests`
+
+The full set of keys known to this borg version is ``ITEM_KEYS`` in
+``constants.py``. It also contains some keys borg 2 does not write, but still
+reads from borg 1.x archives (e.g. when transferring them): *source* (borg 1.x
+symlink target, now: *target*), *hardlink_master*, *chunks_healthy* and *part*.
+Keys not in that set are preserved as they are when an item is read and written
+back (e.g. by ``borg check --repair``), so an older borg version does not damage
+items written by a newer one. ``borg check`` only requires the *path* and *mtime*
+keys to be present in every item and warns about keys it does not know.
+
+.. _item_digests:
+
+Item digests
+~~~~~~~~~~~~
+
+If asked to (``--digests ALGOS``, e.g. ``--digests=blake3``), ``borg create`` and
+``borg import-tar`` compute hash digests over the full content of each regular file
+and store them in the item's ``digests`` dict, mapping the hash algorithm name to
+the digest, e.g. ``{"blake3": b"..."}`` (32 bytes / 256 bits for blake3). The digest
+of the content is the same as the one an external tool like ``b3sum`` computes - in
+contrast to the chunk ids, it does not depend on the chunker or on borg's key.
+
+The same algorithms are available as ``borg list`` format keys, and
+``borg list --format "{blake3}"`` uses a stored digest if the item has one (otherwise
+it reads the file content to compute it).
+
+Digests are off by default (``--digests=none``): the content is hashed while it is
+read and processed anyway, mostly by a background thread (our hash implementations
+release the GIL), so one hash algorithm usually does not make ``borg create`` slower
+for bigger files - but many small files are hashed by the main thread, and several
+algorithms are hashed one after the other, which the background thread may not be
+able to hide.
+
+Digests are not computed if borg does not read the full content of a file:
+
+* an unchanged file (the files cache knows it) is not read again - borg takes the
+  digests from the files cache. Files that are already in the files cache without
+  digests only get them when they are read again (that is, when they change), so
+  changing ``--digests`` only affects files that borg reads.
+* the additional hard links to a file are not read again, they get the digests of
+  the first one.
+* ``borg create --reuse-from`` reuses chunks of a reference archive without reading
+  them, so the resulting item does not have digests.
 
 All items are serialized using msgpack and the resulting byte stream
 is fed into the same chunker algorithm as used for regular file data
@@ -580,12 +517,30 @@ A chunk is stored as an object as well, of course.
 Chunks
 ~~~~~~
 
-Borg has these chunkers:
+Borg has these chunkers (the default is "fastcdc"):
 
 - "fixed": a simple, low cpu overhead, fixed blocksize chunker, optionally
   supporting a header block of different size.
+- "fastcdc": variable, content-defined blocksize, uses the window-less, keyed
+  Gear rolling hash (FastCDC_); faster than buzhash, same deduplication.
+- "buzhash64": similar to "buzhash", but improved 64bit implementation
 - "buzhash": variable, content-defined blocksize, uses a rolling hash
   computed by the Buzhash_ algorithm.
+- "toeplitz-aes": like "rabin-aes", but the universal hash is a tabulated
+  LFSR/Toeplitz hash (secret 2 KiB table, fixed public polynomial); same
+  speed as "rabin-aes" with the best collision bound of the three.
+- "rabin-aes": variable, content-defined blocksize; a rolling Rabin fingerprint
+  (secret polynomial) post-processed with AES-128, so the cut decision only
+  depends on the AES output ("UHF-then-PRF" construction). Strongest available
+  protection against chunk-size fingerprinting attacks.
+- "goldilocks-aes": like "rabin-aes", but the universal hash is a polynomial
+  hash over the Goldilocks prime field (the reference construction of the
+  underlying paper); about half the rabin-aes speed, mainly a comparison
+  baseline.
+
+All chunkers support sparse file processing (``borg create --sparse``): hole
+ranges in the input file are then detected (via ``SEEK_HOLE``/``SEEK_DATA``)
+and seeked over instead of being read, processing their content as all-zero.
 
 For some more general usage hints see also ``--chunker-params``.
 
@@ -606,59 +561,178 @@ The default is not to have a differently sized header.
   bytes) recommended. E.g.: 4194304 would cut 4MiB sized chunks.
 - HEADER_SIZE: optional, defaults to 0 (no header).
 
-The fixed chunker also supports processing sparse files (reading only the ranges
-with data and seeking over the empty hole ranges).
+"fastcdc" chunker
++++++++++++++++++
 
-``borg create --sparse --chunker-params fixed,BLOCK_SIZE[,HEADER_SIZE]``
+FastCDC_ content-defined chunker using the Gear rolling hash. Unlike buzhash it
+is window-less (each byte's influence simply decays out of the hash), so its
+update is cheaper and it chunks noticeably faster, while producing the same
+deduplication and (with normalized chunking) the same chunk-size distribution.
+
+Like "buzhash64", the Gear table is cryptographically derived from secret key
+material, so chunk cut points are unpredictable without the key.
+
+``borg create --chunker-params fastcdc,CHUNK_MIN_EXP,CHUNK_MAX_EXP,HASH_MASK_BITS,NC_LEVEL``
+can be used to tune the chunker parameters, the default is:
+
+- CHUNK_MIN_EXP = 19 (minimum chunk size = 2^19 B = 512 kiB)
+- CHUNK_MAX_EXP = 23 (maximum chunk size = 2^23 B = 8 MiB)
+- HASH_MASK_BITS = 21 (target chunk size ~= 2^21 B = 2 MiB)
+- NC_LEVEL = 2 (normalized chunking level, 0 disables it)
+
+There is no window size (Gear is window-less). Normalized chunking varies the
+cut-point mask around the target size, which tightens the chunk-size
+distribution and reduces clamping at the min./max. chunk size.
+
+This is the default chunker (``fastcdc,19,23,21,2``), also used for the item
+metadata stream (with a finer granularity, ``fastcdc,15,19,17,2``).
+
+"buzhash64" chunker
++++++++++++++++++++
+
+Similar to "buzhash", but using 64bit wide hash values.
+
+The buzhash table is cryptographically derived from secret key material.
+
+These changes should improve resistance against attacks and also solve
+some of the issues of the original (32bit / XORed table) implementation.
 
 "buzhash" chunker
 +++++++++++++++++
 
 The buzhash chunker triggers (chunks) when the last HASH_MASK_BITS bits of the
-hash are zero, producing chunks with a target size of 2^HASH_MASK_BITS Bytes.
+hash are zero, producing chunks with a target size of 2^HASH_MASK_BITS bytes.
 
 Buzhash is **only** used for cutting the chunks at places defined by the
 content, the buzhash value is **not** used as the deduplication criteria (we
 use a cryptographically strong hash/MAC over the chunk contents for this, the
 id_hash).
 
+The idea of content-defined chunking is assigning every byte where a
+cut *could* be placed a hash. The hash is based on some number of bytes
+(the window size) before the byte in question. Chunks are cut
+where the hash satisfies some condition
+(usually "n numbers of trailing/leading zeroes"). This causes chunks to be cut
+in the same location relative to the file's contents, even if bytes are inserted
+or removed before/after a cut, as long as the bytes within the window stay the same.
+This results in a high chance that a single cluster of changes to a file will only
+result in 1-2 new chunks, aiding deduplication.
+
+Using normal hash functions this would be extremely slow,
+requiring hashing approximately ``window size * file size`` bytes.
+A rolling hash is used instead, which allows to add a new input byte and
+compute a new hash as well as *remove* a previously added input byte
+from the computed hash. This makes the cost of computing a hash for each
+input byte largely independent of the window size.
+
+Borg defines minimum and maximum chunk sizes (CHUNK_MIN_EXP and CHUNK_MAX_EXP, respectively)
+which narrows down where cuts may be made, greatly reducing the amount of data
+that is actually hashed for content-defined chunking.
+
 ``borg create --chunker-params buzhash,CHUNK_MIN_EXP,CHUNK_MAX_EXP,HASH_MASK_BITS,HASH_WINDOW_SIZE``
-can be used to tune the chunker parameters, the default is:
+can be used to tune the chunker parameters, the usual values are:
 
 - CHUNK_MIN_EXP = 19 (minimum chunk size = 2^19 B = 512 kiB)
 - CHUNK_MAX_EXP = 23 (maximum chunk size = 2^23 B = 8 MiB)
 - HASH_MASK_BITS = 21 (target chunk size ~= 2^21 B = 2 MiB)
-- HASH_WINDOW_SIZE = 4095 [B] (`0xFFF`)
+- HASH_WINDOW_SIZE = 4095 [B] (`0xFFF`) (must be an odd number)
 
 The buzhash table is altered by XORing it with a seed randomly generated once
 for the repository, and stored encrypted in the keyfile. This is to prevent
 chunk size based fingerprinting attacks on your encrypted repo contents (to
 guess what files you have based on a specific set of chunk sizes).
 
+"toeplitz-aes" chunker
+++++++++++++++++++++++
+
+Like "rabin-aes", but the universal hash is a tabulated LFSR-based Toeplitz
+hash (Krawczyk, CRYPTO '94): the digest of the 64-byte window is
+sum_j x^(63-j) * T[b_j] over GF(2)[x] mod P, where T is a secret random
+table of 256 64-bit values (2 KiB of key material) and P is a *fixed public*
+irreducible polynomial of degree 64. The AES-128 PRF layer is the same as
+for "rabin-aes". Two distinct windows collide with probability exactly
+2^-64 over the choice of T - the best possible bound for a 64-bit digest,
+and unconditional (no secret polynomial sampling). The rolling update
+contains no secret-dependent memory access. Speed is on par with
+"rabin-aes". See :doc:`chunker` for a comparison of all chunkers.
+
+``borg create --chunker-params toeplitz-aes,CHUNK_MIN_EXP,CHUNK_MAX_EXP,HASH_MASK_BITS,NC_LEVEL``
+
+The window size is fixed at 64 bytes. NC_LEVEL is the normalized chunking
+level (0 disables it); 2 is a good default. E.g.: ``toeplitz-aes,19,23,21,2``.
+
+"rabin-aes" chunker
++++++++++++++++++++
+
+A "UHF-then-PRF" content-defined chunker, following the provably secure
+construction of `Breaking and Fixing Content-Defined Chunking
+<https://eprint.iacr.org/2025/558>`_ (Truong et al., 2025): a rolling Rabin
+fingerprint over GF(2)[x]/P(x) - with P a secret, random, irreducible
+polynomial of degree 64 - compresses the last 64 bytes into a digest
+(a universal hash), and AES-128 with a secret key is applied to that digest.
+The cut decision only looks at the AES output, so observed chunk boundaries
+are pseudo-random and do not provide usable equations about the chunking
+secrets, unlike chunkers that cut directly on (keyed) rolling hash bits.
+Both secrets are derived from the repository key material.
+
+This is the recommended chunker when resistance against chunk-size
+fingerprinting attacks matters most. It is slower than "fastcdc" (one AES
+block encryption per scanned byte), but still fast in absolute terms: the
+implementation batches the AES work through OpenSSL or uses AES hardware
+instructions (arm64 crypto extensions / x86-64 AES-NI) where available.
+
+``borg create --chunker-params rabin-aes,CHUNK_MIN_EXP,CHUNK_MAX_EXP,HASH_MASK_BITS,NC_LEVEL``
+
+The window size is fixed at 64 bytes. NC_LEVEL is the normalized chunking
+level (0 disables it); 2 is a good default. E.g.: ``rabin-aes,19,23,21,2``.
+
+"goldilocks-aes" chunker
+++++++++++++++++++++++++
+
+Like "rabin-aes", but the universal hash is the reference construction of the
+same paper: a polynomial hash over the Goldilocks prime field GF(p) with
+p = 2^64 - 2^32 + 1, evaluated at a secret random point K over the same
+64-byte window. The AES-128 PRF layer and the security properties are the
+same as for "rabin-aes" (the two-window collision bound is even slightly
+better). It is about half as fast as "rabin-aes" - prime-field multiplies
+instead of table lookups in the rolling hash - and is provided mainly as a
+well-understood comparison baseline.
+
+``borg create --chunker-params goldilocks-aes,CHUNK_MIN_EXP,CHUNK_MAX_EXP,HASH_MASK_BITS,NC_LEVEL``
+
+The window size is fixed at 64 bytes. NC_LEVEL is the normalized chunking
+level (0 disables it); 2 is a good default. E.g.: ``goldilocks-aes,19,23,21,2``.
+
 .. _cache:
 
-The cache
----------
+The files cache
+---------------
 
-The **files cache** is stored in ``cache/files`` and is used at backup time to
-quickly determine whether a given file is unchanged and we have all its chunks.
+The **files cache** is a client-local file, stored in the borg cache directory
+of the repository (see :ref:`env_vars`) as ``files.<SUFFIX>``. SUFFIX is the
+:ref:`store hash <store_hash>` of the archive (series) name, so each archive series gets its own files
+cache; ``BORG_FILES_CACHE_SUFFIX`` overrides it. The files cache is used at
+backup time to quickly determine whether a given file is unchanged and we have
+all its chunks.
 
 In memory, the files cache is a key -> value mapping (a Python *dict*) and contains:
 
-* key: id_hash of the encoded, absolute file path
-* value:
+* key: id_hash of the encoded path (same path as seen in archive)
+* value (``FileCacheEntry`` in ``cache.py``):
 
+  - age (0 [newest], ..., BORG_FILES_CACHE_TTL - 1)
   - file inode number
   - file size
+  - file ctime_ns
   - file mtime_ns
-  - age (0 [newest], 1, 2, 3, ..., BORG_FILES_CACHE_TTL - 1)
-  - list of chunk ids representing the file's contents
+  - list of chunk (id, size) tuples representing the file's contents
+  - digests, the file's content digests (see :ref:`item_digests`) or None
 
 To determine whether a file has not changed, cached values are looked up via
 the key in the mapping and compared to the current file attribute values.
 
-If the file's size, mtime_ns and inode number is still the same, it is
-considered to not have changed. In that case, we check that all file content
+If the file's size, timestamp and inode number is still the same, it is
+considered not to have changed. In that case, we check that all file content
 chunks are (still) present in the repository (we check that via the chunks
 cache).
 
@@ -675,44 +749,95 @@ different files, as a single path may not be unique across different
 archives in different setups.
 
 Not all filesystems have stable inode numbers. If that is the case, borg can
-be told to ignore the inode number in the check via --ignore-inode.
+be told to ignore the inode number in the check via --files-cache.
 
 The age value is used for cache management. If a file is "seen" in a backup
 run, its age is reset to 0, otherwise its age is incremented by one.
 If a file was not seen in BORG_FILES_CACHE_TTL backups, its cache entry is
-removed. See also: :ref:`always_chunking` and :ref:`a_status_oddity`
+removed.
 
-The files cache is a python dictionary, storing python objects, which
-generates a lot of overhead.
+The files cache is a python dictionary. To keep the memory overhead of python
+objects low, the value is not kept as a python tuple, but in a "compressed" form:
+
+- the chunks list is reduced from (256bit chunk id, 32bit size) tuples to bare
+  32bit indexes into the chunks index (see ``ChunkIndex.k_to_idx``). The chunk
+  id and size are looked up from the chunks index again when the entry is used.
+  This only works while that chunks index is in memory.
+- the resulting entry is then msgpacked, so one dict value is a single ``bytes``
+  object instead of a nested structure of python objects.
 
 Borg can also work without using the files cache (saves memory if you have a
 lot of files or not much RAM free), then all files are assumed to have changed.
 This is usually much slower than with files cache.
 
-The on-disk format of the files cache is a stream of msgpacked tuples (key, value).
-Loading the files cache involves reading the file, one msgpack object at a time,
-unpacking it, and msgpacking the value (in an effort to save memory).
+On disk, the files cache is a stream of msgpacked tuples (key, value). There, the
+chunks list is stored in its uncompressed form (chunk id and size), as the chunks
+index indexes are only valid for one specific in-memory chunks index. This stream
+is stored as a :ref:`sealed stream <sealed_stream>`, so it is encrypted and
+authenticated with the repository key (authenticated only in the ``authenticated-*``
+modes), like the objects in the repository. The context of the sealed stream is
+``b"borg-files-cache\0"``, followed by the repository id and the file name of the files
+cache (``files.<SUFFIX>``): a files cache copied from another repository (using the
+same key material) or from another archive series is rejected. Loading the files
+cache involves reading and verifying the file frame by frame, unpacking one msgpack
+object at a time and compressing the entry as described above.
 
-The **chunks cache** is stored in ``cache/chunks`` and is used to determine
-whether we already have a specific chunk, to count references to it and also
-for statistics.
+Without the key, one can only see the names, sizes and timestamps of the files
+cache files. A files cache that fails the verification (it is corrupted, was
+modified, or was not written with the key of this repository) is ignored with a
+warning: borg then rebuilds the files cache from the most recent archive of the
+series in the repository, or, failing that, starts with an empty files cache. The
+same happens, without a warning, if there is no files cache file (yet). Replacing a
+files cache file by an older version of it is not detected, but harmless: its
+entries were correct when it was written, and entries that refer to chunks that are
+no longer in the repository are dropped when loading it.
 
-The chunks cache is a key -> value mapping and contains:
+.. _index:
 
-* key:
+The chunks index
+----------------
+
+The **chunks index** is persisted in the repository as index fragments and loaded in memory.
+It is used to determine whether we already have a specific chunk.
+
+The chunks index is a key -> value mapping and contains:
+
+* key (32 bytes):
 
   - chunk id_hash
-* value:
+* value (48 bytes, ``ChunkIndexEntry`` in ``borg.hashindex``):
 
-  - reference count
-  - size
-  - encrypted/compressed size
+  - flags (32bit): ``F_USED`` (chunk is used / referenced), ``F_COMPRESS`` (chunk
+    shall get re-compressed), ``F_PENDING`` (the chunk is still buffered in the pack
+    writer, so its pack location is not resolved yet). The upper 8 bits are reserved
+    for system flags (currently ``F_NEW``) and are not visible to users of the index.
+  - size (32bit): plaintext chunk size, 0 if not known (see below)
+  - pack_id (32 bytes): id of the pack file the chunk's blob is stored in
+  - obj_offset (32bit): byte offset of the blob inside that pack file
+  - obj_size (32bit): blob length (header + encrypted_meta + encrypted_data)
 
-The chunks cache is a HashIndex_. Due to some restrictions of HashIndex,
-the reference count of each given chunk is limited to a constant, MAX_VALUE
-(introduced below in HashIndex_), approximately 2**32.
-If a reference count hits MAX_VALUE, decrementing it yields MAX_VALUE again,
-i.e. the reference count is pinned to MAX_VALUE.
+The last 3 values are the chunk's location, see :ref:`pack-index-entry`: reading a
+chunk is one ranged read of ``[obj_offset, obj_offset + obj_size)`` from
+``packs/<hex(pack_id)>``.
+
+So a chunks index entry is 32 + 48 == 80 bytes, and that is also exactly what it
+needs on disk (the serialized format is just key/value pairs, no padding, plus a
+small header). In memory, there is some additional overhead, see below.
+
+Not all of that is persisted, though: when an index fragment is written, flags and
+size are zeroed (only the chunk id and the pack location are of interest there).
+Thus, a chunks index that was just built from the repository has size == 0 for all
+its entries, no matter whether it came from the index fragments or from the slow
+rebuild (which reads the pack headers, where only the stored blob size is known,
+not the plaintext size).
+
+The plaintext size of an entry is only filled in while borg is running, for the
+chunks it actually processes: by ``borg create`` when it adds or re-uses a chunk,
+or when the files cache entries of a previous archive are loaded (their chunks
+lists have the plaintext sizes). So code using the chunks index must be prepared
+to see size == 0 and must not assume it is the real chunk size.
+
+The chunks index is a HashIndex_.
 
 .. _cache-memory-usage:
 
@@ -721,26 +846,34 @@ Indexes / Caches memory usage
 
 Here is the estimated memory usage of Borg - it's complicated::
 
-  chunk_size ~= 2 ^ HASH_MASK_BITS  (for buzhash chunker, BLOCK_SIZE for fixed chunker)
+  chunk_size ~= 2 ^ HASH_MASK_BITS  (content-defined chunkers, BLOCK_SIZE for fixed chunker)
   chunk_count ~= total_file_size / chunk_size
 
-  repo_index_usage = chunk_count * 40
+  chunks_index_usage = chunk_count * 100
 
-  chunks_cache_usage = chunk_count * 44
+  files_cache_usage = total_file_count * 230 + chunk_count * 6
 
-  files_cache_usage = total_file_count * 240 + chunk_count * 80
-
-  mem_usage ~= repo_index_usage + chunks_cache_usage + files_cache_usage
-             = chunk_count * 164 + total_file_count * 240
-
-Due to the hashtables, the best/usual/worst cases for memory allocation can
-be estimated like that::
-
-  mem_allocation = mem_usage / load_factor  # l_f = 0.25 .. 0.75
-
-  mem_allocation_peak = mem_allocation * (1 + growth_factor)  # g_f = 1.1 .. 2
+  mem_usage ~= chunks_index_usage + files_cache_usage
+             = chunk_count * 106 + total_file_count * 230
 
 All units are Bytes.
+
+The 100 Bytes per chunks index entry are the 80 Bytes of the entry itself plus
+the overhead of the hash table it lives in (see HashIndex_): the keys/values
+arrays are over-allocated by up to 30%, and the bucket table adds another 4 Bytes
+per bucket at a load factor of 0.25 .. 0.5. So, depending on where between two
+resizes the index currently is, the real value is somewhere between 88 and 120
+Bytes per entry - 100 is a good average.
+
+The files cache numbers are for CPython on a 64bit platform: the ~230 Bytes per file
+cover the dict slot, the 32 Bytes path hash (as a python ``bytes`` object) and the
+fixed part of the msgpacked value; the ~6 Bytes per chunk are one msgpacked 32bit
+index into the chunks index.
+
+Both data structures grow by re-allocating and copying, so there are short-time
+peaks in memory usage while a resize happens (worst case about 2x the values
+computed above for the structure being resized). Usually this does not happen for
+all data structures at the same time, though.
 
 It is assuming every chunk is referenced exactly once (if you have a lot of
 duplicate chunks, you will have fewer chunks than estimated above).
@@ -749,125 +882,244 @@ It is also assuming that typical chunk size is 2^HASH_MASK_BITS (if you have
 a lot of files smaller than this statistical medium chunk size, you will have
 more chunks than estimated above, because 1 file is at least 1 chunk).
 
-If a remote repository is used the repo index will be allocated on the remote side.
-
-The chunks cache, files cache and the repo index are all implemented as hash
-tables. A hash table must have a significant amount of unused entries to be
-fast - the so-called load factor gives the used/unused elements ratio.
-
-When a hash table gets full (load factor getting too high), it needs to be
-grown (allocate new, bigger hash table, copy all elements over to it, free old
-hash table) - this will lead to short-time peaks in memory usage each time this
-happens. Usually does not happen for all hashtables at the same time, though.
-For small hash tables, we start with a growth factor of 2, which comes down to
-~1.1x for big hash tables.
+The chunks index and files cache are both implemented as hash tables (the chunks
+index as a HashIndex_, the files cache as a python dict). A hash table must have a
+significant amount of unused entries to be fast - the so-called load factor gives
+the used/unused elements ratio.
 
 E.g. backing up a total count of 1 Mi (IEC binary prefix i.e. 2^20) files with a total size of 1TiB.
 
-a) with ``create --chunker-params buzhash,10,23,16,4095`` (custom, like borg < 1.0 or attic):
+a) with ``create --chunker-params fastcdc,10,23,16,2`` (custom):
 
-  mem_usage  =  2.8GiB
+  chunk_count = 16 Mi, chunks_index_usage = 1.56GiB, files_cache_usage = 0.32GiB
 
-b) with ``create --chunker-params buzhash,19,23,21,4095`` (default):
+  mem_usage  =  1.9GiB
 
-  mem_usage  =  0.31GiB
+b) with ``create --chunker-params fastcdc,19,23,21,2`` (default):
+
+  chunk_count = 512 Ki, chunks_index_usage = 0.05GiB, files_cache_usage = 0.23GiB
+
+  mem_usage  =  0.28GiB
 
 .. note:: There is also the ``--files-cache=disabled`` option to disable the files cache.
    You'll save some memory, but it will need to read / chunk all the files as
    it can not skip unmodified files then.
 
+.. _internals_hashindex:
+
 HashIndex
 ---------
 
-The chunks cache and the repository index are stored as hash tables, with
-only one slot per bucket, spreading hash collisions to the following
-buckets. As a consequence the hash is just a start position for a linear
-search. If a key is looked up that is not in the table, then the hash table
-is searched from the start position (the hash) until the first empty
-bucket is reached.
+The chunks index is implemented on top of ``borghash.HashTableNT``, which comes from
+the separate `borghash <https://github.com/borgbackup/borghash>`_ package (Cython).
+``borg.hashindex.ChunkIndex`` only adds the borg specific parts on top of it: the
+``ChunkIndexEntry`` namedtuple / struct format and the handling of the system flags.
+
+``HashTableNT`` packs/unpacks the namedtuple value to/from ``bytes`` using a
+``struct.Struct`` and delegates the actual storage to ``borghash.HashTable``, which
+is a fixed key size / fixed value size ``bytes -> bytes`` mapping.
+
+Internally, ``HashTable`` is not one, but three arrays:
+
+- the *bucket table*, an array of ``uint32_t`` indexes into the keys/values arrays.
+  ``0xffffffff`` marks an empty bucket, ``0xfffffffe`` marks a deleted bucket
+  (tombstone); everything ``>= 0xffffff00`` is reserved, so the usable index range
+  (and thus the maximum number of entries) is a bit below 4Gi.
+- the *keys* array, holding ``key_size`` (32 for the chunks index) Bytes per entry.
+- the *values* array, holding ``value_size`` (48 for the chunks index) Bytes per entry.
+
+Keys and values are appended to their arrays in insertion order, so the index of a
+key in the keys array is stable while the hash table is in memory. The files cache
+uses that to "compress" chunk ids to 32bit numbers, see ``ChunkIndex.k_to_idx``.
+
+The bucket table has only one slot per bucket, spreading hash collisions to the
+following buckets. As a consequence the hash is just a start position for a linear
+search. If a key is looked up that is not in the table, then the bucket table is
+searched from the start position (the hash) until the first empty bucket is reached.
 
 This particular mode of operation is open addressing with linear probing.
 
-When the hash table is filled to 75%, its size is grown. When it's
-emptied to 25%, its size is shrinked. Operations on it have a variable
-complexity between constant and linear with low factor, and memory overhead
-varies between 33% and 300%.
+The bucket table is grown (by 2x) when the number of used buckets plus tombstones
+exceeds 50% of its capacity, and shrunken (to 40%, but never below 1000 buckets)
+when the number of used buckets drops below 10% of its capacity. So its load factor
+usually is between 0.25 and 0.5. That is cheap, because a bucket is only 4 Bytes -
+the bulk of the data is in the keys/values arrays, which are not hash tables and
+thus do not need any unused space for speed. They are just grown by 1.3x whenever
+they are full.
 
-If an element is deleted, and the slot behind the deleted element is not empty,
-then the element will leave a tombstone, a bucket marked as deleted. Tombstones
-are only removed by insertions using the tombstone's bucket, or by resizing
-the table. They present the same load to the hash table as a real entry,
-but do not count towards the regular load factor.
+If an element is deleted, its bucket is marked with a tombstone (the keys/values
+array slots are zeroed, but not reclaimed until the next rebuild). Tombstones are
+only removed by resizing / rebuilding the bucket table. They present the same load
+to the hash table as a real entry (recall that linear probing for an element not in
+the index stops at the first empty bucket), which is why they count towards the load
+factor that triggers the growth.
 
-Thus, if the number of empty slots becomes too low (recall that linear probing
-for an element not in the index stops at the first empty slot), the hash table
-is rebuilt. The maximum *effective* load factor, i.e. including tombstones, is 93%.
+Data in a HashIndex is stored in little-endian format, which increases efficiency
+for almost everyone, since basically no one uses big-endian processors any more.
 
-Data in a HashIndex is always stored in little-endian format, which increases
-efficiency for almost everyone, since basically no one uses big-endian processors
-any more.
-
-HashIndex does not use a hashing function, because all keys (save manifest) are
-outputs of a cryptographic hash or MAC and thus already have excellent distribution.
+HashIndex does not use a hashing function, because all keys are outputs of a
+cryptographic hash or MAC and thus already have excellent distribution.
 Thus, HashIndex simply uses the first 32 bits of the key as its "hash".
 
-The format is easy to read and write, because the buckets array has the same layout
-in memory and on disk. Only the header formats differ. The on-disk header is
-``struct HashHeader``:
+The on-disk format does not mirror the in-memory layout - neither the bucket table
+nor the unused space of the keys/values arrays are written. A serialized HashIndex is:
 
-- First, the HashIndex magic, the eight byte ASCII string "BORG_IDX".
-- Second, the signed 32-bit number of entries (i.e. buckets which are not deleted and not empty).
-- Third, the signed 32-bit number of buckets, i.e. the length of the buckets array
-  contained in the file, and the modulus for index calculation.
-- Fourth, the signed 8-bit length of keys.
-- Fifth, the signed 8-bit length of values. This has to be at least four bytes.
+- First, a header: the eight byte ASCII string "BORGHASH", an ``uint32`` format
+  version and an ``uint32`` length of the metadata block (all little-endian).
+- Second, the metadata block, a JSON object with the key size, value size, byte
+  order, the value namedtuple's name / fields / struct format, the bucket table
+  capacity and the number of entries ("used").
+- Third, "used" times a (key, value) pair, without any padding or separators.
 
-All fields are packed.
+So the on-disk size is ``entries * (key_size + value_size)`` plus a small header,
+i.e. exactly 80 Bytes per entry for the chunks index.
 
-The HashIndex is *not* a general purpose data structure.
-The value size must be at least 4 bytes, and these first bytes are used for in-band
-signalling in the data structure itself.
-
-The constant MAX_VALUE (defined as 2**32-1025 = 4294966271) defines the valid range for
-these 4 bytes when interpreted as an uint32_t from 0 to MAX_VALUE (inclusive).
-The following reserved values beyond MAX_VALUE are currently in use (byte order is LE):
-
-- 0xffffffff marks empty buckets in the hash table
-- 0xfffffffe marks deleted buckets in the hash table
-
-HashIndex is implemented in C and wrapped with Cython in a class-based interface.
-The Cython wrapper checks every passed value against these reserved values and
-raises an AssertionError if they are used.
+.. _data-encryption:
 
 Encryption
 ----------
 
 .. seealso:: The :ref:`borgcrypto` section for an in-depth review.
 
-AES_-256 is used in CTR mode (so no need for padding). A 64 bit initialization
-vector is used, a MAC is computed on the encrypted chunk
-and both are stored in the chunk. Encryption and MAC use two different keys.
-Each chunk consists of ``TYPE(1)`` + ``MAC(32)`` + ``NONCE(8)`` + ``CIPHERTEXT``:
+AEAD modes
+~~~~~~~~~~
 
-.. figure:: encryption.png
+For new repositories, borg only uses modern AEAD ciphers: AES-OCB or CHACHA20-POLY1305.
+
+For each borg invocation, a new sessionkey is derived from the borg key material
+and the 48bit IV starts from 0 again. The cipher blocks of a chunk do not consume
+IVs here (CHACHA20-POLY1305 counts them in its internal 32bit block counter, AES-OCB
+derives the per-block offsets from the IV), so we just count up by 1 per chunk.
+
+The encryption layout is best seen at the bottom of this diagram:
+
+.. figure:: encryption-aead.png
     :figwidth: 100%
     :width: 100%
 
-In AES-CTR mode you can think of the IV as the start value for the counter.
-The counter itself is incremented by one after each 16 byte block.
-The IV/counter is not required to be random but it must NEVER be reused.
-So to accomplish this Borg initializes the encryption counter to be
-higher than any previously used counter value before encrypting new data.
+No special IV/counter management is needed here due to the use of session keys.
 
-To reduce payload size, only 8 bytes of the 16 bytes nonce is saved in the
-payload, the first 8 bytes are always zeros. This does not affect security but
-limits the maximum repository capacity to only 295 exabytes (2**64 * 16 bytes).
+The 48 bit IV limits the number of **messages** (chunks and metadata objects) that we
+encrypt with one session key to 2^48 - borg refuses to encrypt more rather than reusing
+an IV. That is way more than needed: even if you only backed up 4kiB chunks (2^12B),
+2^48 messages would be 2^(12+48)B == 1.2 exabytes of input data, meaning you would run
+against other limitations (RAM, storage, time) way before that.
 
-Encryption keys (and other secrets) are kept either in a key file on the client
-('keyfile' mode) or in the repository config on the server ('repokey' mode).
+How much **data** we may encrypt with one session key is a different question, which is
+not answered by the IV size, but by the security bounds of the ciphers, see below.
+
+.. _aead_usage_limits:
+
+AEAD usage limits
+~~~~~~~~~~~~~~~~~
+
+The relevant quantities are the number of encrypted messages (q), the amount of data
+encrypted with one key and the number of forgery attempts (v, decryptions of tampered
+data that borg refuses). ``p`` is the attacker's success probability we still consider
+acceptable. See issue #6501 for the details and for the computations.
+
+- **Number of messages** (both ciphers): limited to 2^48 per session key by the IV size,
+  see above. This is never the binding limit for either cipher.
+- **Data volume** (AES-OCB): the attacker's advantage grows with the square of the amount
+  of data encrypted using one key: about ``6 * sigma^2 / 2^128``, ``sigma`` being the
+  number of 128bit cipher blocks, including the authenticated header. RFC 7253 derives
+  from this bound that one key should encrypt at most 2^48 blocks (4PiB), which
+  corresponds to p == 2^-32. borg aims higher and starts a new session after 2^37 blocks
+  (2TiB), which corresponds to p == 2^-51 per session key.
+
+  CHACHA20-POLY1305 does not have such a limit at all: its confidentiality bound does not
+  depend on the amount of data encrypted.
+- **Forgery attempts** (CHACHA20-POLY1305): ``v <= p * 2^103 / (L' + 1)``, ``L'`` being
+  the message length (payload plus authenticated header) in 128bit blocks. For borg's
+  biggest messages, that is about 2^33 forgery attempts at p == 2^-50, so an attacker
+  would have to make borg read more than 100PiB of tampered data. Note that this is
+  counted over **all** session keys, so - unlike the data volume limit - it can not be
+  improved by starting more sessions.
+
+  For AES-OCB, the corresponding limit is much higher (its 128bit authentication tag
+  gives a term in the order of ``v * L / 2^128``), so the CHACHA20-POLY1305 limit is the
+  one to look at.
+
+We do **not** count or enforce the forgery attempts limit, we just document it here:
+a failed decryption means we got tampered or corrupted data and borg refuses it, usually
+aborting the whole command (``borg check`` and archive listing keep going, but only to
+report the damage). Getting anywhere near the limit computed above would require feeding
+borg a lot more tampered data than any real repository will ever hold.
+
+Starting a new session just means computing a new random session id and deriving a new
+session key from it (and counting the IV from 0 again). That is cheap and it does not
+need any special handling when reading, because the session id is part of every chunk
+header. Because the advantages of the individual session keys just add up, frequent
+session key changes also keep the total advantage low over the lifetime of a borg key.
+
+.. _tagged_envelope:
+
+Modes without encryption
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``authenticated-*`` modes do not encrypt: the payload of a repository
+object slot (the compressed chunk data resp. the packed metadata, see `Repository objects`_)
+is stored as-is. Every slot still carries a 32 byte tag::
+
+    TYPE(1) + reserved(1) + tag(32) + payload
+
+``TYPE`` is the key type byte (which identifies the mode, see ``KeyType``), ``reserved`` is
+zero. The tag is computed over the envelope header, the AAD and the payload::
+
+    aad_full = aad + chunk_id
+    tag = MAC(tag_key, TYPE || reserved || len16_be(aad_full) || aad_full || payload)
+
+``aad`` is what ``RepoObj`` authenticates alongside the payload: the object header prefix
+(magic, format version, chunk id) and the slot tag (``M`` for meta, ``D`` for data), see
+:ref:`pack-format`. Consequently, the tag detects modification of the payload, of the
+metadata, of the object header, a swap of the meta and the data slot, and an object slice
+taken from a different object. The length prefix keeps the boundary between the AAD and the
+payload unambiguous.
+
+There is no nonce, no session and no other state: the tag is deterministic. Two repositories
+with the same key material therefore store byte-identical objects for identical input, which
+allows deduplicating them on the filesystem level (e.g. with CoW/dedup tools).
+
+The tag is a **MAC** (HMAC-SHA256 for ``authenticated-sha256``, keyed BLAKE3 for
+``authenticated-blake3``), so only somebody who has the borg key can compute it - this detects
+malicious tampering, not just accidental corruption. The MAC key is derived from ``crypt_key``::
+
+    tag_key = sha256(crypt_key + b"borg-repoobj-mac-hmac-sha256")[:32]   # authenticated-sha256
+    tag_key = sha256(crypt_key + b"borg-repoobj-mac-blake3")[:32]        # authenticated-blake3
+
+It is deliberately not derived from ``id_key``: chunk ids are public, and related repositories
+share the id key (see ``borg repo-create --other-repo``), which must not enable them to forge
+each other's objects. ``--copy-crypt-key`` shares ``crypt_key`` and thus opts into producing
+byte-identical objects across the related repositories.
+
+Legacy modes
+~~~~~~~~~~~~
+
+Old repositories (which used AES-CTR mode) are supported read-only to be able to
+``borg transfer`` their archives to new repositories (which use AEAD modes).
+
+AES-CTR mode is not supported for new repositories and the related code will be
+removed in a future release.
+
+The same applies to the borg 1.x ``none`` and ``authenticated`` modes: their envelope is just
+the type byte followed by the payload, so nothing about an object is verified except the chunk
+id over the plaintext. borg 2 has no ``none`` mode, and its ``authenticated-*`` modes use the
+tagged envelope described above.
+
+All modes
+~~~~~~~~~
+
+Encryption keys (and other secrets) are kept either in the keys directory on
+the client ('keyfile' mode) or under the keys/ namespace in the repository
+('repokey' mode) using the store hash of the borg key content as the name.
+
 In both cases, the secrets are generated from random and then encrypted by a
 key derived from your passphrase (this happens on the client before the key
-is stored into the keyfile or as repokey).
+is stored as keyfile or repokey).
+
+keyfile and repokey borg keys use the **same** format; only the storage location
+differs. Borg finds the correct key by trying each key against the supplied
+passphrase. See :ref:`borgcrypto_multiple_keys`.
 
 The passphrase is passed through the ``BORG_PASSPHRASE`` environment variable
 or prompted for interactive usage.
@@ -879,40 +1131,37 @@ Key files
 
 .. seealso:: The :ref:`key_encryption` section for an in-depth review of the key encryption.
 
-When initialized with the ``init -e keyfile`` command, Borg
-needs an associated file in ``$HOME/.config/borg/keys`` to read and write
-the repository. The format is based on msgpack_, base64 encoding and
-PBKDF2_ SHA256 hashing, which is then encoded again in a msgpack_.
+When initializing a repository with one of the "keyfile" encryption modes,
+Borg creates an associated key file in the keys subdirectory of the borg config
+directory (see :ref:`env_vars` for platform-specific default paths).
 
-The same data structure is also used in the "repokey" modes, which store
-it in the repository in the configuration file.
+The same key is also used in the "repokey" modes, which store it in the repository.
 
 The internal data structure is as follows:
 
 version
-  currently always an integer, 1
+  currently always an integer, 2
 
 repository_id
-  the ``id`` field in the ``config`` ``INI`` file of the repository.
+  the repository ID, as stored in the repository config (see :ref:`repo_config`).
 
-enc_key
-  the key used to encrypt data with AES (256 bits)
-
-enc_hmac_key
-  the key used to HMAC the encrypted data (256 bits)
+crypt_key
+  the initial key material used for the AEAD crypto (512 bits)
 
 id_key
-  the key used to HMAC the plaintext chunk data to compute the chunk's id
+  the key used to MAC the plaintext chunk data to compute the chunk's id.
+  The content-defined chunkers other than "buzhash" also derive their secret
+  (table, polynomial, AES key) from it, each using its own domain.
 
 chunk_seed
-  the seed for the buzhash chunking table (signed 32 bit integer)
+  the seed for the buzhash chunking table (signed 32 bit integer), only used
+  by the "buzhash" chunker
 
 These fields are packed using msgpack_. The utf-8 encoded passphrase
-is processed with PBKDF2_ (SHA256_, 100000 iterations, random 256 bit salt)
-to derive a 256 bit key encryption key (KEK).
+is processed with argon2_ to derive a 256 bit key encryption key (KEK).
 
-A `HMAC-SHA256`_ checksum of the packed fields is generated with the KEK,
-then the KEK is also used to encrypt the same packed fields using AES-CTR.
+Then the KEK is used to encrypt and authenticate the packed data using
+the chacha20-poly1305 AEAD cipher.
 
 The result is stored in a another msgpack_ formatted as follows:
 
@@ -920,38 +1169,54 @@ version
   currently always an integer, 1
 
 salt
-  random 256 bits salt used to process the passphrase
+  random 128 bits (``ARGON2_SALT_BYTES`` == 16) salt used to process the
+  passphrase
 
-iterations
-  number of iterations used to process the passphrase (currently 100000)
+argon2_*
+  some parameters for the argon2 kdf
 
 algorithm
-  the hashing algorithm used to process the passphrase and do the HMAC
-  checksum (currently the string ``sha256``)
-
-hash
-  HMAC-SHA256 of the *plaintext* of the packed fields.
+  the algorithms used to process the passphrase
+  (currently the string ``argon2 chacha20-poly1305``)
 
 data
   The encrypted, packed fields.
+
+label
+  optional: a human-readable label for this borg key, e.g. ``admin`` for the
+  borg key created by ``borg repo-create``. See
+  :ref:`multiple borg keys <borgcrypto_multiple_keys>`.
 
 The resulting msgpack_ is then encoded using base64 and written to the
 key file, wrapped using the standard ``textwrap`` module with a header.
 The header is a single line with a MAGIC string, a space and a hexadecimal
 representation of the repository id.
 
+.. _data-compression:
+
 Compression
 -----------
 
-Borg supports the following compression methods:
+Borg supports the following compression methods, each identified by a ctype value
+in the range between 0 and 255 (and augmented by a one-byte clevel value for the
+compression level):
 
-- none (no compression, pass through data 1:1)
-- lz4 (low compression, but super fast)
-- zstd (level 1-22 offering a wide range: level 1 is lower compression and high
-  speed, level 22 is higher compression and lower speed) - since borg 1.1.4
+- none (no compression, pass through data 1:1), identified by 0x00
+- lz4 (low compression, but super fast), identified by 0x01
+- zstd (level -128..22 offering a wide range: level 22 is higher compression and lower
+  speed, level 1 is lower compression and high speed, and the negative "fast" levels
+  trade still more compression for still more speed) - identified by 0x03
 - zlib (level 0-9, level 0 is no compression [but still adding zlib overhead],
-  level 1 is low, level 9 is high compression)
-- lzma (level 0-9, level 0 is low, level 9 is high compression).
+  level 1 is low, level 9 is high compression), identified by 0x05
+- lzma (level 0-9, level 0 is low, level 9 is high compression), identified
+  by 0x02.
+
+The type byte is followed by a byte indicating the compression level. How that byte is
+interpreted depends on the compression type: for zstd it is an ``int8_t``, so that the
+negative levels fit (level -1 is stored as 255, -128 as 128). For all other types it is
+an unsigned byte, with 255 meaning "no level applies" (as for none and lz4). Levels 1..22
+occupy the same byte values either way, so zstd data written by older borg versions keeps
+its meaning.
 
 Speed:  none > lz4 > zlib > lzma, lz4 > zstd
 Compression: lzma > zlib > lz4 > none, zstd > lz4
@@ -968,7 +1233,7 @@ while doing no compression at all (none) is a operation that takes no time, it
 likely will need to store more data to the storage compared to using lz4.
 The time needed to transfer and store the additional data might be much more
 than if you had used lz4 (which is super fast, but still might compress your
-data about 2:1). This is assuming your data is compressible (if you backup
+data about 2:1). This is assuming your data is compressible (if you back up
 already compressed data, trying to compress them at backup time is usually
 pointless).
 
@@ -977,94 +1242,133 @@ methods in one repo does not influence deduplication.
 
 See ``borg create --help`` about how to specify the compression level and its default.
 
-Lock files
-----------
+.. _storelocking:
 
-Borg uses locks to get (exclusive or shared) access to the cache and
-the repository.
+Locks (storelocking)
+--------------------
 
-The locking system is based on renaming a temporary directory
-to `lock.exclusive` (for
-exclusive locks). Inside this directory, there is a file indicating
-hostname, process id and thread id of the lock holder.
+Borg locks the **repository**, so that concurrent borg runs (also from other
+machines) do not disturb each other. This is the only lock borg takes: the
+client-local cache (:ref:`the files cache <cache>` and its ``config``) is not
+locked.
 
-There is also a json file `lock.roster` that keeps a directory of all shared
-and exclusive lockers.
+To implement locking based on ``borgstore``, borg stores objects below locks/.
 
-If the process is able to rename a temporary directory (with the
-host/process/thread identifier prepared inside it) in the resource directory
-to `lock.exclusive`, it has the lock for it. If renaming fails
-(because this directory already exists and its host/process/thread identifier
-denotes a thread on the host which is still alive), lock acquisition fails.
+The objects are stored in the :ref:`store object envelope <store_object_envelope>`,
+so locking the repository needs the key: borg loads it (and asks for the passphrase,
+if needed) before it waits for the lock. A lock object is named by the store hash of
+its envelope, so neither its content nor its name tells who uses the repository. Every
+lock object is encrypted in a fresh one-off session (a new random session id), because
+a lock may be refreshed by a background thread while the main thread encrypts other
+objects.
 
-The cache lock is usually in `~/.cache/borg/REPOID/lock.*`.
-The repository lock is in `repository/lock.*`.
+The objects contain:
 
-In case you run into troubles with the locks, you can use the ``borg break-lock``
-command after you first have made sure that no Borg process is
-running on any machine that accesses this resource. Be very careful, the cache
-or repository might get damaged if multiple processes use it at the same time.
+- a timestamp when lock was created (or refreshed), stamped by the clock of
+  the machine writing the lock
+- host / process / thread information about lock owner
+- lock type: exclusive or shared
+
+Where the storage backend provides object timestamps (file, sftp, s3 and
+current rest servers - but not rclone), borg additionally uses the lock
+object's store-side mtime, which is stamped by the storage's clock.
+
+To acquire a lock, borg lists the lock objects, creates its own lock object if
+nothing forbids it, waits for the race recheck delay and lists again, to detect
+other clients that created theirs at the same time (if so, it backs off and
+retries). This needs storage with list-after-write consistency: a listing started
+after a lock object was written must contain it. Then, of two clients racing for
+the lock, at least the one that created its lock object last sees the other's, so
+they can not both get an exclusive lock. Local filesystems, sftp, rest
+(``borg serve --rest``) and S3 as provided by AWS or MinIO give this guarantee and
+the default delay (0.01s) is fine.
+
+If the storage only lists a new object after a lag (e.g. NFS clients caching
+directory listings, or some cloud storages used via rclone), set
+``BORG_LOCK_RECHECK_DELAY`` to at least that lag (in seconds) on all clients
+using the repository: then, the client that created its lock object last still
+sees the other one.
+
+Using that information, borg implements:
+
+- lock auto-removal if the owner process is dead. the primary purpose of this
+  is to quickly get rid of stale locks by borg processes on the same machine.
+- lock auto-expiry: if a lock is old and has not been refreshed in time,
+  it will be automatically ignored and deleted. the primary purpose of this
+  is to get rid of stale locks by borg processes on other machines. to never
+  kill a healthy lock just because its writer's clock is skewed against ours
+  (see :issue:`9870`), a lock is only expired by age if it looks stale both by
+  the clients' clocks (content timestamp) and by the storage's clock
+  (store-side mtime); store-side timestamps can veto an expiry, but never
+  cause one.
+- a warning if the clocks of concurrently active clients differ by more than
+  a few minutes.
+- telling the user which lock blocks them (type, host, pid, age) while waiting
+  for it and in the error message if acquiring it times out.
+- a lock object that can not be read (it fails the authentication, e.g. because it
+  is corrupt or was not written by a borg with the repository's key) is treated as
+  a foreign exclusive lock: nothing is known about it but its store-side mtime, so it
+  only expires if the storage's clock confirms that it was not written for longer
+  than the stale timeout. Without store-side mtimes, it never expires; then
+  ``borg break-lock`` removes it.
+
+See the module docstring of ``src/borg/storelocking.py`` for the details
+(clock domains, how store "now" is derived, what happens without store-side
+mtimes).
+
+Breaking the lock
+-----------------
+
+In case you run into troubles with the repository lock, you can use the
+``borg break-lock`` command (it needs the key) after you first have made sure that
+no Borg process is running on any machine that accesses this repository. Be very careful, the
+repository might get damaged if multiple processes write to it at the same time.
+
+Usually you do not need this: a stale lock resolves automatically (see above),
+just retry later.
+
 
 Checksumming data structures
 ----------------------------
 
-As detailed in the previous sections, Borg generates and stores various files
-containing important meta data, such as the repository index, repository hints,
-chunks caches and files cache.
-
-Data corruption in these files can damage the archive data in a repository,
-e.g. due to wrong reference counts in the chunks cache. Only some parts of Borg
-were designed to handle corrupted data structures, so a corrupted files cache
-may cause crashes or write incorrect archives.
-
-Therefore, Borg calculates checksums when writing these files and tests checksums
-when reading them. Checksums are generally 64-bit XXH64 hashes.
-The canonical xxHash representation is used, i.e. big-endian.
+Borg 2 protects its own local files with the repository key (see :ref:`the files
+cache <cache>`). Checksums are only used for reading borg 1.x repositories (see
+``borg transfer``): borg 1.x stores the repository index and hints files of such a
+repository (``index.N``, ``hints.N``) with checksums, so that data corruption in them
+is detected. Checksums are generally 256-bit sha256 hashes.
 Checksums are stored as hexadecimal ASCII strings.
 
 For compatibility, checksums are not required and absent checksums do not trigger errors.
-The mechanisms have been designed to avoid false-positives when various Borg
-versions are used alternately on the same repositories.
 
 Checksums are a data safety mechanism. They are not a security mechanism.
 
 .. rubric:: Choice of algorithm
 
-XXH64 has been chosen for its high speed on all platforms, which avoids performance
-degradation in CPU-limited parts (e.g. cache synchronization).
-Unlike CRC32, it neither requires hardware support (crc32c or CLMUL)
-nor vectorized code nor large, cache-unfriendly lookup tables to achieve good performance.
-This simplifies deployment of it considerably (cf. src/borg/algorithms/crc32...).
-
-Further, XXH64 is a non-linear hash function and thus has a "more or less" good
-chance to detect larger burst errors, unlike linear CRCs where the probability
-of detection decreases with error size.
-
-The 64-bit checksum length is considered sufficient for the file sizes typically
-checksummed (individual files up to a few GB, usually less).
-xxHash was expressly designed for data blocks of these sizes.
+sha256 has been chosen for its wide availability on all platforms and hw acceleration on some.
 
 Lower layer — file_integrity
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-To accommodate the different transaction models used for the cache and repository,
-there is a lower layer (borg.crypto.file_integrity.IntegrityCheckedFile)
-wrapping a file-like object, performing streaming calculation and comparison of checksums.
-Checksum errors are signalled by raising an exception (borg.crypto.file_integrity.FileIntegrityError)
-at the earliest possible moment.
+There is a lower layer (borg.crypto.file_integrity.IntegrityCheckedFile)
+wrapping a file-like object, performing streaming calculation and comparison
+of checksums.
+Checksum errors are signalled by raising an exception at the earliest possible
+moment (borg.crypto.file_integrity.FileIntegrityError).
 
 .. rubric:: Calculating checksums
 
 Before feeding the checksum algorithm any data, the file name (i.e. without any path)
 is mixed into the checksum, since the name encodes the context of the data for Borg.
 
-The various indices used by Borg have separate header and main data parts.
-IntegrityCheckedFile allows borg to checksum them independently, which avoids
-even reading the data when the header is corrupted. When a part is signalled,
-the length of the part name is mixed into the checksum state first (encoded
-as an ASCII string via `%10d` printf format), then the name of the part
-is mixed in as an UTF-8 string. Lastly, the current position (length)
-in the file is mixed in as well.
+A file can be split into named *parts*, which IntegrityCheckedFile checksums
+independently, so that e.g. a corrupted header can be detected without even
+reading the data. When a part is signalled, the length of the part name is
+mixed into the checksum state first (encoded as an ASCII string via `%10d`
+printf format), then the name of the part is mixed in as an UTF-8 string.
+Lastly, the current position (length) in the file is mixed in as well.
+
+The index file of a borg 1.x repository has a ``HashHeader`` part, its hints file
+is a single part.
 
 The checksum state is not reset at part boundaries.
 
@@ -1080,112 +1384,57 @@ All checksums are compiled into a simple JSON structure called *integrity data*:
 .. code-block:: json
 
     {
-        "algorithm": "XXH64",
+        "algorithm": "SHA256",
         "digests": {
-            "HashHeader": "eab6802590ba39e3",
-            "final": "e2a7f132fc2e8b24"
+            "HashHeader": "eab6802590ba39e3...",
+            "final": "e2a7f132fc2e8b24..."
         }
     }
 
 The *algorithm* key notes the used algorithm. When reading, integrity data containing
 an unknown algorithm is not inspected further.
 
-The *digests* key contains a mapping of part names to their digests.
+The *digests* key contains a mapping of part names to their digests. The
+``final`` digest is always present, other entries only exist if the file was
+written with parts (see above).
 
-Integrity data is generally stored by the upper layers, introduced below. An exception
-is the DetachedIntegrityCheckedFile, which automatically writes and reads it from
-a ".integrity" file next to the data file.
-It is used for archive chunks indexes in chunks.archive.d.
+Integrity data is stored by the upper layer, introduced below. There is also a
+DetachedIntegrityCheckedFile, which automatically writes and reads it from a
+".integrity" file next to the data file - borg 2 does not currently use it.
 
 Upper layer
 ~~~~~~~~~~~
 
-Storage of integrity data depends on the component using it, since they have
-different transaction mechanisms, and integrity data needs to be
-transacted with the data it is supposed to protect.
+The integrity data of ``index.N`` and ``hints.N`` is stored in ``integrity.N`` next
+to them, a msgpacked dict with the integrity data version (2) and the integrity data
+of both files (keys ``index`` and ``hints``). Without an ``integrity.N`` file, or if
+its version is unknown, the files are read without checking them.
 
-.. rubric:: Main cache files: chunks and files cache
+If the index or hints file fails its integrity check, borg rebuilds the index
+and hints from the segments, as for any other error reading them.
 
-The integrity data of the ``chunks`` and ``files`` caches is stored in the
-cache ``config``, since all three are transacted together.
 
-The ``[integrity]`` section is used:
+HardLinkManager and the hlid concept
+------------------------------------
 
-.. code-block:: ini
+Dealing with hard links needs some extra care, implemented in borg within the HardLinkManager
+class:
 
-    [cache]
-    version = 1
-    repository = 3c4...e59
-    manifest = 10e...21c
-    timestamp = 2017-06-01T21:31:39.699514
-    key_type = 2
-    previous_location = /path/to/repo
-
-    [integrity]
-    manifest = 10e...21c
-    chunks = {"algorithm": "XXH64", "digests": {"HashHeader": "eab...39e3", "final": "e2a...b24"}}
-
-The manifest ID is duplicated in the integrity section due to the way all Borg
-versions handle the config file. Instead of creating a "new" config file from
-an internal representation containing only the data understood by Borg,
-the config file is read in entirety (using the Python ConfigParser) and modified.
-This preserves all sections and values not understood by the Borg version
-modifying it.
-
-Thus, if an older versions uses a cache with integrity data, it would preserve
-the integrity section and its contents. If a integrity-aware Borg version
-would read this cache, it would incorrectly report checksum errors, since
-the older version did not update the checksums.
-
-However, by duplicating the manifest ID in the integrity section, it is
-easy to tell whether the checksums concern the current state of the cache.
-
-Integrity errors are fatal in these files, terminating the program,
-and are not automatically corrected at this time.
-
-.. rubric:: chunks.archive.d
-
-Indices in chunks.archive.d are not transacted and use DetachedIntegrityCheckedFile,
-which writes the integrity data to a separate ".integrity" file.
-
-Integrity errors result in deleting the affected index and rebuilding it.
-This logs a warning and increases the exit code to WARNING (1).
-
-.. _integrity_repo:
-
-.. rubric:: Repository index and hints
-
-The repository associates index and hints files with a transaction by including the
-transaction ID in the file names. Integrity data is stored in a third file
-("integrity.<TRANSACTION_ID>"). Like the hints file, it is msgpacked:
-
-.. code-block:: python
-
-    {
-        b'version': 2,
-        b'hints': b'{"algorithm": "XXH64", "digests": {"final": "411208db2aa13f1a"}}',
-        b'index': b'{"algorithm": "XXH64", "digests": {"HashHeader": "846b7315f91b8e48", "final": "cb3e26cadc173e40"}}'
-    }
-
-The *version* key started at 2, the same version used for the hints. Since Borg has
-many versioned file formats, this keeps the number of different versions in use
-a bit lower.
-
-The other keys map an auxiliary file, like *index* or *hints* to their integrity data.
-Note that the JSON is stored as-is, and not as part of the msgpack structure.
-
-Integrity errors result in deleting the affected file(s) (index/hints) and rebuilding the index,
-which is the same action taken when corruption is noticed in other ways (e.g. HashIndex can
-detect most corrupted headers, but not data corruption). A warning is logged as well.
-The exit code is not influenced, since remote repositories cannot perform that action.
-Raising the exit code would be possible for local repositories, but is not implemented.
-
-Unlike the cache design this mechanism can have false positives whenever an older version
-*rewrites* the auxiliary files for a transaction created by a newer version,
-since that might result in a different index (due to hash-table resizing) or hints file
-(hash ordering, or the older version 1 format), while not invalidating the integrity file.
-
-For example, using 1.1 on a repository, noticing corruption or similar issues and then running
-``borg-1.0 check --repair``, which rewrites the index and hints, results in this situation.
-Borg 1.1 would erroneously report checksum errors in the hints and/or index files and trigger
-an automatic rebuild of these files.
+- At archive creation time, fs items with st_nlink > 1 indicate that they are a member of
+  a group of hardlinks all pointing to the same inode. For such fs items, the archived item
+  includes a hlid attribute (hardlink id), which is computed like H(st_dev, st_ino). Thus,
+  if archived items have the same hlid value, they pointed to the same inode and form a
+  group of hardlinks. Besides that, nothing special is done for any member of the group
+  of hardlinks, meaning that e.g. for regular files, each archived item will have a
+  chunks list.
+- At extraction time, the presence of a hlid attribute indicates that there might be more
+  hardlinks coming, pointing to the same content (inode), thus borg will remember the "hlid
+  to extracted path" mapping, so it will know the correct path for extracting (hardlinking)
+  the next hardlink of that group / with the same hlid.
+- This symmetric approach (each item has all the information, e.g. the chunks list)
+  simplifies dealing with such items a lot, especially for partial extraction, for the
+  FUSE filesystem, etc.
+- This is different from the asymmetric approach of old borg versions (< 2.0) and also from
+  tar which have the concept of a main item (first hardlink, has the content) and content-less
+  secondary items with by-name back references for each subsequent hardlink, causing lots
+  of complications when dealing with them.

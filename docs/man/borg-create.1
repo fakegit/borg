@@ -1,8 +1,6 @@
-.\" Man page generated from reStructuredText.
+.\" Man page generated from reStructuredText
+.\" by the Docutils 0.22.4 manpage writer.
 .
-.TH BORG-CREATE 1 "2021-02-06" "" "borg backup tool"
-.SH NAME
-borg-create \- Create new archive
 .
 .nr rst2man-indent-level 0
 .
@@ -30,42 +28,85 @@ level margin: \\n[rst2man-indent\\n[rst2man-indent-level]]
 .\" new: \\n[rst2man-indent\\n[rst2man-indent-level]]
 .in \\n[rst2man-indent\\n[rst2man-indent-level]]u
 ..
+.TH "borg-create" "1" "2026-09-27" "" "borg backup tool"
+.SH Name
+borg-create \- Creates a new archive.
 .SH SYNOPSIS
 .sp
-borg [common options] create [options] ARCHIVE [PATH...]
+borg [common options] create [options] NAME [PATH...]
 .SH DESCRIPTION
 .sp
 This command creates a backup archive containing all files found while recursively
-traversing all paths specified. Paths are added to the archive as they are given,
-that means if relative paths are desired, the command has to be run from the correct
+traversing all specified paths. Paths are added to the archive as they are given,
+which means that if relative paths are desired, the command must be run from the correct
 directory.
 .sp
-When giving \(aq\-\(aq as path, borg will read data from standard input and create a
-file \(aqstdin\(aq in the created archive from that data. In some cases it\(aqs more
-appropriate to use \-\-content\-from\-command, however. See section \fIReading from
-stdin\fP below for details.
+The slashdot hack in paths (recursion roots) is triggered by using \fB/./\fP:
+\fB/this/gets/stripped/./this/gets/archived\fP means to process that fs object, but
+strip the prefix on the left side of \fB\&./\fP from the archived items (in this case,
+\fBthis/gets/archived\fP will be the path in the archived item).
+.sp
+If a recursion root (a path given on the command line or in a patterns file) is a
+symlink, borg follows it and archives what it points to \- using the path you gave.
+If \fBcurrent\fP is a symlink pointing to the directory \fB20260801\-2345\fP,
+\fBborg create ARCHIVE current\fP thus archives \fBcurrent\fP as a directory (with the
+metadata of \fB20260801\-2345\fP) and recurses into it, archiving the contained fs
+objects as \fBcurrent/...\fP\&. As the archived paths do not change when the symlink
+target changes, the files cache keeps working for such backups.
+.sp
+Note that the symlink itself is then not in the archive (and neither is its target
+path), so restoring will create a real directory (or file) where the symlink was.
+If you want the symlink archived as a symlink, do not give it as a recursion root,
+but let borg find it while recursing (symlinks found that way are never followed).
+A recursion root that is a symlink with a non\-existing target is skipped with a warning.
+.sp
+If you give both a symlink and its target as recursion roots, borg archives the fs
+objects only once, under the path given first (like for any other root given twice).
+.sp
+When specifying \(aq\-\(aq as a path, borg will read data from standard input and create a
+file named \(aqstdin\(aq in the created archive from that data. In some cases, it is more
+appropriate to use \-\-content\-from\-command. See the section
+\fIReading backup data from stdin\fP below for details.
 .sp
 The archive will consume almost no disk space for files or parts of files that
 have already been stored in other archives.
 .sp
-The archive name needs to be unique. It must not end in \(aq.checkpoint\(aq or
-\(aq.checkpoint.N\(aq (with N being a number), because these names are used for
-checkpoints and treated in special ways.
+The \fB\-\-tag\fP option can be used to add a tag to the new archive. To add
+multiple tags, give it multiple times, e.g. \fB\-\-tag foo \-\-tag bar\fP\&.
+.sp
+The archive name does not need to be unique; you can and should use the same
+name for a series of archives. The unique archive identifier is its ID (hash),
+and you can abbreviate the ID as long as it is unique.
 .sp
 In the archive name, you may use the following placeholders:
 {now}, {utcnow}, {fqdn}, {hostname}, {user} and some others.
 .sp
 Backup speed is increased by not reprocessing files that are already part of
-existing archives and weren\(aqt modified. The detection of unmodified files is
+existing archives and were not modified. The detection of unmodified files is
 done by comparing multiple file metadata values with previous values kept in
 the files cache.
+.sp
+The files cache is kept locally, one per archive series. If it is missing (e.g. on a
+fresh machine or after the local cache was removed), borg rebuilds it by reading the
+archive this one continues from the repository. That archive is the newest one having
+the same archive attributes as given by \fB\-\-group\-by\fP, by default the same series
+name and the same host. Matching the series name alone would be wrong in a repository
+shared by multiple machines or users, because they may use the same series name for
+their own, unrelated data \- borg would then rebuild the files cache from a foreign
+archive, where almost nothing matches, and read and chunk everything again.
+.sp
+Give \fB\-\-group\-by name\fP if the same series is written by different hosts on purpose
+and they see the same files, or add \fBuser\fP if one host backs up the same series as
+different users. Beware of grouping by an attribute that is not stable over time: if
+e.g. the hostname changes for every backup run (as it might for containers), borg will
+never find an archive to rebuild the files cache from.
 .sp
 This comparison can operate in different modes as given by \fB\-\-files\-cache\fP:
 .INDENT 0.0
 .IP \(bu 2
-ctime,size,inode (default)
+ctime,size,inode (default on POSIX systems)
 .IP \(bu 2
-mtime,size,inode (default behaviour of borg versions older than 1.1.0rc4)
+mtime,size,inode (default on Windows)
 .IP \(bu 2
 ctime,size (ignore the inode number)
 .IP \(bu 2
@@ -91,15 +132,37 @@ ctime vs. mtime: safety vs. speed
 .INDENT 0.0
 .IP \(bu 2
 ctime is a rather safe way to detect changes to a file (metadata and contents)
-as it can not be set from userspace. But, a metadata\-only change will already
+as it cannot be set from userspace. But a metadata\-only change will already
 update the ctime, so there might be some unnecessary chunking/hashing even
 without content changes. Some filesystems do not support ctime (change time).
 E.g. doing a chown or chmod to a file will change its ctime.
 .IP \(bu 2
 mtime usually works and only updates if file contents were changed. But mtime
-can be arbitrarily set from userspace, e.g. to set mtime back to the same value
+can be arbitrarily set from userspace, e.g., to set mtime back to the same value
 it had before a content change happened. This can be used maliciously as well as
-well\-meant, but in both cases mtime based cache modes can be problematic.
+well\-meant, but in both cases mtime\-based cache modes can be problematic.
+.UNINDENT
+.sp
+On Windows, ctime is the file \fIcreation\fP time, not the \(dqmetadata change time\(dq it is
+on POSIX systems. A ctime based mode would therefore not notice content changes of a
+file that keeps its size and inode number, so borg defaults to \fBmtime,size,inode\fP
+there. If a ctime based mode is given explicitly on Windows, borg warns and uses the
+corresponding mtime based mode instead: ctime,size,inode \-> mtime,size,inode,
+ctime,size \-> mtime,size, rechunk,ctime \-> rechunk,mtime.
+.INDENT 0.0
+.TP
+.B The \fB\-\-files\-changed\fP option controls how Borg detects if a file has changed during backup:
+.INDENT 7.0
+.IP \(bu 2
+ctime (default on POSIX): Use ctime to detect changes. This is the safest option.
+Not supported on Windows (ctime is file creation time there).
+.IP \(bu 2
+mtime (default on Windows): Use mtime to detect changes.
+.IP \(bu 2
+disabled: Disable the \(dqfile has changed while we backed it up\(dq detection completely.
+This is not recommended unless you know what you\(aqre doing, as it could lead to
+inconsistent backups if files change during the backup process.
+.UNINDENT
 .UNINDENT
 .sp
 The mount points of filesystems or filesystem snapshots should be the same for every
@@ -107,77 +170,104 @@ creation of a new archive to ensure fast operation. This is because the file cac
 is used to determine changed files quickly uses absolute filenames.
 If this is not possible, consider creating a bind mount to a stable location.
 .sp
-The \fB\-\-progress\fP option shows (from left to right) Original, Compressed and Deduplicated
-(O, C and D, respectively), then the Number of files (N) processed so far, followed by
-the currently processed path.
+The \fB\-\-progress\fP option shows (from left to right) Original and (uncompressed)
+deduplicated size (O and U respectively), then the Number of files (N) processed so far,
+followed by the currently processed path.
+.sp
+Sizes of GB and above are shown with enough decimal places that even MB\-sized progress
+stays visible. On a terminal, this needs a width of at least 110 columns \- on narrower
+terminals, the compact format is used, so that the path stays readable. If the output
+does not go to a terminal (e.g. into a logfile), the precise format is always used.
 .sp
 When using \fB\-\-stats\fP, you will get some statistics about how much data was
-added \- the "This Archive" deduplicated size there is most interesting as that is
-how much your repository will grow. Please note that the "All archives" stats refer to
-the state after creation. Also, the \fB\-\-stats\fP and \fB\-\-dry\-run\fP options are mutually
-exclusive because the data is not actually compressed and deduplicated during a dry run.
+added \- the deduplicated size there is most interesting as that is how much your
+repository will grow. \fB\-\-json\fP outputs the same statistics as JSON.
 .sp
-See the output of the "borg help patterns" command for more help on exclude patterns.
+When \fB\-\-stats\fP is used together with \fB\-\-dry\-run\fP, only the number of files and the
+original size are reported. They are computed from file system metadata, without reading
+the file contents, so a dry run stays fast. As data is not actually read, chunked, and
+deduplicated during a dry run, the deduplicated size is unknown. The sizes of data read
+from standard input, from a command\(aqs output, or from special files (\fB\-\-read\-special\fP)
+are also unknown in a dry run and counted as zero.
 .sp
-See the output of the "borg help placeholders" command for more help on placeholders.
+The \fB\-\-stats\fP output also reports the store statistics (lines prefixed with
+\(dqStore\(dq), taken from the storage layer after this run. These cover the backend and
+the local store cache: call counts and timings per operation, the load/store data
+volumes and throughput, and cache hits/misses. \(dqStore backend load volume\(dq and
+\(dqStore backend store volume\(dq are the bytes actually read from and sent to the
+backend; a load counts only what missed the cache, and a store counts chunk data
+together with Borg\(aqs own index and metadata writes. The values are approximate
+because of write buffering and caching. On a repeated backup a near\-zero store
+volume means almost no new data had to be written, because the chunks already exist
+in the repository (deduplication).
+.sp
+The \(dqAdded\(dq, \(dqModified\(dq and \(dqUnchanged\(dq file counters come from the files\-cache
+comparison described above: \(dqUnchanged\(dq files matched the cached metadata and were
+not read again (their existing chunks are reused); \(dqAdded\(dq and \(dqModified\(dq files did
+not match and were read and chunked (new chunks are stored, already\-known chunks are
+deduplicated). The comparison uses the files cache, keyed by the file\(aqs absolute path.
+.sp
+For more help on include/exclude patterns, see the \fIborg_patterns\fP command output.
+.sp
+For more help on placeholders, see the \fIborg_placeholders\fP command output.
 .SH OPTIONS
 .sp
 See \fIborg\-common(1)\fP for common options of Borg commands.
 .SS arguments
 .INDENT 0.0
 .TP
-.B ARCHIVE
-name of archive to create (must be also a valid directory name)
+.B NAME
+specify the archive name
 .TP
 .B PATH
 paths to archive
 .UNINDENT
-.SS optional arguments
+.SS options
 .INDENT 0.0
 .TP
-.B \-n\fP,\fB  \-\-dry\-run
+.B  \-n\fP,\fB  \-\-dry\-run
 do not create a backup archive
 .TP
-.B \-s\fP,\fB  \-\-stats
+.B  \-s\fP,\fB  \-\-stats
 print statistics for the created archive
 .TP
-.B \-\-list
-output verbose list of items (files, dirs, ...)
+.B  \-\-list
+output a verbose list of items (files, dirs, ...)
 .TP
 .BI \-\-filter \ STATUSCHARS
 only display items with the given status characters (see description)
 .TP
-.B \-\-json
+.B  \-\-json
 output stats as JSON. Implies \fB\-\-stats\fP\&.
-.TP
-.B \-\-no\-cache\-sync
-experimental: do not synchronize the cache. Implies not using the files cache.
 .TP
 .BI \-\-stdin\-name \ NAME
 use NAME in archive for stdin data (default: \(aqstdin\(aq)
 .TP
 .BI \-\-stdin\-user \ USER
-set user USER in archive for stdin data (default: \(aqroot\(aq)
+set user USER in archive for stdin data (default: do not store user/uid)
 .TP
 .BI \-\-stdin\-group \ GROUP
-set group GROUP in archive for stdin data (default: \(aqroot\(aq)
+set group GROUP in archive for stdin data (default: do not store group/gid)
 .TP
 .BI \-\-stdin\-mode \ M
 set mode to M in archive for stdin data (default: 0660)
 .TP
-.B \-\-content\-from\-command
-interpret PATH as command and store its stdout. See also section Reading from stdin below.
+.B  \-\-content\-from\-command
+interpret PATH as a command and store its stdout. See also the section \(aqReading backup data from stdin\(aq below.
 .TP
-.B \-\-paths\-from\-stdin
-read DELIM\-separated list of paths to backup from stdin. Will not recurse into directories.
+.B  \-\-paths\-from\-stdin
+read DELIM\-separated list of paths to back up from stdin. All control is external: it will back up all files given \- no more, no less.
 .TP
-.B \-\-paths\-from\-command
+.B  \-\-paths\-from\-command
 interpret PATH as command and treat its output as \fB\-\-paths\-from\-stdin\fP
 .TP
+.B  \-\-paths\-from\-shell\-command
+interpret PATH as shell command and treat its output as \fB\-\-paths\-from\-stdin\fP
+.TP
 .BI \-\-paths\-delimiter \ DELIM
-set path delimiter for \fB\-\-paths\-from\-stdin\fP and \fB\-\-paths\-from\-command\fP (default: n)
+set path delimiter for \fB\-\-paths\-from\-stdin\fP, \fB\-\-paths\-from\-command\fP and \fB\-\-paths\-from\-shell\-command\fP (default: \fB\en\fP)
 .UNINDENT
-.SS Exclusion options
+.SS Include/Exclude options
 .INDENT 0.0
 .TP
 .BI \-e \ PATTERN\fR,\fB \ \-\-exclude \ PATTERN
@@ -187,58 +277,79 @@ exclude paths matching PATTERN
 read exclude patterns from EXCLUDEFILE, one per line
 .TP
 .BI \-\-pattern \ PATTERN
-experimental: include/exclude paths matching PATTERN
+include/exclude paths matching PATTERN
 .TP
 .BI \-\-patterns\-from \ PATTERNFILE
-experimental: read include/exclude patterns from PATTERNFILE, one per line
+read include/exclude patterns from PATTERNFILE, one per line
 .TP
-.B \-\-exclude\-caches
-exclude directories that contain a CACHEDIR.TAG file (\fI\%http://www.bford.info/cachedir/spec.html\fP)
+.B  \-\-exclude\-caches
+exclude directories that contain a CACHEDIR.TAG file (\%<https://\:www\:.bford\:.info/\:cachedir/\:spec\:.html>)
 .TP
 .BI \-\-exclude\-if\-present \ NAME
 exclude directories that are tagged by containing a filesystem object with the given NAME
 .TP
-.B \-\-keep\-exclude\-tags
-if tag objects are specified with \fB\-\-exclude\-if\-present\fP, don\(aqt omit the tag objects themselves from the backup archive
+.B  \-\-keep\-exclude\-tags
+if tag objects are specified with \fB\-\-exclude\-if\-present\fP, do not omit the tag objects themselves from the backup archive
 .TP
-.B \-\-exclude\-nodump
-exclude files flagged NODUMP
+.B  \-\-exclude\-dataless
+exclude files flagged DATALESS (macOS: placeholder files whose content is not materialized locally, e.g. not\-downloaded cloud storage files)
 .UNINDENT
 .SS Filesystem options
 .INDENT 0.0
 .TP
-.B \-x\fP,\fB  \-\-one\-file\-system
-stay in the same file system and do not store mount points of other file systems.  This might behave different from your expectations, see the docs.
+.B  \-x\fP,\fB  \-\-one\-file\-system
+stay in the same file system and do not store mount points of other file systems \- this might behave different from your expectations, see the description below.
 .TP
-.B \-\-numeric\-owner
+.B  \-\-numeric\-ids
 only store numeric user and group identifiers
 .TP
-.B \-\-noatime
-do not store atime into archive
-.TP
-.B \-\-atime
+.B  \-\-atime
 do store atime into archive
 .TP
-.B \-\-noctime
+.B  \-\-noctime
 do not store ctime into archive
 .TP
-.B \-\-nobirthtime
+.B  \-\-nobirthtime
 do not store birthtime (creation date) into archive
 .TP
-.B \-\-nobsdflags
-deprecated, use \fB\-\-noflags\fP instead
-.TP
-.B \-\-noflags
+.B  \-\-noflags
 do not read and store flags (e.g. NODUMP, IMMUTABLE) into archive
 .TP
-.B \-\-sparse
-detect sparse holes in input (supported only by fixed chunker)
+.B  \-\-noacls
+do not read and store ACLs into archive
+.TP
+.B  \-\-noxattrs
+do not read and store xattrs into archive
+.TP
+.B  \-\-sparse
+detect sparse holes in input and seek over them instead of reading them
+.TP
+.BI \-\-digests \ ALGOS
+compute these hash digests over the full content of each file and store them into the archive items. Comma\-separated list of hash algorithm names, e.g. \(dqblake3\(dq, or \(dqnone\(dq. default: none
 .TP
 .BI \-\-files\-cache \ MODE
-operate files cache in MODE. default: ctime,size,inode
+operate files cache in MODE. default: ctime,size,inode (on Windows: mtime,size,inode, because ctime is file creation time there).
 .TP
-.B \-\-read\-special
+.BI \-\-group\-by \ KEYS
+comma\-separated list of archive attributes identifying the archives this archive belongs to; the newest of them is the archive the files cache is rebuilt from, if the local files cache is missing. valid keys are: name, host, user; default is: name,host
+.TP
+.BI \-\-files\-changed \ MODE
+specify how to detect if a file has changed during backup (ctime, mtime, disabled). default: ctime (on Windows: mtime, because ctime is file creation time there).
+.TP
+.B  \-\-read\-special
 open and read block and char device files as well as FIFOs as if they were regular files. Also follows symlinks pointing to these kinds of files.
+.TP
+.BI \-\-read\-special\-timeout \ SECONDS
+when reading from FIFOs or character devices (see \-\-read\-special): skip the file with an error if no data arrives for more than SECONDS (this includes waiting for a FIFO\(aqs writer to connect). Give 0 to wait forever. default: 1800 seconds.
+.TP
+.BI \-\-map \ MAPFILE
+give a map file describing the content ranges of the (single) input file, so borg does not need to read all of it. See the \fIInput maps\fP section below.
+.TP
+.BI \-\-reuse\-from \ ARCHIVE
+reuse the chunks of this reference archive for the input map\(aqs \fBsame\fP ranges (requires \-\-map). See the \fIInput maps\fP section below.
+.TP
+.BI \-\-reuse\-path \ PATH
+archive\-internal path of the reference item in the \-\-reuse\-from archive (only needed if that archive contains more than one file item).
 .UNINDENT
 .SS Archive options
 .INDENT 0.0
@@ -247,114 +358,126 @@ open and read block and char device files as well as FIFOs as if they were regul
 add a comment text to the archive
 .TP
 .BI \-\-timestamp \ TIMESTAMP
-manually specify the archive creation date/time (UTC, yyyy\-mm\-ddThh:mm:ss format). Alternatively, give a reference file/directory.
-.TP
-.BI \-c \ SECONDS\fR,\fB \ \-\-checkpoint\-interval \ SECONDS
-write checkpoint every SECONDS seconds (Default: 1800)
+manually specify the archive creation date/time (yyyy\-mm\-ddThh:mm:ss[(+|\-)HH:MM] format, (+|\-)HH:MM is the UTC offset, default: local time zone). Alternatively, give a reference file/directory.
 .TP
 .BI \-\-chunker\-params \ PARAMS
-specify the chunker parameters (ALGO, CHUNK_MIN_EXP, CHUNK_MAX_EXP, HASH_MASK_BITS, HASH_WINDOW_SIZE). default: buzhash,19,23,21,4095
+specify the chunker parameters (ALGO, CHUNK_MIN_EXP, CHUNK_MAX_EXP, HASH_MASK_BITS, NC_LEVEL). default: the repository default (see borg repo\-create), else fastcdc,19,23,21,2
 .TP
 .BI \-C \ COMPRESSION\fR,\fB \ \-\-compression \ COMPRESSION
-select compression algorithm, see the output of the "borg help compression" command for details.
+select compression algorithm, see the output of the \(dqborg help compression\(dq command for details. Default: the repository default (see borg repo\-create), else lz4.
+.TP
+.BI \-\-tag \ TAG
+add tag to archive (can be given multiple times)
 .UNINDENT
 .SH EXAMPLES
+.sp
+\fBNote:\fP
+.INDENT 0.0
+.INDENT 3.5
+Archive series and performance: In Borg 2, archives that share the same NAME form an \(dqarchive series\(dq.
+The files cache is maintained per series. For best performance on repeated backups, reuse the same
+NAME every time you run \fBborg create\fP for the same dataset (e.g. always use \fBmy\-documents\fP).
+Frequently changing the NAME (for example by embedding date/time like \fBmy\-documents\-2025\-11\-10\fP)
+prevents cache reuse and forces Borg to re\-scan and re\-chunk files, which can make incremental
+backups vastly slower. Only vary the NAME if you intentionally want to start a new series.
+.sp
+If you must vary the archive name but still want cache reuse across names, see the advanced
+knobs described in \fIupgradenotes2\fP (\fBBORG_FILES_CACHE_SUFFIX\fP and \fBBORG_FILES_CACHE_TTL\fP),
+but the recommended approach is to keep a stable NAME per series.
+.UNINDENT
+.UNINDENT
 .INDENT 0.0
 .INDENT 3.5
 .sp
-.nf
-.ft C
-# Backup ~/Documents into an archive named "my\-documents"
-$ borg create /path/to/repo::my\-documents ~/Documents
+.EX
+# Backup ~/Documents into an archive named \(dqmy\-documents\(dq
+$ borg create my\-documents ~/Documents
 
 # same, but list all files as we process them
-$ borg create \-\-list /path/to/repo::my\-documents ~/Documents
+$ borg create \-\-list my\-documents ~/Documents
+
+# Backup /mnt/disk/docs, but strip path prefix using the slashdot hack
+$ borg create \-\-repo /path/to/repo docs /mnt/disk/./docs
 
 # Backup ~/Documents and ~/src but exclude pyc files
-$ borg create /path/to/repo::my\-files \e
+$ borg create my\-files                \e
     ~/Documents                       \e
     ~/src                             \e
     \-\-exclude \(aq*.pyc\(aq
 
 # Backup home directories excluding image thumbnails (i.e. only
 # /home/<one directory>/.thumbnails is excluded, not /home/*/*/.thumbnails etc.)
-$ borg create /path/to/repo::my\-files /home \e
-    \-\-exclude \(aqsh:/home/*/.thumbnails\(aq
+$ borg create my\-files /home \-\-exclude \(aqsh:home/*/.thumbnails\(aq
 
-# Backup the root filesystem into an archive named "root\-YYYY\-MM\-DD"
-# use zlib compression (good, but slow) \- default is lz4 (fast, low compression ratio)
-$ borg create \-C zlib,6 \-\-one\-file\-system /path/to/repo::root\-{now:%Y\-%m\-%d} /
+# Back up the root filesystem into an archive named \(dqroot\-archive\(dq
+# Use zlib compression (good, but slow) — default is LZ4 (fast, low compression ratio)
+$ borg create \-C zlib,6 \-\-one\-file\-system root\-archive /
 
-# Backup onto a remote host ("push" style) via ssh to port 2222,
-# logging in as user "borg" and storing into /path/to/repo
-$ borg create ssh://borg@backup.example.org:2222/path/to/repo::{fqdn}\-root\-{now} /
+# Backup into an archive name like FQDN\-root
+$ borg create \(aq{fqdn}\-root\(aq /
 
-# Backup a remote host locally ("pull" style) using sshfs
+# Back up a remote host locally (\(dqpull\(dq style) using SSHFS
 $ mkdir sshfs\-mount
 $ sshfs root@example.com:/ sshfs\-mount
 $ cd sshfs\-mount
-$ borg create /path/to/repo::example.com\-root\-{now:%Y\-%m\-%d} .
+$ borg create example.com\-root .
 $ cd ..
 $ fusermount \-u sshfs\-mount
 
-# Make a big effort in fine granular deduplication (big chunk management
-# overhead, needs a lot of RAM and disk space, see formula in internals
-# docs \- same parameters as borg < 1.0 or attic):
-$ borg create \-\-chunker\-params buzhash,10,23,16,4095 /path/to/repo::small /smallstuff
+# Make a big effort in fine\-grained deduplication (big chunk management
+# overhead, needs a lot of RAM and disk space; see the formula in the internals docs):
+$ borg create \-\-chunker\-params fastcdc,10,23,16,2 small /smallstuff
 
 # Backup a raw device (must not be active/in use/mounted at that time)
-$ borg create \-\-read\-special \-\-chunker\-params fixed,4194304 /path/to/repo::my\-sdx /dev/sdX
+$ borg create \-\-read\-special \-\-chunker\-params fixed,4194304 my\-sdx /dev/sdX
 
 # Backup a sparse disk image (must not be active/in use/mounted at that time)
-$ borg create \-\-sparse \-\-chunker\-params fixed,4194304 /path/to/repo::my\-disk my\-disk.raw
+$ borg create \-\-sparse \-\-chunker\-params fixed,4194304 my\-disk my\-disk.raw
 
 # No compression (none)
-$ borg create \-\-compression none /path/to/repo::arch ~
+$ borg create \-\-compression none arch ~
 
 # Super fast, low compression (lz4, default)
-$ borg create /path/to/repo::arch ~
+$ borg create arch ~
 
 # Less fast, higher compression (zlib, N = 0..9)
-$ borg create \-\-compression zlib,N /path/to/repo::arch ~
+$ borg create \-\-compression zlib,N arch ~
 
 # Even slower, even higher compression (lzma, N = 0..9)
-$ borg create \-\-compression lzma,N /path/to/repo::arch ~
+$ borg create \-\-compression lzma,N arch ~
 
 # Only compress compressible data with lzma,N (N = 0..9)
-$ borg create \-\-compression auto,lzma,N /path/to/repo::arch ~
+$ borg create \-\-compression auto,lzma,N arch ~
 
-# Use short hostname, user name and current time in archive name
-$ borg create /path/to/repo::{hostname}\-{user}\-{now} ~
-# Similar, use the same datetime format that is default as of borg 1.1
-$ borg create /path/to/repo::{hostname}\-{user}\-{now:%Y\-%m\-%dT%H:%M:%S} ~
-# As above, but add nanoseconds
-$ borg create /path/to/repo::{hostname}\-{user}\-{now:%Y\-%m\-%dT%H:%M:%S.%f} ~
+# Use the short hostname and username as the archive name
+$ borg create \(aq{hostname}\-{user}\(aq ~
 
-# Backing up relative paths by moving into the correct directory first
+# Back up relative paths by moving into the correct directory first
 $ cd /home/user/Documents
-# The root directory of the archive will be "projectA"
-$ borg create /path/to/repo::daily\-projectA\-{now:%Y\-%m\-%d} projectA
+# The root directory of the archive will be \(dqprojectA\(dq
+$ borg create \(aqdaily\-projectA\(aq projectA
 
 # Use external command to determine files to archive
-# Use \-\-paths\-from\-stdin with find to only backup files less than 1MB in size
-$ find ~ \-size \-1000k | borg create \-\-paths\-from\-stdin /path/to/repo::small\-files\-only
-# Use \-\-paths\-from\-command with find to only backup files from a given user
-$ borg create \-\-paths\-from\-command /path/to/repo::joes\-files \-\- find /srv/samba/shared \-user joe
+# Use \-\-paths\-from\-stdin with find to back up only files less than 1 MB in size
+$ find ~ \-size \-1000k | borg create \-\-paths\-from\-stdin small\-files\-only
+# Use \-\-paths\-from\-command with find to back up files from only a given user
+$ borg create \-\-paths\-from\-command joes\-files \-\- find /srv/samba/shared \-user joe
+# Use \-\-paths\-from\-shell\-command with find to back up a few files from only a given user \-
+# BE VERY CAREFUL AND ONLY USE TRUSTED INPUT FOR THE SHELL COMMAND!
+$ borg create \-\-paths\-from\-shell\-command some\-of\-joes\-files \-\- \(dqfind /srv/samba/shared \-user joe | head\(dq
 # Use \-\-paths\-from\-stdin with \-\-paths\-delimiter (for example, for filenames with newlines in them)
 $ find ~ \-size \-1000k \-print0 | borg create \e
     \-\-paths\-from\-stdin \e
-    \-\-paths\-delimiter "\e0" \e
-    /path/to/repo::smallfiles\-handle\-newline
-.ft P
-.fi
+    \-\-paths\-delimiter \(dq\e0\(dq \e
+    smallfiles\-handle\-newline
+.EE
 .UNINDENT
 .UNINDENT
 .SH NOTES
 .sp
 The \fB\-\-exclude\fP patterns are not like tar. In tar \fB\-\-exclude\fP .bundler/gems will
 exclude foo/.bundler/gems. In borg it will not, you need to use \fB\-\-exclude\fP
-\(aq*/.bundler/gems\(aq to get the same effect. See \fBborg help patterns\fP for
-more information.
+\(aq*/.bundler/gems\(aq to get the same effect.
 .sp
 In addition to using \fB\-\-exclude\fP patterns, it is possible to use
 \fB\-\-exclude\-if\-present\fP to specify the name of a filesystem object (e.g. a file
@@ -368,13 +491,13 @@ through using the \fB\-\-keep\-exclude\-tags\fP option.
 The \fB\-x\fP or \fB\-\-one\-file\-system\fP option excludes directories, that are mountpoints (and everything in them).
 It detects mountpoints by comparing the device number from the output of \fBstat()\fP of the directory and its
 parent directory. Specifically, it excludes directories for which \fBstat()\fP reports a device number different
-from the device number of their parent. Be aware that in Linux (and possibly elsewhere) there are directories
-with device number different from their parent, which the kernel does not consider a mountpoint and also the
-other way around. Examples are bind mounts (possibly same device number, but always a mountpoint) and ALL
-subvolumes of a btrfs (different device number from parent but not necessarily a mountpoint). Therefore when
-using \fB\-\-one\-file\-system\fP, one should make doubly sure that the backup works as intended especially when using
-btrfs. This is even more important, if the btrfs layout was created by someone else, e.g. a distribution
-installer.
+from the device number of their parent.
+In general: be aware that there are directories with device number different from their parent, which the kernel
+does not consider a mountpoint and also the other way around.
+Linux examples for this are bind mounts (possibly same device number, but always a mountpoint) and ALL
+subvolumes of a btrfs (different device number from parent but not necessarily a mountpoint).
+macOS examples are the apfs mounts of a typical macOS installation.
+Therefore, when using \fB\-\-one\-file\-system\fP, you should double\-check that the backup works as intended.
 .SS Item flags
 .sp
 \fB\-\-list\fP outputs a list of all files, directories and other
@@ -387,7 +510,7 @@ If you are interested only in a subset of that output, you can give e.g.
 below).
 .sp
 A uppercase character represents the status of a regular file relative to the
-"files" cache (not relative to the repo \-\- this is an issue if the files cache
+\(dqfiles\(dq cache (not relative to the repo \-\- this is an issue if the files cache
 is not used). Metadata is stored in any case and for \(aqA\(aq and \(aqM\(aq also new data
 chunks are stored. For \(aqU\(aq all data chunks refer to already existing chunks.
 .INDENT 0.0
@@ -413,7 +536,7 @@ borg usually just stores their metadata:
 .IP \(bu 2
 \(aqc\(aq = char device
 .IP \(bu 2
-\(aqh\(aq = regular file, hardlink (to already seen inodes)
+\(aqh\(aq = regular file, hard link (to already seen inodes)
 .IP \(bu 2
 \(aqs\(aq = symlink
 .IP \(bu 2
@@ -423,26 +546,39 @@ borg usually just stores their metadata:
 Other flags used include:
 .INDENT 0.0
 .IP \(bu 2
+\(aq+\(aq = included, item would be backed up (if not in dry\-run mode)
+.IP \(bu 2
+\(aq\-\(aq = excluded, item would not be / was not backed up
+.IP \(bu 2
 \(aqi\(aq = backup data was read from standard input (stdin)
 .IP \(bu 2
-\(aq\-\(aq = dry run, item was \fInot\fP backed up
-.IP \(bu 2
-\(aqx\(aq = excluded, item was \fInot\fP backed up
+\(aqx\(aq = skipped due to \fB\-\-exclude\-dataless\fP (file is flagged DATALESS)
 .IP \(bu 2
 \(aq?\(aq = missing status code (if you see this, please file a bug report!)
 .UNINDENT
-.SS Reading from stdin
+.SS Errors and (incomplete) archives
+.sp
+If an error happens during archive creation (e.g. some file could not be read
+due to a permission error or some other OS error), borg will log a warning or
+an error (depending on the type of issue) and continue with the next item.
+.sp
+At the end of the backup, if there were any such issues, borg will exit with
+a non\-zero exit code (usually 1 for warnings).
+.sp
+\fBThe archive is still saved even if warnings or errors occurred\fP, but it will
+only contain the data borg was able to read successfully.
+.sp
+You should always check the backup logs and the exit code of the borg command.
+.SS Reading backup data from stdin
 .sp
 There are two methods to read from stdin. Either specify \fB\-\fP as path and
 pipe directly to borg:
 .INDENT 0.0
 .INDENT 3.5
 .sp
-.nf
-.ft C
-backup\-vm \-\-id myvm \-\-stdout | borg create REPO::ARCHIVE \-
-.ft P
-.fi
+.EX
+backup\-vm \-\-id myvm \-\-stdout | borg create \-\-repo REPO ARCHIVE \-
+.EE
 .UNINDENT
 .UNINDENT
 .sp
@@ -453,11 +589,9 @@ to the command:
 .INDENT 0.0
 .INDENT 3.5
 .sp
-.nf
-.ft C
-borg create \-\-content\-from\-command REPO::ARCHIVE \-\- backup\-vm \-\-id myvm \-\-stdout
-.ft P
-.fi
+.EX
+borg create \-\-content\-from\-command \-\-repo REPO ARCHIVE \-\- backup\-vm \-\-id myvm \-\-stdout
+.EE
 .UNINDENT
 .UNINDENT
 .sp
@@ -478,10 +612,72 @@ creation a bit.
 .sp
 By default, the content read from stdin is stored in a file called \(aqstdin\(aq.
 Use \fB\-\-stdin\-name\fP to change the name.
+.SS Input maps
+.sp
+Usually, borg reads the complete input to determine its contents. If you already
+know the contents of parts of the input from an external source of truth, you can
+give that information via \fB\-\-map MAPFILE\fP and borg will not read the known parts.
+The primary use case is backing up snapshots of large block devices (e.g. LVM thin
+volumes), where the storage layer knows which ranges are in use.
+.sp
+The map file must describe the whole input: one range per line, in the form
+\fBSTART LENGTH STATE\fP (byte values, decimal or 0x\-prefixed hexadecimal). The
+ranges must be sorted, non\-overlapping and contiguous, starting at offset 0 and
+covering the exact input size. \fB#\fP starts a comment, empty lines are ignored.
+STATE is one of:
+.INDENT 0.0
+.IP \(bu 2
+\fBdata\fP: the range\(aqs contents are read and backed up.
+.IP \(bu 2
+\fBzero\fP: the range is known to read as all\-zero bytes. borg stores a hole
+(all\-zero range) of that size without reading the range.
+.IP \(bu 2
+\fBsame\fP: the range is known to be identical to the same range of the input
+backed up in the \fB\-\-reuse\-from REFARCHIVE\fP reference archive (usually: the
+previous backup of an earlier snapshot of the same device). borg reuses the
+reference archive\(aqs chunks for such ranges without reading them. This state
+requires \fB\-\-reuse\-from\fP\&.
+.UNINDENT
+.sp
+\fBThe map is trusted\fP: if it is wrong (e.g. a range marked \fBzero\fP actually
+contains data, or a range marked \fBsame\fP actually changed), the archive will
+not match the input and borg cannot detect that. Independently verify the
+source producing the maps, and consider doing a periodic full read backup
+(without \fB\-\-map\fP).
+.sp
+For LVM thin volume snapshots, maps can be generated from \fBthin_dump\fP /
+\fBthin_delta\fP XML with the \fBscripts/lvm\-thin\-map.py\fP converter from the
+borg sources; its docstring shows the complete workflow.
+.sp
+\fB\-\-map\fP requires giving exactly one input path, which must be a regular file or
+(with \fB\-\-read\-special\fP) a block device.
+.sp
+The reference archive must contain exactly one file item; if it contains more,
+select the reference item with \fB\-\-reuse\-path PATH\fP (its archive\-internal path).
+Reference chunks that only partially overlap \fBsame\fP ranges are re\-read from
+the input, so any chunker gives correct results \- but a fixed block size chunker
+(e.g. \fB\-\-chunker\-params fixed,4194304\fP, same parameters as used for the
+reference archive) avoids re\-reading at the edges of changed ranges and gives
+stable chunk boundaries across backups.
+.SS Feeding all file paths from externally
+.sp
+Usually, you give a starting path (recursion root) to borg and then borg
+automatically recurses, finds and backs up all fs objects contained in
+there (optionally considering include/exclude rules).
+.sp
+If you need more control and you want to give every single fs object path
+to borg (maybe implementing your own recursion or your own rules), you can use
+\fB\-\-paths\-from\-stdin\fP, \fB\-\-paths\-from\-command\fP or \fB\-\-paths\-from\-shell\-command\fP
+(with the latter two, borg will fail to create an archive should the command fail).
+.sp
+Borg supports paths with the slashdot hack to strip path prefixes here also.
+So, be careful not to unintentionally trigger that.
+.sp
+Symlinks given this way are never followed (unlike recursion roots are), they are
+archived as symlinks.
 .SH SEE ALSO
 .sp
-\fIborg\-common(1)\fP, \fIborg\-delete(1)\fP, \fIborg\-prune(1)\fP, \fIborg\-check(1)\fP, \fIborg\-patterns(1)\fP, \fIborg\-placeholders(1)\fP, \fIborg\-compression(1)\fP
-.SH AUTHOR
+\fIborg\-common(1)\fP, \fIborg\-delete(1)\fP, \fIborg\-prune(1)\fP, \fIborg\-check(1)\fP, \fIborg\-patterns(1)\fP, \fIborg\-placeholders(1)\fP, \fIborg\-compression(1)\fP, \fIborg\-repo\-create(1)\fP
+.SH Author
 The Borg Collective
-.\" Generated by docutils manpage writer.
-.
+.\" End of generated man page.

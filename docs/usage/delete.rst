@@ -4,24 +4,20 @@ Examples
 ~~~~~~~~
 ::
 
-    # delete a single backup archive:
-    $ borg delete /path/to/repo::Monday
-    # actually free disk space:
-    $ borg compact /path/to/repo
+    # Delete all backup archives named "kenny-files":
+    $ borg delete -a kenny-files
+    # Actually free disk space:
+    $ borg compact
 
-    # delete all archives whose names begin with the machine's hostname followed by "-"
-    $ borg delete --prefix '{hostname}-' /path/to/repo
+    # Delete a specific backup archive using its unique archive ID prefix
+    $ borg delete aid:d34db33f
 
-    # delete all archives whose names contain "-2012-"
-    $ borg delete --glob-archives '*-2012-*' /path/to/repo
+    # Delete all archives created on this machine
+    $ borg delete -a 'host:{hostname}'
 
-    # see what would be deleted if delete was run without --dry-run
-    $ borg delete --list --dry-run -a '*-May-*' /path/to/repo
+    # Delete all archives created in 2012
+    $ borg delete -a 'date:2012'
 
-    # delete the whole repository and the related local cache:
-    $ borg delete /path/to/repo
-    You requested to completely DELETE the repository *including* all archives it contains:
-    repo                                 Mon, 2016-02-15 19:26:54
-    root-2016-02-15                      Mon, 2016-02-15 19:36:29
-    newname                              Mon, 2016-02-15 19:50:19
-    Type 'YES' if you understand this and want to continue: YES
+    # See what would be deleted if delete was run without --dry-run
+    $ borg delete --list --dry-run -a 'date:2012-05'
+

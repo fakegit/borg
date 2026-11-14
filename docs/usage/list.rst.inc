@@ -6,57 +6,45 @@ borg list
 ---------
 .. code-block:: none
 
-    borg [common options] list [options] [REPOSITORY_OR_ARCHIVE] [PATH...]
+    borg [common options] list [options] NAME [PATH...]
 
 .. only:: html
 
     .. class:: borg-options-table
 
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    | **positional arguments**                                                                                                                                                                                                                                                                                                                                                                               |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``REPOSITORY_OR_ARCHIVE``                     | repository or archive to list contents of                                                                                                                                                                                                                                |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``PATH``                                      | paths to list; patterns are supported                                                                                                                                                                                                                                    |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    | **optional arguments**                                                                                                                                                                                                                                                                                                                                                                                 |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``--consider-checkpoints``                    | Show checkpoint archives in the repository contents list (default: hidden).                                                                                                                                                                                              |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``--short``                                   | only print file/directory names, nothing else                                                                                                                                                                                                                            |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``--format FORMAT``, ``--list-format FORMAT`` | specify format for file listing (default: "{mode} {user:6} {group:6} {size:8d} {mtime} {path}{extra}{NL}")                                                                                                                                                               |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``--json``                                    | Only valid for listing repository contents. Format output as JSON. The form of ``--format`` is ignored, but keys used in it are added to the JSON output. Some keys are always present. Note: JSON can only represent text. A "barchive" key is therefore not available. |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``--json-lines``                              | Only valid for listing archive contents. Format output as JSON Lines. The form of ``--format`` is ignored, but keys used in it are added to the JSON output. Some keys are always present. Note: JSON can only represent text. A "bpath" key is therefore not available. |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    | .. class:: borg-common-opt-ref                                                                                                                                                                                                                                                                                                                                                                         |
-    |                                                                                                                                                                                                                                                                                                                                                                                                        |
-    | :ref:`common_options`                                                                                                                                                                                                                                                                                                                                                                                  |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    | **Archive filters** — Archive filters can be applied to repository targets.                                                                                                                                                                                                                                                                                                                            |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``-P PREFIX``, ``--prefix PREFIX``            | only consider archive names starting with this prefix.                                                                                                                                                                                                                   |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``-a GLOB``, ``--glob-archives GLOB``         | only consider archive names matching the glob. sh: rules apply, see "borg help patterns". ``--prefix`` and ``--glob-archives`` are mutually exclusive.                                                                                                                   |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``--sort-by KEYS``                            | Comma-separated list of sorting keys; valid keys are: timestamp, name, id; default is: timestamp                                                                                                                                                                         |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``--first N``                                 | consider first N archives after other filters were applied                                                                                                                                                                                                               |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``--last N``                                  | consider last N archives after other filters were applied                                                                                                                                                                                                                |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    | **Exclusion options**                                                                                                                                                                                                                                                                                                                                                                                  |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``-e PATTERN``, ``--exclude PATTERN``         | exclude paths matching PATTERN                                                                                                                                                                                                                                           |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``--exclude-from EXCLUDEFILE``                | read exclude patterns from EXCLUDEFILE, one per line                                                                                                                                                                                                                     |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``--pattern PATTERN``                         | experimental: include/exclude paths matching PATTERN                                                                                                                                                                                                                     |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    |                                                                             | ``--patterns-from PATTERNFILE``               | experimental: read include/exclude patterns from PATTERNFILE, one per line                                                                                                                                                                                               |
-    +-----------------------------------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | **positional arguments**                                                                                                                                                                                                                                                              |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``NAME``                              | specify the archive name                                                                                                                                                              |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``PATH``                              | paths to list; patterns are supported                                                                                                                                                 |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | **options**                                                                                                                                                                                                                                                                           |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--short``                           | only print file/directory names, nothing else                                                                                                                                         |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--format FORMAT``                   | specify format for file listing (default: "{mode} {user:6} {group:6} {size:8} {mtime} {path}{extra}{NL}")                                                                             |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--json-lines``                      | Format output as JSON Lines. The form of ``--format`` is ignored, but keys used in it are added to the JSON output. Some keys are always present. Note: JSON can only represent text. |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--depth N``                         | only list files up to the specified directory depth                                                                                                                                   |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--sort-by SPEC``                    | sort output by comma-separated fields (e.g. '>size,path'), see Sorting below                                                                                                          |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | .. class:: borg-common-opt-ref                                                                                                                                                                                                                                                        |
+    |                                                                                                                                                                                                                                                                                       |
+    | :ref:`common_options`                                                                                                                                                                                                                                                                 |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | **Include/Exclude options**                                                                                                                                                                                                                                                           |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``-e PATTERN``, ``--exclude PATTERN`` | exclude paths matching PATTERN                                                                                                                                                        |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--exclude-from EXCLUDEFILE``        | read exclude patterns from EXCLUDEFILE, one per line                                                                                                                                  |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--pattern PATTERN``                 | include/exclude paths matching PATTERN                                                                                                                                                |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    |                                                       | ``--patterns-from PATTERNFILE``       | read include/exclude patterns from PATTERNFILE, one per line                                                                                                                          |
+    +-------------------------------------------------------+---------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 
     .. raw:: html
 
@@ -68,104 +56,97 @@ borg list
 
 .. only:: latex
 
-    REPOSITORY_OR_ARCHIVE
-        repository or archive to list contents of
+    NAME
+        specify the archive name
     PATH
         paths to list; patterns are supported
 
 
-    optional arguments
-        --consider-checkpoints    Show checkpoint archives in the repository contents list (default: hidden).
-        --short     only print file/directory names, nothing else
-        --format FORMAT, --list-format FORMAT    specify format for file listing (default: "{mode} {user:6} {group:6} {size:8d} {mtime} {path}{extra}{NL}")
-        --json      Only valid for listing repository contents. Format output as JSON. The form of ``--format`` is ignored, but keys used in it are added to the JSON output. Some keys are always present. Note: JSON can only represent text. A "barchive" key is therefore not available.
-        --json-lines    Only valid for listing archive contents. Format output as JSON Lines. The form of ``--format`` is ignored, but keys used in it are added to the JSON output. Some keys are always present. Note: JSON can only represent text. A "bpath" key is therefore not available.
+    options
+        --short            only print file/directory names, nothing else
+        --format FORMAT    specify format for file listing (default: "{mode} {user:6} {group:6} {size:8} {mtime} {path}{extra}{NL}")
+        --json-lines       Format output as JSON Lines. The form of ``--format`` is ignored, but keys used in it are added to the JSON output. Some keys are always present. Note: JSON can only represent text.
+        --depth N          only list files up to the specified directory depth
+        --sort-by SPEC     sort output by comma-separated fields (e.g. '>size,path'), see Sorting below
 
 
     :ref:`common_options`
         |
 
-    Archive filters
-        -P PREFIX, --prefix PREFIX        only consider archive names starting with this prefix.
-        -a GLOB, --glob-archives GLOB     only consider archive names matching the glob. sh: rules apply, see "borg help patterns". ``--prefix`` and ``--glob-archives`` are mutually exclusive.
-        --sort-by KEYS                    Comma-separated list of sorting keys; valid keys are: timestamp, name, id; default is: timestamp
-        --first N                         consider first N archives after other filters were applied
-        --last N                          consider last N archives after other filters were applied
-
-
-    Exclusion options
+    Include/Exclude options
         -e PATTERN, --exclude PATTERN     exclude paths matching PATTERN
         --exclude-from EXCLUDEFILE        read exclude patterns from EXCLUDEFILE, one per line
-        --pattern PATTERN                 experimental: include/exclude paths matching PATTERN
-        --patterns-from PATTERNFILE       experimental: read include/exclude patterns from PATTERNFILE, one per line
+        --pattern PATTERN                 include/exclude paths matching PATTERN
+        --patterns-from PATTERNFILE       read include/exclude patterns from PATTERNFILE, one per line
 
 
 Description
 ~~~~~~~~~~~
 
-This command lists the contents of a repository or an archive.
+This command lists the contents of an archive.
 
-See the "borg help patterns" command for more help on exclude patterns.
+For more help on include/exclude patterns, see the output of :ref:`borg_patterns`.
 
 .. man NOTES
 
-The following keys are available for ``--format``:
+The FORMAT specifier syntax
++++++++++++++++++++++++++++
+
+The ``--format`` option uses Python's `format string syntax
+<https://docs.python.org/3.11/library/string.html#formatstrings>`_.
+
+Examples:
+::
+
+    $ borg list --format '{mode} {user:6} {group:6} {size:8} {mtime} {path}{extra}{NL}' ArchiveFoo
+    -rw-rw-r-- user   user       1024 Thu, 2021-12-09 10:22:17 file-foo
+    ...
+
+    # {VAR:<NUMBER} - pad to NUMBER columns left-aligned.
+    # {VAR:>NUMBER} - pad to NUMBER columns right-aligned.
+    $ borg list --format '{mode} {user:>6} {group:>6} {size:<8} {mtime} {path}{extra}{NL}' ArchiveFoo
+    -rw-rw-r--   user   user 1024     Thu, 2021-12-09 10:22:17 file-foo
+    ...
+
+The following keys are always available:
 
 - NEWLINE: OS dependent line separator
 - NL: alias of NEWLINE
-- NUL: NUL character for creating print0 / xargs -0 like output, see barchive/bpath
-- SPACE
-- TAB
-- CR
-- LF
-
-Keys for listing repository archives:
-
-- archive: archive name interpreted as text (might be missing non-text characters, see barchive)
-- name: alias of "archive"
-- barchive: verbatim archive name, can contain any character except NUL
-- comment: archive comment interpreted as text (might be missing non-text characters, see bcomment)
-- bcomment: verbatim archive comment, can contain any character except NUL
-- id: internal ID of the archive
-
-- start: time (start) of creation of the archive
-- time: alias of "start"
-- end: time (end) of creation of the archive
-
-- hostname: hostname of host on which this archive was created
-- username: username of user who created this archive
+- NUL: NUL character for creating print0 / xargs -0 like output
+- SPACE: space character
+- TAB: tab character
+- CR: carriage return character
+- LF: line feed character
 
 
-Keys for listing archive files:
+Keys available only when listing files in an archive:
 
-- type
-- mode
-- uid
-- gid
-- user
-- group
-- path: path interpreted as text (might be missing non-text characters, see bpath)
-- bpath: verbatim POSIX path, can contain any character except NUL
-- source: link target for links (identical to linktarget)
-- linktarget
-- flags
+- type: file type (file, dir, symlink, ...)
+- mode: file mode (as in stat)
+- uid: user id of file owner
+- gid: group id of file owner
+- user: user name of file owner
+- group: group name of file owner
+- path: file path
+- target: link target for symlinks
+- hlid: hard link identity (same if hardlinking same fs object)
+- inode: inode number
+- flags: file flags
 
-- size
-- csize: compressed size
-- dsize: deduplicated size
-- dcsize: deduplicated compressed size
+- size: file size
 - num_chunks: number of chunks in this file
-- unique_chunks: number of unique chunks in this file
 
-- mtime
-- ctime
-- atime
-- isomtime
-- isoctime
-- isoatime
+- mtime: file modification time
+- ctime: file change time
+- atime: file access time
+- isomtime: file modification time (ISO 8601 format)
+- isoctime: file change time (ISO 8601 format)
+- isoatime: file access time (ISO 8601 format)
 
+- fingerprint: Fingerprint of the file content (may have false negatives), format: H(conditions)-H(chunk_ids)
 - blake2b
 - blake2s
+- blake3
 - md5
 - sha1
 - sha224
@@ -176,12 +157,36 @@ Keys for listing archive files:
 - sha3_384
 - sha3_512
 - sha512
-- shake_128
-- shake_256
-- xxh64: XXH64 checksum of this file (note: this is NOT a cryptographic hash!)
 
-- archiveid
-- archivename
-- extra: prepends {source} with " -> " for soft links and " link to " for hard links
+- archiveid: internal ID of the archive
+- archivename: name of the archive
+- extra: prepends {target} with " -> " for soft links and " link to " for hard links
 
-- health: either "healthy" (file ok) or "broken" (if file has all-zero replacement chunks)
+
+Sorting
++++++++
+Use ``--sort-by SPEC`` where SPEC is a comma-separated list of fields.
+Sorts are applied stably from last to first in the given list, thus the first
+field is the primary sort criterion. Prepend ">" for descending, "<" (or no
+prefix) for ascending order, e.g. ``--sort-by='>size,path'`` (quote it, ">" is
+a shell redirection).
+
+Supported fields, sorting by the same value that ``--format`` would print:
+
+- path: the item path
+- type, mode: the file type character resp. the full file mode string
+- user, group: the owner/group name, or the numeric id if the name is not known
+- uid, gid: the numeric owner/group id
+- size: the file size (same as {size}, 0 for items without content)
+- mtime, ctime, atime: the timestamps (atime/ctime fall back to mtime if not stored)
+
+There is no ``birthtime`` field, as there is no {birthtime} format key either.
+
+The sort fields are independent of ``--format``, you may sort by a field you do
+not print.
+
+Note: ``--sort-by`` needs to read all (matching) items into memory before it can
+print anything, so listing a huge archive this way needs a lot of memory and
+delays the first output line. Without ``--sort-by``, items are streamed and their
+order is undefined. If memory usage is a problem, consider
+``borg list --format ... | sort`` instead.

@@ -1,14 +1,14 @@
 import os
 import re
 import stat
-import subprocess
+import struct
 
 from .posix import posix_acl_use_stored_uid_gid
-from .posix import user2uid, group2gid
+from . import posix_ug
 from ..helpers import workarounds
 from ..helpers import safe_decode, safe_encode
 from .base import SyncFile as BaseSyncFile
-from .base import safe_fadvise
+from .base import safe_fadvise, MountEntry
 from .xattr import _listxattr_inner, _getxattr_inner, _setxattr_inner, split_string0
 try:
     from .syncfilerange import sync_file_range, SYNC_FILE_RANGE_WRITE, SYNC_FILE_RANGE_WAIT_BEFORE, SYNC_FILE_RANGE_WAIT_AFTER
@@ -17,9 +17,8 @@ except ImportError:
     SYNC_FILE_RANGE_LOADED = False
 
 from libc cimport errno
-from libc.stdint cimport int64_t
 
-API_VERSION = '1.2_05'
+
 
 cdef extern from "sys/xattr.h":
     ssize_t c_listxattr "listxattr" (const char *path, char *list, size_t size)
@@ -49,11 +48,12 @@ cdef extern from "sys/acl.h":
     int acl_set_file(const char *path, int type, acl_t acl)
     int acl_set_fd(int fd, acl_t acl)
     acl_t acl_from_text(const char *buf)
-    char *acl_to_text(acl_t acl, ssize_t *len)
 
 cdef extern from "acl/libacl.h":
-    int acl_extended_file(const char *path)
+    int acl_extended_file_nofollow(const char *path)
     int acl_extended_fd(int fd)
+    char *acl_to_any_text(acl_t acl, const char *prefix, char separator, int options)
+    int TEXT_NUMERIC_IDS
 
 cdef extern from "linux/fs.h":
     # ioctls
@@ -64,7 +64,6 @@ cdef extern from "linux/fs.h":
     int FS_NODUMP_FL
     int FS_IMMUTABLE_FL
     int FS_APPEND_FL
-    int FS_COMPR_FL
 
 cdef extern from "sys/ioctl.h":
     int ioctl(int fildes, int request, ...)
@@ -126,8 +125,9 @@ BSD_TO_LINUX_FLAGS = {
     stat.UF_NODUMP: FS_NODUMP_FL,
     stat.UF_IMMUTABLE: FS_IMMUTABLE_FL,
     stat.UF_APPEND: FS_APPEND_FL,
-    stat.UF_COMPRESSED: FS_COMPR_FL,
 }
+# must be a bitwise OR of all values in BSD_TO_LINUX_FLAGS.
+LINUX_MASK = FS_NODUMP_FL | FS_IMMUTABLE_FL | FS_APPEND_FL
 
 
 def set_flags(path, bsd_flags, fd=None):
@@ -136,18 +136,45 @@ def set_flags(path, bsd_flags, fd=None):
         if stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISLNK(st.st_mode):
             # see comment in get_flags()
             return
-    cdef int flags = 0
+    cdef int current
+    cdef int flags
+    cdef int mask = LINUX_MASK  # 1 at positions we want to influence
+    cdef int new_flags = 0
     for bsd_flag, linux_flag in BSD_TO_LINUX_FLAGS.items():
         if bsd_flags & bsd_flag:
-            flags |= linux_flag
+            new_flags |= linux_flag
+
     open_fd = fd is None
     if open_fd:
         fd = os.open(path, os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW)
     try:
-        if ioctl(fd, FS_IOC_SETFLAGS, &flags) == -1:
+        # Get current flags.
+        if ioctl(fd, FS_IOC_GETFLAGS, &current) == -1:
+            # If this fails, give up because it is either not supported by the fs
+            # or maybe not permitted? If we can't determine the current flags,
+            # we better not risk corrupting them by setflags, see the comment below.
+            return  # give up silently
+
+        while True:
+            # Replace only the bits we actually want to influence, keep others.
+            # We can't just set all flags to the archived value, because we might
+            # reset flags that are not controllable from userspace, see #9039.
+            flags = (current & ~mask) | (new_flags & mask)
+
+            if ioctl(fd, FS_IOC_SETFLAGS, &flags) != -1:
+                return
             error_number = errno.errno
-            if error_number != errno.EOPNOTSUPP:
-                raise OSError(error_number, strerror(error_number).decode(), path)
+            # Usually we would only catch EOPNOTSUPP here, but Linux Kernel 6.17
+            # has a bug where it returns ENOTTY instead of EOPNOTSUPP.
+            if error_number in (errno.EOPNOTSUPP, errno.ENOTTY):
+                return
+            if error_number == errno.EPERM and mask != FS_NODUMP_FL:
+                # Changing FS_IMMUTABLE_FL / FS_APPEND_FL needs CAP_LINUX_IMMUTABLE.
+                # Retry, influencing only FS_NODUMP_FL, so an unprivileged extract
+                # can still restore the nodump flag.
+                mask = FS_NODUMP_FL
+                continue
+            raise OSError(error_number, strerror(error_number).decode(), path)
     finally:
         if open_fd:
             os.close(fd)
@@ -155,8 +182,8 @@ def set_flags(path, bsd_flags, fd=None):
 
 def get_flags(path, st, fd=None):
     if stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode) or stat.S_ISLNK(st.st_mode):
-        # avoid opening devices files - trying to open non-present devices can be rather slow.
-        # avoid opening symlinks, O_NOFOLLOW would make the open() fail anyway.
+        # Avoid opening device files — trying to open non-present devices can be rather slow.
+        # Avoid opening symlinks; O_NOFOLLOW would make the open() fail anyway.
         return 0
     cdef int linux_flags
     open_fd = fd is None
@@ -178,52 +205,102 @@ def get_flags(path, st, fd=None):
     return bsd_flags
 
 
+def _get_mnt_id(fd):
+    """Return the id of the mount the open file descriptor fd is on (Linux >= 3.15), or None."""
+    try:
+        with open(f"/proc/self/fdinfo/{fd}", "rb") as f:
+            for line in f:
+                if line.startswith(b"mnt_id:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def on_different_mounts(fd1, fd2):
+    """
+    Return whether the open file descriptors *fd1* and *fd2* are on different mounts.
+
+    Returns True or False, or None if this can not be determined.
+
+    Comparing st_dev is not good enough on Linux, e.g. btrfs subvolumes have their own st_dev,
+    so we compare the mount ids. While both fds are open, both mounts exist, so their ids are unique.
+    """
+    mnt_id1, mnt_id2 = _get_mnt_id(fd1), _get_mnt_id(fd2)
+    if mnt_id1 is None or mnt_id2 is None:
+        return None
+    return mnt_id1 != mnt_id2
+
+
 def acl_use_local_uid_gid(acl):
     """Replace the user/group field with the local uid/gid if possible
     """
+    assert isinstance(acl, bytes)
     entries = []
     for entry in safe_decode(acl).split('\n'):
         if entry:
             fields = entry.split(':')
             if fields[0] == 'user' and fields[1]:
-                fields[1] = str(user2uid(fields[1], fields[3]))
+                fields[1] = str(posix_ug._user2uid(fields[1], fields[3]))
             elif fields[0] == 'group' and fields[1]:
-                fields[1] = str(group2gid(fields[1], fields[3]))
+                fields[1] = str(posix_ug._group2gid(fields[1], fields[3]))
             entries.append(':'.join(fields[:3]))
     return safe_encode('\n'.join(entries))
 
 
-cdef acl_append_numeric_ids(acl):
-    """Extend the "POSIX 1003.1e draft standard 17" format with an additional uid/gid field
+def _acl_from_numeric_to_named_with_id(acl):
+    """Convert numeric-id ACL entries to name entries and append numeric id as 4th field.
+
+    Input format (Linux libacl): lines like 'user:1000:rwx' or 'group:100:r-x' or 'user::rwx'.
+    Output format: for entries with a name/id field, become 'user:uname:rwx:uid' or 'group:gname:r-x:gid'.
     """
+    assert isinstance(acl, bytes)
     entries = []
     for entry in _comment_re.sub('', safe_decode(acl)).split('\n'):
-        if entry:
-            type, name, permission = entry.split(':')
-            if name and type == 'user':
-                entries.append(':'.join([type, name, permission, str(user2uid(name, name))]))
-            elif name and type == 'group':
-                entries.append(':'.join([type, name, permission, str(group2gid(name, name))]))
+        if not entry:
+            continue
+        fields = entry.split(':')
+        # Expected 3 fields: type, ugid_or_empty, perms
+        if len(fields) >= 3:
+            typ, ugid_str, perm = fields[0], fields[1], fields[2]
+            if ugid_str and typ == 'user':
+                try:
+                    uid = int(ugid_str)
+                except ValueError:
+                    uid = None
+                uname = posix_ug._uid2user(uid, ugid_str) if uid is not None else ugid_str
+                entries.append(':'.join([typ, uname, perm, str(uid if uid is not None else ugid_str)]))
+            elif ugid_str and typ == 'group':
+                try:
+                    gid = int(ugid_str)
+                except ValueError:
+                    gid = None
+                gname = posix_ug._gid2group(gid, ugid_str) if gid is not None else ugid_str
+                entries.append(':'.join([typ, gname, perm, str(gid if gid is not None else ugid_str)]))
             else:
-                entries.append(entry)
+                # owner, group_obj, mask, other (empty ugid_str field) stay as-is
+                entries.append(':'.join([typ, '', perm]))
+        else:
+            entries.append(entry)
     return safe_encode('\n'.join(entries))
 
 
-cdef acl_numeric_ids(acl):
-    """Replace the "POSIX 1003.1e draft standard 17" user/group field with uid/gid
-    """
+def _acl_from_numeric_to_numeric_with_id(acl):
+    """Keep numeric ids in name field and append the same id as 4th field where applicable."""
+    assert isinstance(acl, bytes)
     entries = []
     for entry in _comment_re.sub('', safe_decode(acl)).split('\n'):
-        if entry:
-            type, name, permission = entry.split(':')
-            if name and type == 'user':
-                uid = str(user2uid(name, name))
-                entries.append(':'.join([type, uid, permission, uid]))
-            elif name and type == 'group':
-                gid = str(group2gid(name, name))
-                entries.append(':'.join([type, gid, permission, gid]))
+        if not entry:
+            continue
+        fields = entry.split(':')
+        if len(fields) >= 3:
+            typ, ugid, perm = fields[0], fields[1], fields[2]
+            if ugid and (typ == 'user' or typ == 'group'):
+                entries.append(':'.join([typ, ugid, perm, ugid]))
             else:
-                entries.append(entry)
+                entries.append(':'.join([typ, '', perm]))
+        else:
+            entries.append(entry)
     return safe_encode('\n'.join(entries))
 
 
@@ -232,41 +309,51 @@ def acl_get(path, item, st, numeric_ids=False, fd=None):
     cdef acl_t access_acl = NULL
     cdef char *default_text = NULL
     cdef char *access_text = NULL
+    cdef int ret = 0
 
-    if stat.S_ISLNK(st.st_mode):
-        # symlinks can not have ACLs
-        return
     if isinstance(path, str):
         path = os.fsencode(path)
-    if (fd is not None and acl_extended_fd(fd) <= 0
-        or
-        fd is None and acl_extended_file(path) <= 0):
+    if fd is not None:
+        ret = acl_extended_fd(fd)
+    else:
+        ret = acl_extended_file_nofollow(path)
+    if ret < 0:
+        raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
+    if ret == 0:
+        # there is no ACL defining permissions other than those defined by the traditional file permission bits.
+        # note: this should also be the case for symlink fs objects, as they can not have ACLs.
         return
     if numeric_ids:
-        converter = acl_numeric_ids
+        converter = _acl_from_numeric_to_numeric_with_id
     else:
-        converter = acl_append_numeric_ids
+        converter = _acl_from_numeric_to_named_with_id
     try:
         if fd is not None:
             access_acl = acl_get_fd(fd)
         else:
             access_acl = acl_get_file(path, ACL_TYPE_ACCESS)
-        if stat.S_ISDIR(st.st_mode):
-            # only directories can have a default ACL. there is no fd-based api to get it.
-            default_acl = acl_get_file(path, ACL_TYPE_DEFAULT)
-        if access_acl:
-            access_text = acl_to_text(access_acl, NULL)
-            if access_text:
-                item['acl_access'] = converter(access_text)
-        if default_acl:
-            default_text = acl_to_text(default_acl, NULL)
-            if default_text:
-                item['acl_default'] = converter(default_text)
+        if access_acl == NULL:
+            raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
+        access_text = acl_to_any_text(access_acl, NULL, '\n', TEXT_NUMERIC_IDS)
+        if access_text == NULL:
+            raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
+        item['acl_access'] = converter(access_text)
     finally:
-        acl_free(default_text)
-        acl_free(default_acl)
         acl_free(access_text)
         acl_free(access_acl)
+    if stat.S_ISDIR(st.st_mode):
+        # only directories can have a default ACL. there is no fd-based api to get it.
+        try:
+            default_acl = acl_get_file(path, ACL_TYPE_DEFAULT)
+            if default_acl == NULL:
+                raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
+            default_text = acl_to_any_text(default_acl, NULL, '\n', TEXT_NUMERIC_IDS)
+            if default_text == NULL:
+                raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
+            item['acl_default'] = converter(default_text)
+        finally:
+            acl_free(default_text)
+            acl_free(default_acl)
 
 
 def acl_set(path, item, numeric_ids=False, fd=None):
@@ -277,32 +364,90 @@ def acl_set(path, item, numeric_ids=False, fd=None):
         # Linux does not support setting ACLs on symlinks
         return
 
-    if fd is None and isinstance(path, str):
+    if isinstance(path, str):
         path = os.fsencode(path)
     if numeric_ids:
         converter = posix_acl_use_stored_uid_gid
     else:
         converter = acl_use_local_uid_gid
     access_text = item.get('acl_access')
-    if access_text:
+    if access_text is not None:
         try:
             access_acl = acl_from_text(<bytes>converter(access_text))
-            if access_acl:
-                if fd is not None:
-                    acl_set_fd(fd, access_acl)
-                else:
-                    acl_set_file(path, ACL_TYPE_ACCESS, access_acl)
+            if access_acl == NULL:
+                raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
+            if fd is not None:
+                if acl_set_fd(fd, access_acl) == -1:
+                    raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
+            else:
+                if acl_set_file(path, ACL_TYPE_ACCESS, access_acl) == -1:
+                    raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
         finally:
             acl_free(access_acl)
     default_text = item.get('acl_default')
-    if default_text:
+    if default_text is not None:
         try:
             default_acl = acl_from_text(<bytes>converter(default_text))
-            if default_acl:
-                # only directories can get a default ACL. there is no fd-based api to set it.
-                acl_set_file(path, ACL_TYPE_DEFAULT, default_acl)
+            if default_acl == NULL:
+                raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
+            # only directories can get a default ACL. there is no fd-based api to set it.
+            if acl_set_file(path, ACL_TYPE_DEFAULT, default_acl) == -1:
+                raise OSError(errno.errno, os.strerror(errno.errno), os.fsdecode(path))
         finally:
             acl_free(default_acl)
+
+
+# Linux kernel POSIX ACL xattr representation,
+# see linux/include/uapi/linux/posix_acl_xattr.h and linux/include/linux/posix_acl.h.
+_ACL_XATTR_VERSION = 2
+_ACL_UNDEFINED_ID = 0xFFFFFFFF
+# maps the ACL entry type to the e_tag values used for (unnamed, named) entries of that type.
+_ACL_TAGS = {
+    'user': (0x01, 0x02),   # ACL_USER_OBJ, ACL_USER
+    'group': (0x04, 0x08),  # ACL_GROUP_OBJ, ACL_GROUP
+    'mask': (0x10, None),   # ACL_MASK
+    'other': (0x20, None),  # ACL_OTHER
+}
+_ACL_PERMS = {'r': 4, 'w': 2, 'x': 1, '-': 0}
+
+
+def acl_text_to_xattr(acl, numeric_ids=False):
+    """Convert an ACL from the borg item text representation (acl_access / acl_default)
+    to the binary representation the Linux kernel uses for the system.posix_acl_access /
+    system.posix_acl_default extended attributes.
+
+    If `numeric_ids` is True, the stored numeric ids are used, otherwise the stored
+    user/group names are mapped to local uids/gids (falling back to the stored ids).
+
+    Raises ValueError for ACL text that can not be converted.
+    """
+    assert isinstance(acl, bytes)
+    converter = posix_acl_use_stored_uid_gid if numeric_ids else acl_use_local_uid_gid
+    entries = []
+    try:
+        for entry in safe_decode(converter(acl)).split('\n'):
+            if not entry:
+                continue
+            typ, qualifier, perm = entry.split(':')[:3]
+            unnamed_tag, named_tag = _ACL_TAGS[typ]
+            if qualifier:
+                if named_tag is None:
+                    raise ValueError(f"unexpected qualifier in ACL entry: {entry}")
+                tag, qid = named_tag, int(qualifier)
+            else:
+                tag, qid = unnamed_tag, _ACL_UNDEFINED_ID
+            perms = 0
+            for p in perm:
+                perms |= _ACL_PERMS[p]
+            entries.append((tag, perms, qid))
+    except (IndexError, KeyError, ValueError) as e:
+        raise ValueError(f"unsupported ACL: {acl!r}") from e
+    # the kernel expects the entries in canonical order: owner, named users, owning group,
+    # named groups, mask, other - with named entries sorted by id. the stored text should
+    # already be in this order (libacl produces it), but do not rely on that.
+    entries.sort(key=lambda e: (e[0], e[2]))
+    return b''.join([struct.pack('<I', _ACL_XATTR_VERSION)] +
+                    [struct.pack('<HHI', tag, perms, qid) for tag, perms, qid in entries])
 
 
 cdef _sync_file_range(fd, offset, length, flags):
@@ -332,28 +477,74 @@ else:
         disk in the immediate future.
         """
 
-        def __init__(self, path, binary=False):
-            super().__init__(path, binary)
+        def __init__(self, path, *, fd=None, binary=False):
+            super().__init__(path, fd=fd, binary=binary)
             self.offset = 0
             self.write_window = (16 * 1024 ** 2) & ~PAGE_MASK
             self.last_sync = 0
             self.pending_sync = None
 
         def write(self, data):
-            self.offset += self.fd.write(data)
+            self.offset += self.f.write(data)
             offset = self.offset & ~PAGE_MASK
             if offset >= self.last_sync + self.write_window:
-                self.fd.flush()
-                _sync_file_range(self.fileno, self.last_sync, offset - self.last_sync, SYNC_FILE_RANGE_WRITE)
+                self.f.flush()
+                _sync_file_range(self.fd, self.last_sync, offset - self.last_sync, SYNC_FILE_RANGE_WRITE)
                 if self.pending_sync is not None:
-                    _sync_file_range(self.fileno, self.pending_sync, self.last_sync - self.pending_sync,
+                    _sync_file_range(self.fd, self.pending_sync, self.last_sync - self.pending_sync,
                                      SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WAIT_AFTER)
                 self.pending_sync = self.last_sync
                 self.last_sync = offset
 
         def sync(self):
-            self.fd.flush()
-            os.fdatasync(self.fileno)
+            self.f.flush()
+            os.fdatasync(self.fd)
             # tell the OS that it does not need to cache what we just wrote,
             # avoids spoiling the cache for the OS and other processes.
-            safe_fadvise(self.fileno, 0, 0, 'DONTNEED')
+            safe_fadvise(self.fd, 0, 0, 'DONTNEED')
+
+
+_MOUNTINFO_ESCAPE_RE = re.compile(rb"\\([0-7]{3})")
+
+
+def _unescape_mountinfo(field):
+    # /proc/self/mountinfo escapes space, tab, newline and backslash as \040, \011, \012 and \134.
+    # It escapes bytes, so unescape bytes and decode the result, not the other way round.
+    return os.fsdecode(_MOUNTINFO_ESCAPE_RE.sub(lambda m: bytes([int(m.group(1), 8)]), field))
+
+
+def parse_mountinfo(lines):
+    """Parse the lines of /proc/self/mountinfo (bytes), see proc_pid_mountinfo(5).
+
+    Each line is: mount ID, parent ID, major:minor, root, mountpoint, mount options, zero or
+    more optional fields, a lone "-", fstype, source, super options. As the number of optional
+    fields varies, the fields after the separator are found from the separator, not from the start.
+    """
+    entries = []
+    for line in lines:
+        fields = line.split()
+        try:
+            sep = fields.index(b"-")
+        except ValueError:
+            continue  # not a mountinfo line
+        if sep < 5 or len(fields) < sep + 3:
+            continue
+        mountpoint, fstype, source = fields[4], fields[sep + 1], fields[sep + 2]
+        entries.append(MountEntry(_unescape_mountinfo(source), os.fsdecode(fstype), _unescape_mountinfo(mountpoint)))
+    return entries
+
+
+MOUNTINFO = "/proc/self/mountinfo"
+
+
+def list_mounts():
+    """See platform.base.list_mounts, Linux implementation via /proc/self/mountinfo.
+
+    Raises OSError if that file cannot be read (e.g. because /proc is not mounted).
+    """
+    try:
+        with open(MOUNTINFO, "rb") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        raise OSError(e.errno, f"cannot read {MOUNTINFO} (is /proc mounted?): {e.strerror}") from e
+    return parse_mountinfo(lines)

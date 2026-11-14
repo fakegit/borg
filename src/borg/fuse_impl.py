@@ -1,36 +1,66 @@
 """
-load library for lowlevel FUSE implementation
+Loads the library for the FUSE implementation.
 """
 
 import os
+import types
 
-BORG_FUSE_IMPL = os.environ.get('BORG_FUSE_IMPL', 'pyfuse3,llfuse')
+from .platform import ENOATTR  # noqa
 
-for FUSE_IMPL in BORG_FUSE_IMPL.split(','):
+BORG_FUSE_IMPL = os.environ.get("BORG_FUSE_IMPL", "mfusepy,pyfuse3,llfuse")
+
+hlfuse: types.ModuleType | None = None
+llfuse: types.ModuleType | None = None
+
+# import failures by implementation name, see issue #8657
+fuse_import_errors: dict[str, str] = {}
+
+for FUSE_IMPL in BORG_FUSE_IMPL.split(","):
     FUSE_IMPL = FUSE_IMPL.strip()
-    if FUSE_IMPL == 'pyfuse3':
+    if FUSE_IMPL == "pyfuse3":
         try:
-            import pyfuse3 as llfuse
-        except ImportError:
-            pass
+            import pyfuse3
+        except Exception as err:
+            fuse_import_errors[FUSE_IMPL] = str(err)
         else:
+            llfuse = pyfuse3
             has_llfuse = False
             has_pyfuse3 = True
+            has_mfusepy = False
+            has_any_fuse = True
+            hlfuse = None  # noqa
             break
-    elif FUSE_IMPL == 'llfuse':
+    elif FUSE_IMPL == "llfuse":
         try:
-            import llfuse
-        except ImportError:
-            pass
+            import llfuse as llfuse_module
+        except Exception as err:
+            fuse_import_errors[FUSE_IMPL] = str(err)
         else:
+            llfuse = llfuse_module
             has_llfuse = True
             has_pyfuse3 = False
+            has_mfusepy = False
+            has_any_fuse = True
+            hlfuse = None  # noqa
             break
-    elif FUSE_IMPL == 'none':
+    elif FUSE_IMPL == "mfusepy":
+        try:
+            import mfusepy
+        except Exception as err:  # mfusepy raises OSError (not ImportError) if libfuse is missing
+            fuse_import_errors[FUSE_IMPL] = str(err)
+        else:
+            hlfuse = mfusepy
+            has_llfuse = False
+            has_pyfuse3 = False
+            has_mfusepy = True
+            has_any_fuse = True
+            break
+    elif FUSE_IMPL == "none":
         pass
     else:
-        raise RuntimeError("unknown fuse implementation in BORG_FUSE_IMPL: '%s'" % BORG_FUSE_IMPL)
+        raise RuntimeError("Unknown FUSE implementation in BORG_FUSE_IMPL: '%s'." % BORG_FUSE_IMPL)
 else:
-    llfuse = None
     has_llfuse = False
     has_pyfuse3 = False
+    has_mfusepy = False
+    has_any_fuse = False

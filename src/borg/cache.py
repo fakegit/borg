@@ -1,245 +1,117 @@
 import configparser
+import io
 import os
 import shutil
 import stat
-from binascii import unhexlify
+import struct
 from collections import namedtuple
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from time import perf_counter
+
+from borghash import HashTableNT
+from borgstore.backends.errors import PermissionDenied
 
 from .logger import create_logger
 
 logger = create_logger()
 
-files_cache_logger = create_logger('borg.debug.files_cache')
+files_cache_logger = create_logger("borg.debug.files_cache")
 
-from .constants import CACHE_README, DEFAULT_FILES_CACHE_MODE
-from .hashindex import ChunkIndex, ChunkIndexEntry, CacheSynchronizer
-from .helpers import Location
+from borgstore.store import ItemInfo
+
+from .constants import CACHE_README, FILES_CACHE_MODE_DISABLED, ROBJ_FILE_STREAM, TIME_DIFFERS2_NS
+from .constants import CHUNKINDEX_FRAGMENT_ENTRIES_MIN, CHUNKINDEX_FRAGMENT_ENTRIES_MAX
+from .constants import CHUNKINDEX_SMALL_FRAGMENT_CAP, CHUNKINDEX_MERGE_ATTEMPTS, CHUNKINDEX_INVALID_SENTINEL
+from .hashindex import ChunkIndex, ChunkIndexEntry, ChunkIndexEntryFormat
 from .helpers import Error
-from .helpers import Manifest
-from .helpers import get_cache_dir, get_security_dir
-from .helpers import int_to_bigint, bigint_to_int, bin_to_hex, parse_stringified_list
-from .helpers import format_file_size
+from .helpers import get_cache_dir
+from .helpers import archive_hostname, archive_username
+from .helpers import chunkit
+from .helpers import CorruptPack, IntegrityError
+from .helpers import hex_to_bin, bin_to_hex
+from .helpers import format_file_size, safe_encode
 from .helpers import safe_ns
-from .helpers import yes
-from .helpers import remove_surrogates
-from .helpers import ProgressIndicatorPercent, ProgressIndicatorMessage
-from .helpers import set_ec, EXIT_WARNING
-from .helpers import truncate_and_unlink
+from .helpers import ProgressIndicatorMessage, ProgressIndicatorPercent, ProgressIndicatorSpinner, progress_wanted
+from .helpers import sig_int
 from .helpers import msgpack
-from .item import ArchiveItem, ChunkListEntry
-from .crypto.key import PlaintextKey
-from .crypto.file_integrity import IntegrityCheckedFile, DetachedIntegrityCheckedFile, FileIntegrityError
-from .locking import Lock
+from .helpers.msgpack import int_to_timestamp, timestamp_to_int
+from .item import ChunkListEntry
+from .crypto.key import store_hash
+from .crypto.sealed_stream import SealedStreamWriter, SealedStreamError, read_sealed_stream
+from .manifest import Manifest
 from .platform import SaveFile
-from .remote import cache_if_remote
-from .repository import LIST_SCAN_LIMIT
-
-# note: cmtime might me either a ctime or a mtime timestamp
-FileCacheEntry = namedtuple('FileCacheEntry', 'age inode size cmtime chunk_ids')
+from .repository import Repository, StoreObjectNotFound, PackReader
+from .security import SecurityManager, assert_secure  # noqa: F401
 
 
-class SecurityManager:
+def files_cache_name(archive_name, files_cache_name="files"):
     """
-    Tracks repositories. Ensures that nothing bad happens (repository swaps,
-    replay attacks, unknown repositories etc.).
+    Return the name of the files cache file for the given archive name.
 
-    This is complicated by the Cache being initially used for this, while
-    only some commands actually use the Cache, which meant that other commands
-    did not perform these checks.
-
-    Further complications were created by the Cache being a cache, so it
-    could be legitimately deleted, which is annoying because Borg didn't
-    recognize repositories after that.
-
-    Therefore a second location, the security database (see get_security_dir),
-    was introduced which stores this information. However, this means that
-    the code has to deal with a cache existing but no security DB entry,
-    or inconsistencies between the security DB and the cache which have to
-    be reconciled, and also with no cache existing but a security DB entry.
+    :param archive_name: name of the archive (ideally a series name)
+    :param files_cache_name: base name of the files cache file
+    :return: name of the files cache file
     """
+    suffix = os.environ.get("BORG_FILES_CACHE_SUFFIX", "")
+    # when using archive series, we automatically make up a separate cache file per series.
+    # when not, the user may manually do that by using the env var.
+    if not suffix:
+        # avoid issues with too complex or long archive_name by hashing it:
+        suffix = store_hash(archive_name.encode()).hexdigest()
+    return files_cache_name + "." + suffix
 
-    def __init__(self, repository):
-        self.repository = repository
-        self.dir = get_security_dir(repository.id_str)
-        self.cache_dir = cache_dir(repository)
-        self.key_type_file = os.path.join(self.dir, 'key-type')
-        self.location_file = os.path.join(self.dir, 'location')
-        self.manifest_ts_file = os.path.join(self.dir, 'manifest-timestamp')
 
-    @staticmethod
-    def destroy(repository, path=None):
-        """destroy the security dir for ``repository`` or at ``path``"""
-        path = path or get_security_dir(repository.id_str)
-        if os.path.exists(path):
-            shutil.rmtree(path)
+def archive_group_patterns(archive_name, group_by):
+    """
+    Build the match patterns selecting the archives belonging to the same group as a new archive.
 
-    def known(self):
-        return all(os.path.exists(f)
-                   for f in (self.key_type_file, self.location_file, self.manifest_ts_file))
-
-    def key_matches(self, key):
-        if not self.known():
-            return False
-        try:
-            with open(self.key_type_file, 'r') as fd:
-                type = fd.read()
-                return type == str(key.TYPE)
-        except OSError as exc:
-            logger.warning('Could not read/parse key type file: %s', exc)
-
-    def save(self, manifest, key):
-        logger.debug('security: saving state for %s to %s', self.repository.id_str, self.dir)
-        current_location = self.repository._location.canonical_path()
-        logger.debug('security: current location   %s', current_location)
-        logger.debug('security: key type           %s', str(key.TYPE))
-        logger.debug('security: manifest timestamp %s', manifest.timestamp)
-        with SaveFile(self.location_file) as fd:
-            fd.write(current_location)
-        with SaveFile(self.key_type_file) as fd:
-            fd.write(str(key.TYPE))
-        with SaveFile(self.manifest_ts_file) as fd:
-            fd.write(manifest.timestamp)
-
-    def assert_location_matches(self, cache_config=None):
-        # Warn user before sending data to a relocated repository
-        try:
-            with open(self.location_file) as fd:
-                previous_location = fd.read()
-            logger.debug('security: read previous location %r', previous_location)
-        except FileNotFoundError:
-            logger.debug('security: previous location file %s not found', self.location_file)
-            previous_location = None
-        except OSError as exc:
-            logger.warning('Could not read previous location file: %s', exc)
-            previous_location = None
-        if cache_config and cache_config.previous_location and previous_location != cache_config.previous_location:
-            # Reconcile cache and security dir; we take the cache location.
-            previous_location = cache_config.previous_location
-            logger.debug('security: using previous_location of cache: %r', previous_location)
-
-        repository_location = self.repository._location.canonical_path()
-        if previous_location and previous_location != repository_location:
-            msg = ("Warning: The repository at location {} was previously located at {}\n".format(
-                repository_location, previous_location) +
-                "Do you want to continue? [yN] ")
-            if not yes(msg, false_msg="Aborting.", invalid_msg="Invalid answer, aborting.",
-                       retry=False, env_var_override='BORG_RELOCATED_REPO_ACCESS_IS_OK'):
-                raise Cache.RepositoryAccessAborted()
-            # adapt on-disk config immediately if the new location was accepted
-            logger.debug('security: updating location stored in cache and security dir')
-            with SaveFile(self.location_file) as fd:
-                fd.write(repository_location)
-            if cache_config:
-                cache_config.save()
-
-    def assert_no_manifest_replay(self, manifest, key, cache_config=None):
-        try:
-            with open(self.manifest_ts_file) as fd:
-                timestamp = fd.read()
-            logger.debug('security: read manifest timestamp %r', timestamp)
-        except FileNotFoundError:
-            logger.debug('security: manifest timestamp file %s not found', self.manifest_ts_file)
-            timestamp = ''
-        except OSError as exc:
-            logger.warning('Could not read previous location file: %s', exc)
-            timestamp = ''
-        if cache_config:
-            timestamp = max(timestamp, cache_config.timestamp or '')
-        logger.debug('security: determined newest manifest timestamp as %s', timestamp)
-        # If repository is older than the cache or security dir something fishy is going on
-        if timestamp and timestamp > manifest.timestamp:
-            if isinstance(key, PlaintextKey):
-                raise Cache.RepositoryIDNotUnique()
-            else:
-                raise Cache.RepositoryReplay()
-
-    def assert_key_type(self, key, cache_config=None):
-        # Make sure an encrypted repository has not been swapped for an unencrypted repository
-        if cache_config and cache_config.key_type is not None and cache_config.key_type != str(key.TYPE):
-            raise Cache.EncryptionMethodMismatch()
-        if self.known() and not self.key_matches(key):
-            raise Cache.EncryptionMethodMismatch()
-
-    def assert_secure(self, manifest, key, *, cache_config=None, warn_if_unencrypted=True, lock_wait=None):
-        # warn_if_unencrypted=False is only used for initializing a new repository.
-        # Thus, avoiding asking about a repository that's currently initializing.
-        self.assert_access_unknown(warn_if_unencrypted, manifest, key)
-        if cache_config:
-            self._assert_secure(manifest, key, cache_config)
+    The new archive is named *archive_name* and gets stamped with this host and this user, so the
+    patterns describe the archives it continues, e.g. ["name:home", "host:myhost"] for the default
+    grouping. See "borg help match-archives" for the pattern syntax.
+    """
+    patterns = []
+    for group_by_key in group_by:
+        if group_by_key == "name":
+            patterns.append(f"name:{archive_name}")
+        elif group_by_key == "host":
+            patterns.append(f"host:{archive_hostname()}")
+        elif group_by_key == "user":
+            patterns.append(f"user:{archive_username()}")
         else:
-            cache_config = CacheConfig(self.repository, lock_wait=lock_wait)
-            if cache_config.exists():
-                with cache_config:
-                    self._assert_secure(manifest, key, cache_config)
-            else:
-                self._assert_secure(manifest, key)
-        logger.debug('security: repository checks ok, allowing access')
-
-    def _assert_secure(self, manifest, key, cache_config=None):
-        self.assert_location_matches(cache_config)
-        self.assert_key_type(key, cache_config)
-        self.assert_no_manifest_replay(manifest, key, cache_config)
-        if not self.known():
-            logger.debug('security: remembering previously unknown repository')
-            self.save(manifest, key)
-
-    def assert_access_unknown(self, warn_if_unencrypted, manifest, key):
-        # warn_if_unencrypted=False is only used for initializing a new repository.
-        # Thus, avoiding asking about a repository that's currently initializing.
-        if not key.logically_encrypted and not self.known():
-            msg = ("Warning: Attempting to access a previously unknown unencrypted repository!\n" +
-                   "Do you want to continue? [yN] ")
-            allow_access = not warn_if_unencrypted or yes(msg, false_msg="Aborting.",
-                invalid_msg="Invalid answer, aborting.",
-                retry=False, env_var_override='BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK')
-            if allow_access:
-                if warn_if_unencrypted:
-                    logger.debug('security: remembering unknown unencrypted repository (explicitly allowed)')
-                else:
-                    logger.debug('security: initializing unencrypted repository')
-                self.save(manifest, key)
-            else:
-                raise Cache.CacheInitAbortedError()
+            raise ValueError(f"invalid group-by key: {group_by_key}")
+    return patterns
 
 
-def assert_secure(repository, manifest, lock_wait):
-    sm = SecurityManager(repository)
-    sm.assert_secure(manifest, manifest.key, lock_wait=lock_wait)
+def discover_files_cache_names(path, files_cache_name="files"):
+    """
+    Return a list of all files cache file names in the given directory.
+
+    :param path: path to the directory to search in
+    :param files_cache_name: base name of the files cache files
+    :return: list of files cache file names
+    """
+    return [p.name for p in path.iterdir() if p.name.startswith(files_cache_name + ".")]
 
 
-def recanonicalize_relative_location(cache_location, repository):
-    # borg < 1.0.8rc1 had different canonicalization for the repo location (see #1655 and #1741).
-    repo_location = repository._location.canonical_path()
-    rl = Location(repo_location)
-    cl = Location(cache_location)
-    if cl.proto == rl.proto and cl.user == rl.user and cl.host == rl.host and cl.port == rl.port \
-            and \
-            cl.path and rl.path and \
-            cl.path.startswith('/~/') and rl.path.startswith('/./') and cl.path[3:] == rl.path[3:]:
-        # everything is same except the expected change in relative path canonicalization,
-        # update previous_location to avoid warning / user query about changed location:
-        return repo_location
-    else:
-        return cache_location
+# chunks is a list of ChunkListEntry, digests is a dict (see item.digests) or None.
+# digests has a default, so that a files cache written by a borg without it still loads.
+FileCacheEntry = namedtuple("FileCacheEntry", "age inode size ctime mtime chunks digests", defaults=(None,))
+
+# domain prefix of the sealed stream context of a files cache, see FilesCacheMixin._files_cache_context.
+FILES_CACHE_AAD = b"borg-files-cache\0"
 
 
 def cache_dir(repository, path=None):
-    return path or os.path.join(get_cache_dir(), repository.id_str)
-
-
-def files_cache_name():
-    suffix = os.environ.get('BORG_FILES_CACHE_SUFFIX', '')
-    return 'files.' + suffix if suffix else 'files'
+    return Path(path) if path else Path(get_cache_dir()) / repository.id_str
 
 
 class CacheConfig:
-    def __init__(self, repository, path=None, lock_wait=None):
+    def __init__(self, repository, path=None):
         self.repository = repository
         self.path = cache_dir(repository, path)
-        self.config_path = os.path.join(self.path, 'config')
-        self.lock = None
-        self.lock_wait = lock_wait
+        logger.debug("Using %s as cache", self.path)
+        self.config_path = self.path / "config"
 
     def __enter__(self):
         self.open()
@@ -249,715 +121,347 @@ class CacheConfig:
         self.close()
 
     def exists(self):
-        return os.path.exists(self.config_path)
+        return self.config_path.exists()
 
     def create(self):
         assert not self.exists()
         config = configparser.ConfigParser(interpolation=None)
-        config.add_section('cache')
-        config.set('cache', 'version', '1')
-        config.set('cache', 'repository', self.repository.id_str)
-        config.set('cache', 'manifest', '')
-        config.add_section('integrity')
-        config.set('integrity', 'manifest', '')
+        config.add_section("cache")
+        config.set("cache", "version", "1")
+        config.set("cache", "repository", self.repository.id_str)
         with SaveFile(self.config_path) as fd:
             config.write(fd)
 
     def open(self):
-        self.lock = Lock(os.path.join(self.path, 'lock'), exclusive=True, timeout=self.lock_wait).acquire()
         self.load()
 
     def load(self):
         self._config = configparser.ConfigParser(interpolation=None)
-        with open(self.config_path) as fd:
+        with self.config_path.open() as fd:
             self._config.read_file(fd)
         self._check_upgrade(self.config_path)
-        self.id = self._config.get('cache', 'repository')
-        self.manifest_id = unhexlify(self._config.get('cache', 'manifest'))
-        self.timestamp = self._config.get('cache', 'timestamp', fallback=None)
-        self.key_type = self._config.get('cache', 'key_type', fallback=None)
-        self.ignored_features = set(parse_stringified_list(self._config.get('cache', 'ignored_features', fallback='')))
-        self.mandatory_features = set(parse_stringified_list(self._config.get('cache', 'mandatory_features', fallback='')))
-        try:
-            self.integrity = dict(self._config.items('integrity'))
-            if self._config.get('cache', 'manifest') != self.integrity.pop('manifest'):
-                # The cache config file is updated (parsed with ConfigParser, the state of the ConfigParser
-                # is modified and then written out.), not re-created.
-                # Thus, older versions will leave our [integrity] section alone, making the section's data invalid.
-                # Therefore, we also add the manifest ID to this section and
-                # can discern whether an older version interfered by comparing the manifest IDs of this section
-                # and the main [cache] section.
-                self.integrity = {}
-                logger.warning('Cache integrity data not available: old Borg version modified the cache.')
-        except configparser.NoSectionError:
-            logger.debug('Cache integrity: No integrity data found (files, chunks). Cache is from old version.')
-            self.integrity = {}
-        previous_location = self._config.get('cache', 'previous_location', fallback=None)
-        if previous_location:
-            self.previous_location = recanonicalize_relative_location(previous_location, self.repository)
-        else:
-            self.previous_location = None
-        self._config.set('cache', 'previous_location', self.repository._location.canonical_path())
-
-    def save(self, manifest=None, key=None):
-        if manifest:
-            self._config.set('cache', 'manifest', manifest.id_str)
-            self._config.set('cache', 'timestamp', manifest.timestamp)
-            self._config.set('cache', 'ignored_features', ','.join(self.ignored_features))
-            self._config.set('cache', 'mandatory_features', ','.join(self.mandatory_features))
-            if not self._config.has_section('integrity'):
-                self._config.add_section('integrity')
-            for file, integrity_data in self.integrity.items():
-                self._config.set('integrity', file, integrity_data)
-            self._config.set('integrity', 'manifest', manifest.id_str)
-        if key:
-            self._config.set('cache', 'key_type', str(key.TYPE))
-        with SaveFile(self.config_path) as fd:
-            self._config.write(fd)
+        self.id = self._config.get("cache", "repository")
 
     def close(self):
-        if self.lock is not None:
-            self.lock.release()
-            self.lock = None
+        pass
 
     def _check_upgrade(self, config_path):
         try:
-            cache_version = self._config.getint('cache', 'version')
+            cache_version = self._config.getint("cache", "version")
             wanted_version = 1
             if cache_version != wanted_version:
                 self.close()
-                raise Exception('%s has unexpected cache version %d (wanted: %d).' %
-                                (config_path, cache_version, wanted_version))
+                raise Exception(
+                    "%s has unexpected cache version %d (wanted: %d)." % (config_path, cache_version, wanted_version)
+                )
         except configparser.NoSectionError:
             self.close()
-            raise Exception('%s does not look like a Borg cache.' % config_path) from None
+            raise Exception("%s does not look like a Borg cache." % config_path) from None
 
 
 class Cache:
-    """Client Side cache
-    """
-    class RepositoryIDNotUnique(Error):
-        """Cache is newer than repository - do you have multiple, independently updated repos with same ID?"""
+    """Client Side cache"""
 
-    class RepositoryReplay(Error):
-        """Cache, or information obtained from the security directory is newer than repository - this is either an attack or unsafe (multiple repos with same ID)"""
-
-    class CacheInitAbortedError(Error):
-        """Cache initialization aborted"""
-
-    class RepositoryAccessAborted(Error):
-        """Repository access aborted"""
-
-    class EncryptionMethodMismatch(Error):
-        """Repository encryption method changed since last access, refusing to continue"""
+    from .security import (
+        CacheInitAbortedError,
+        EncryptionMethodMismatch,
+        RepositoryAccessAborted,
+        RepositoryIDNotUnique,
+        RepositoryReplay,
+    )  # noqa: F401
 
     @staticmethod
     def break_lock(repository, path=None):
-        path = cache_dir(repository, path)
-        Lock(os.path.join(path, 'lock'), exclusive=True).break_lock()
+        pass
 
     @staticmethod
     def destroy(repository, path=None):
         """destroy the cache for ``repository`` or at ``path``"""
-        path = path or os.path.join(get_cache_dir(), repository.id_str)
-        config = os.path.join(path, 'config')
-        if os.path.exists(config):
-            os.remove(config)  # kill config first
+        path = cache_dir(repository, path)
+        config = path / "config"
+        if config.exists():
+            config.unlink()  # kill config first
             shutil.rmtree(path)
 
-    def __new__(cls, repository, key, manifest, path=None, sync=True, warn_if_unencrypted=True,
-                progress=False, lock_wait=None, permit_adhoc_cache=False, cache_mode=DEFAULT_FILES_CACHE_MODE,
-                consider_part_files=False):
-
-        def local():
-            return LocalCache(repository=repository, key=key, manifest=manifest, path=path, sync=sync,
-                              warn_if_unencrypted=warn_if_unencrypted, progress=progress,
-                              lock_wait=lock_wait, cache_mode=cache_mode, consider_part_files=consider_part_files)
-
-        def adhoc():
-            return AdHocCache(repository=repository, key=key, manifest=manifest, lock_wait=lock_wait,
-                              consider_part_files=consider_part_files)
-
-        if not permit_adhoc_cache:
-            return local()
-
-        # ad-hoc cache may be permitted, but if the local cache is in sync it'd be stupid to invalidate
-        # it by needlessly using the ad-hoc cache.
-        # Check if the local cache exists and is in sync.
-
-        cache_config = CacheConfig(repository, path, lock_wait)
-        if cache_config.exists():
-            with cache_config:
-                cache_in_sync = cache_config.manifest_id == manifest.id
-            # Don't nest cache locks
-            if cache_in_sync:
-                # Local cache is in sync, use it
-                logger.debug('Cache: choosing local cache (in sync)')
-                return local()
-        logger.debug('Cache: choosing ad-hoc cache (local cache does not exist or is not in sync)')
-        return adhoc()
+    def __new__(
+        cls,
+        repository,
+        manifest,
+        path=None,
+        sync=True,
+        warn_if_unencrypted=True,
+        progress=False,
+        cache_mode=FILES_CACHE_MODE_DISABLED,
+        archive_name=None,
+        archive_group_by=(),
+        start_backup=None,
+    ):
+        return AdHocWithFilesCache(
+            manifest=manifest,
+            path=path,
+            warn_if_unencrypted=warn_if_unencrypted,
+            progress=progress,
+            cache_mode=cache_mode,
+            archive_name=archive_name,
+            archive_group_by=archive_group_by,
+            start_backup=start_backup,
+        )
 
 
-class CacheStatsMixin:
-    str_format = """\
-All archives:   {0.total_size:>20s} {0.total_csize:>20s} {0.unique_csize:>20s}
-
-                       Unique chunks         Total chunks
-Chunk index:    {0.total_unique_chunks:20d} {0.total_chunks:20d}"""
-
-    def __str__(self):
-        return self.str_format.format(self.format_tuple())
-
-    Summary = namedtuple('Summary', ['total_size', 'total_csize', 'unique_size', 'unique_csize', 'total_unique_chunks',
-                                     'total_chunks'])
-
-    def stats(self):
-        from .archive import Archive
-        # XXX: this should really be moved down to `hashindex.pyx`
-        total_size, total_csize, unique_size, unique_csize, total_unique_chunks, total_chunks = self.chunks.summarize()
-        # the above values have the problem that they do not consider part files,
-        # thus the total_size and total_csize might be too high (chunks referenced
-        # by the part files AND by the complete file).
-        # since borg 1.2 we have new archive metadata telling the total size and
-        # csize per archive, so we can just sum up all archives to get the "all
-        # archives" stats:
-        total_size, total_csize = 0, 0
-        for archive_name in self.manifest.archives:
-            archive = Archive(self.repository, self.key, self.manifest, archive_name,
-                              consider_part_files=self.consider_part_files)
-            stats = archive.calc_stats(self, want_unique=False)
-            total_size += stats.osize
-            total_csize += stats.csize
-        stats = self.Summary(total_size, total_csize, unique_size, unique_csize,
-                             total_unique_chunks, total_chunks)._asdict()
-        return stats
-
-    def format_tuple(self):
-        stats = self.stats()
-        for field in ['total_size', 'total_csize', 'unique_csize']:
-            stats[field] = format_file_size(stats[field])
-        return self.Summary(**stats)
-
-    def chunks_stored_size(self):
-        return self.stats()['unique_csize']
-
-
-class LocalCache(CacheStatsMixin):
+class FilesCacheMixin:
     """
-    Persistent, local (client-side) cache.
+    Massively accelerate processing of unchanged files.
+    We read the "files cache" (either from cache directory or from previous archive
+    in repo) that has metadata for all "already stored" files, like size, ctime/mtime,
+    inode number and chunks id/size list.
+    When finding a file on disk, we use the metadata to determine if the file is unchanged.
+    If so, we use the cached chunks list and skip reading/chunking the file contents.
     """
 
-    def __init__(self, repository, key, manifest, path=None, sync=True, warn_if_unencrypted=True,
-                 progress=False, lock_wait=None, cache_mode=DEFAULT_FILES_CACHE_MODE, consider_part_files=False):
-        """
-        :param warn_if_unencrypted: print warning if accessing unknown unencrypted repository
-        :param lock_wait: timeout for lock acquisition (int [s] or None [wait forever])
-        :param sync: do :meth:`.sync`
-        :param cache_mode: what shall be compared in the file stat infos vs. cached stat infos comparison
-        """
-        self.repository = repository
-        self.key = key
-        self.manifest = manifest
-        self.progress = progress
+    FILES_CACHE_NAME = "files"
+
+    def __init__(self, cache_mode, archive_name=None, archive_group_by=(), start_backup=None):
+        self.archive_name = archive_name  # ideally a SERIES name
+        self.archive_group_by = archive_group_by  # archive attributes identifying the previous archive
+        assert not ("c" in cache_mode and "m" in cache_mode)
+        assert "d" in cache_mode or "c" in cache_mode or "m" in cache_mode
         self.cache_mode = cache_mode
-        self.consider_part_files = consider_part_files
-        self.timestamp = None
-        self.txn_active = False
+        self._files = None
+        self._newest_cmtime = None  # None means "no file was chunked/seen yet", see _write_files_cache
+        self._newest_path_hashes = set()
+        self.start_backup = start_backup
 
-        self.path = cache_dir(repository, path)
-        self.security_manager = SecurityManager(repository)
-        self.cache_config = CacheConfig(self.repository, self.path, lock_wait)
-
-        # Warn user before sending data to a never seen before unencrypted repository
-        if not os.path.exists(self.path):
-            self.security_manager.assert_access_unknown(warn_if_unencrypted, manifest, key)
-            self.create()
-
-        self.open()
-        try:
-            self.security_manager.assert_secure(manifest, key, cache_config=self.cache_config)
-
-            if not self.check_cache_compatibility():
-                self.wipe_cache()
-
-            self.update_compatibility()
-
-            if sync and self.manifest.id != self.cache_config.manifest_id:
-                self.sync()
-                self.commit()
-        except:
-            self.close()
-            raise
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def create(self):
-        """Create a new empty cache at `self.path`
+    def compress_entry(self, entry):
         """
-        os.makedirs(self.path)
-        with open(os.path.join(self.path, 'README'), 'w') as fd:
-            fd.write(CACHE_README)
-        self.cache_config.create()
-        ChunkIndex().write(os.path.join(self.path, 'chunks'))
-        os.makedirs(os.path.join(self.path, 'chunks.archive.d'))
-        with SaveFile(os.path.join(self.path, files_cache_name()), binary=True):
-            pass  # empty file
+        compress a files cache entry:
 
-    def _do_open(self):
-        self.cache_config.load()
-        with IntegrityCheckedFile(path=os.path.join(self.path, 'chunks'), write=False,
-                                  integrity_data=self.cache_config.integrity.get('chunks')) as fd:
-            self.chunks = ChunkIndex.read(fd)
-        if 'd' in self.cache_mode:  # d(isabled)
-            self.files = None
-        else:
-            self._read_files()
+        - use the ChunkIndex to "compress" the entry's chunks list (256bit key + 32bit size -> 32bit index).
+        - use msgpack to pack the entry (reduce memory usage by packing and having less python objects).
 
-    def open(self):
-        if not os.path.isdir(self.path):
-            raise Exception('%s Does not look like a Borg cache' % self.path)
-        self.cache_config.open()
-        self.rollback()
+        Note: the result is only valid while the ChunkIndex is in memory!
+        """
+        assert isinstance(self.chunks, ChunkIndex), f"{self.chunks} is not a ChunkIndex"
+        assert isinstance(entry, FileCacheEntry)
+        compressed_chunks = []
+        for id, size in entry.chunks:
+            cie = self.chunks[id]  # may raise KeyError if chunk id is not in repo
+            if cie.size == 0:  # size is not known in the chunks index yet
+                self.chunks[id] = cie._replace(size=size)
+            else:
+                assert size == cie.size, f"{size} != {cie.size}"
+            idx = self.chunks.k_to_idx(id)
+            compressed_chunks.append(idx)
+        entry = entry._replace(chunks=compressed_chunks)
+        return msgpack.packb(entry)
 
-    def close(self):
-        if self.cache_config is not None:
-            self.cache_config.close()
-            self.cache_config = None
+    def decompress_entry(self, entry_packed):
+        """reverse operation of compress_entry"""
+        assert isinstance(self.chunks, ChunkIndex), f"{self.chunks} is not a ChunkIndex"
+        assert isinstance(entry_packed, bytes)
+        entry = msgpack.unpackb(entry_packed)
+        entry = FileCacheEntry(*entry)
+        chunks = []
+        for idx in entry.chunks:
+            assert isinstance(idx, int), f"{idx} is not an int"
+            id = self.chunks.idx_to_k(idx)
+            cie = self.chunks[id]
+            assert cie.size > 0
+            chunks.append((id, cie.size))
+        entry = entry._replace(chunks=chunks)
+        return entry
 
-    def _read_files(self):
-        self.files = {}
-        self._newest_cmtime = None
-        logger.debug('Reading files cache ...')
-        files_cache_logger.debug("FILES-CACHE-LOAD: starting...")
-        msg = None
+    @property
+    def files(self):
+        if self._files is None:
+            self._files = self._read_files_cache()  # try loading from cache dir
+        if self._files is None:
+            self._files = self._build_files_cache()  # try loading from repository
+        if self._files is None:
+            self._files = {}  # start from scratch
+        return self._files
+
+    def _build_files_cache(self):
+        """rebuild the files cache by reading previous archive from repository"""
+        if "d" in self.cache_mode:  # d(isabled)
+            return
+
+        if not self.archive_name:
+            return
+
+        from .archive import Archive
+
+        # Get the latest archive of the same group, supporting archive series. Matching the name
+        # alone is not enough in a repository shared by multiple hosts or users, because they may
+        # use the same series name for their own, unrelated data - we would then build our files
+        # cache from a foreign archive, which just wastes time as almost nothing would match.
+        match = archive_group_patterns(self.archive_name, self.archive_group_by)
         try:
-            with IntegrityCheckedFile(path=os.path.join(self.path, files_cache_name()), write=False,
-                                      integrity_data=self.cache_config.integrity.get(files_cache_name())) as fd:
+            archives = self.manifest.archives.list(match=match, sort_by=["ts"], last=1)
+        except PermissionDenied:  # maybe repo is in write-only mode?
+            archives = None
+        if not archives:
+            # nothing found
+            return
+        prev_archive = archives[0]
+
+        files = {}
+        logger.debug(
+            f"Building files cache from {prev_archive.name} {prev_archive.ts} {bin_to_hex(prev_archive.id)} ..."
+        )
+        files_cache_logger.debug("FILES-CACHE-BUILD: starting...")
+        archive = Archive(self.manifest, prev_archive.id)
+        for item in archive.iter_items():
+            # only put regular files' infos into the files cache:
+            if stat.S_ISREG(item.mode):
+                path_hash = self.key.id_hash(safe_encode(item.path))
+                # an item does not necessarily have all of these timestamps: --noctime omits ctime,
+                # on Windows ctime is never archived (it is the file creation time there, see #8730)
+                # and very old archives only have mtime.
+                ctime_ns = item.get("ctime")
+                mtime_ns = item.get("mtime")
+                # keep track of the key(s) for the most recent timestamp(s):
+                for timestamp_ns in (ctime_ns, mtime_ns):
+                    if timestamp_ns is None:
+                        continue
+                    if self._newest_cmtime is None or timestamp_ns > self._newest_cmtime:
+                        self._newest_cmtime = timestamp_ns
+                        self._newest_path_hashes = {path_hash}
+                    elif timestamp_ns == self._newest_cmtime:
+                        self._newest_path_hashes.add(path_hash)
+                # Add the file to the in-memory files cache. A timestamp the archive does not have
+                # is cached as 0, so it can not compare equal to the timestamp seen in the file
+                # system: if that timestamp is part of the files cache mode, the file is considered
+                # changed and gets chunked again, which is the safe outcome.
+                entry = FileCacheEntry(
+                    age=0,
+                    inode=item.get("inode", 0),
+                    size=item.size,
+                    ctime=int_to_timestamp(0 if ctime_ns is None else ctime_ns),
+                    mtime=int_to_timestamp(0 if mtime_ns is None else mtime_ns),
+                    chunks=item.chunks,
+                    digests=item.get("digests"),
+                )
+                # note: if the repo is an a valid state, next line should not fail with KeyError:
+                files[path_hash] = self.compress_entry(entry)
+        # deal with special snapshot / timestamp granularity case, see FAQ:
+        for path_hash in self._newest_path_hashes:
+            del files[path_hash]
+        files_cache_logger.debug("FILES-CACHE-BUILD: finished, %d entries loaded.", len(files))
+        return files
+
+    def files_cache_name(self):
+        return files_cache_name(self.archive_name, self.FILES_CACHE_NAME)
+
+    def discover_files_cache_names(self, path):
+        return discover_files_cache_names(path, self.FILES_CACHE_NAME)
+
+    def _files_cache_context(self):
+        """
+        Return the sealed stream context of the files cache (see borg.crypto.sealed_stream).
+
+        It binds the files cache to the repository and to its file name, so a files cache copied from
+        another repository (using the same key material) or from another archive series is rejected.
+        """
+        return FILES_CACHE_AAD + self.repository.id + self.files_cache_name().encode()
+
+    def _read_files_cache(self):
+        """read files cache from cache directory"""
+        if "d" in self.cache_mode:  # d(isabled)
+            return
+
+        files = {}
+        logger.debug("Reading files cache ...")
+        files_cache_logger.debug("FILES-CACHE-LOAD: starting...")
+        name = self.files_cache_name()
+        msg = warning = None
+        try:
+            with open(self.path / name, "rb") as fd:
                 u = msgpack.Unpacker(use_list=True)
-                while True:
-                    data = fd.read(64 * 1024)
-                    if not data:
-                        break
+                # the payloads are only trustworthy once the whole stream is read, so `files` is
+                # discarded below if reading the sealed stream fails at any frame.
+                for data in read_sealed_stream(fd, self.key, self._files_cache_context()):
                     u.feed(data)
                     try:
-                        for path_hash, item in u:
-                            entry = FileCacheEntry(*item)
-                            # in the end, this takes about 240 Bytes per file
-                            self.files[path_hash] = msgpack.packb(entry._replace(age=entry.age + 1))
+                        for path_hash, entry in u:
+                            entry = FileCacheEntry(*entry)
+                            entry = entry._replace(age=entry.age + 1)
+                            try:
+                                files[path_hash] = self.compress_entry(entry)
+                            except KeyError:
+                                # repo is missing a chunk referenced from entry
+                                logger.debug(f"compress_entry failed for {entry}, skipping.")
                     except (TypeError, ValueError) as exc:
-                        msg = "The files cache seems invalid. [%s]" % str(exc)
+                        # authenticated, but not what we expect - only possible through a bug.
+                        warning = f"Ignoring invalid files cache {name} [{exc}], it will be rebuilt."
                         break
         except OSError as exc:
             msg = "The files cache can't be read. [%s]" % str(exc)
-        except FileIntegrityError as fie:
-            msg = "The files cache is corrupted. [%s]" % str(fie)
+        except SealedStreamError as exc:
+            # corrupted, tampered with, or not written with this repository's key.
+            warning = f"Ignoring corrupted files cache {name} [{exc}], it will be rebuilt."
+        if warning is not None:
+            logger.warning(warning)
+            files = None
         if msg is not None:
-            logger.warning(msg)
-            logger.warning('Continuing without files cache - expect lower performance.')
-            self.files = {}
-        files_cache_logger.debug("FILES-CACHE-LOAD: finished, %d entries loaded.", len(self.files))
+            logger.debug(msg)
+            files = None
+        files_cache_logger.debug("FILES-CACHE-LOAD: finished, %d entries loaded.", len(files or {}))
+        return files
 
-    def begin_txn(self):
-        # Initialize transaction snapshot
-        pi = ProgressIndicatorMessage(msgid='cache.begin_transaction')
-        txn_dir = os.path.join(self.path, 'txn.tmp')
-        os.mkdir(txn_dir)
-        pi.output('Initializing cache transaction: Reading config')
-        shutil.copy(os.path.join(self.path, 'config'), txn_dir)
-        pi.output('Initializing cache transaction: Reading chunks')
-        shutil.copy(os.path.join(self.path, 'chunks'), txn_dir)
-        pi.output('Initializing cache transaction: Reading files')
-        try:
-            shutil.copy(os.path.join(self.path, files_cache_name()), txn_dir)
-        except FileNotFoundError:
-            with SaveFile(os.path.join(txn_dir, files_cache_name()), binary=True):
-                pass  # empty file
-        os.rename(os.path.join(self.path, 'txn.tmp'),
-                  os.path.join(self.path, 'txn.active'))
-        self.txn_active = True
-        pi.finish()
-
-    def commit(self):
-        """Commit transaction
-        """
-        if not self.txn_active:
-            return
-        self.security_manager.save(self.manifest, self.key)
-        pi = ProgressIndicatorMessage(msgid='cache.commit')
-        if self.files is not None:
-            if self._newest_cmtime is None:
-                # was never set because no files were modified/added
-                self._newest_cmtime = 2 ** 63 - 1  # nanoseconds, good until y2262
-            ttl = int(os.environ.get('BORG_FILES_CACHE_TTL', 20))
-            pi.output('Saving files cache')
-            files_cache_logger.debug("FILES-CACHE-SAVE: starting...")
-            with IntegrityCheckedFile(path=os.path.join(self.path, files_cache_name()), write=True) as fd:
-                entry_count = 0
-                for path_hash, item in self.files.items():
-                    # Only keep files seen in this backup that are older than newest cmtime seen in this backup -
-                    # this is to avoid issues with filesystem snapshots and cmtime granularity.
-                    # Also keep files from older backups that have not reached BORG_FILES_CACHE_TTL yet.
-                    entry = FileCacheEntry(*msgpack.unpackb(item))
-                    if entry.age == 0 and bigint_to_int(entry.cmtime) < self._newest_cmtime or \
-                       entry.age > 0 and entry.age < ttl:
-                        msgpack.pack((path_hash, entry), fd)
-                        entry_count += 1
-            files_cache_logger.debug("FILES-CACHE-KILL: removed all old entries with age >= TTL [%d]", ttl)
-            files_cache_logger.debug("FILES-CACHE-KILL: removed all current entries with newest cmtime %d", self._newest_cmtime)
-            files_cache_logger.debug("FILES-CACHE-SAVE: finished, %d remaining entries saved.", entry_count)
-            self.cache_config.integrity[files_cache_name()] = fd.integrity_data
-        pi.output('Saving chunks cache')
-        with IntegrityCheckedFile(path=os.path.join(self.path, 'chunks'), write=True) as fd:
-            self.chunks.write(fd)
-        self.cache_config.integrity['chunks'] = fd.integrity_data
-        pi.output('Saving cache config')
-        self.cache_config.save(self.manifest, self.key)
-        os.rename(os.path.join(self.path, 'txn.active'),
-                  os.path.join(self.path, 'txn.tmp'))
-        shutil.rmtree(os.path.join(self.path, 'txn.tmp'))
-        self.txn_active = False
-        pi.finish()
-
-    def rollback(self):
-        """Roll back partial and aborted transactions
-        """
-        # Remove partial transaction
-        if os.path.exists(os.path.join(self.path, 'txn.tmp')):
-            shutil.rmtree(os.path.join(self.path, 'txn.tmp'))
-        # Roll back active transaction
-        txn_dir = os.path.join(self.path, 'txn.active')
-        if os.path.exists(txn_dir):
-            shutil.copy(os.path.join(txn_dir, 'config'), self.path)
-            shutil.copy(os.path.join(txn_dir, 'chunks'), self.path)
-            shutil.copy(os.path.join(txn_dir, files_cache_name()), self.path)
-            os.rename(txn_dir, os.path.join(self.path, 'txn.tmp'))
-            if os.path.exists(os.path.join(self.path, 'txn.tmp')):
-                shutil.rmtree(os.path.join(self.path, 'txn.tmp'))
-        self.txn_active = False
-        self._do_open()
-
-    def sync(self):
-        """Re-synchronize chunks cache with repository.
-
-        Maintains a directory with known backup archive indexes, so it only
-        needs to fetch infos from repo and build a chunk index once per backup
-        archive.
-        If out of sync, missing archive indexes get added, outdated indexes
-        get removed and a new master chunks index is built by merging all
-        archive indexes.
-        """
-        archive_path = os.path.join(self.path, 'chunks.archive.d')
-        # An index of chunks whose size had to be fetched
-        chunks_fetched_size_index = ChunkIndex()
-        # Instrumentation
-        processed_item_metadata_bytes = 0
-        processed_item_metadata_chunks = 0
-        compact_chunks_archive_saved_space = 0
-        fetched_chunks_for_csize = 0
-        fetched_bytes_for_csize = 0
-
-        def mkpath(id, suffix=''):
-            id_hex = bin_to_hex(id)
-            path = os.path.join(archive_path, id_hex + suffix)
-            return path
-
-        def cached_archives():
-            if self.do_cache:
-                fns = os.listdir(archive_path)
-                # filenames with 64 hex digits == 256bit,
-                # or compact indices which are 64 hex digits + ".compact"
-                return set(unhexlify(fn) for fn in fns if len(fn) == 64) | \
-                       set(unhexlify(fn[:64]) for fn in fns if len(fn) == 72 and fn.endswith('.compact'))
-            else:
-                return set()
-
-        def repo_archives():
-            return set(info.id for info in self.manifest.archives.list())
-
-        def cleanup_outdated(ids):
-            for id in ids:
-                cleanup_cached_archive(id)
-
-        def cleanup_cached_archive(id, cleanup_compact=True):
-            try:
-                os.unlink(mkpath(id))
-                os.unlink(mkpath(id) + '.integrity')
-            except FileNotFoundError:
-                pass
-            if not cleanup_compact:
-                return
-            try:
-                os.unlink(mkpath(id, suffix='.compact'))
-                os.unlink(mkpath(id, suffix='.compact') + '.integrity')
-            except FileNotFoundError:
-                pass
-
-        def fetch_missing_csize(chunk_idx):
-            """
-            Archives created with AdHocCache will have csize=0 in all chunk list entries whose
-            chunks were already in the repository.
-
-            Scan *chunk_idx* for entries where csize=0 and fill in the correct information.
-            """
-            nonlocal fetched_chunks_for_csize
-            nonlocal fetched_bytes_for_csize
-
-            all_missing_ids = chunk_idx.zero_csize_ids()
-            fetch_ids = []
-            if len(chunks_fetched_size_index):
-                for id_ in all_missing_ids:
-                    already_fetched_entry = chunks_fetched_size_index.get(id_)
-                    if already_fetched_entry:
-                        entry = chunk_idx[id_]._replace(csize=already_fetched_entry.csize)
-                        assert entry.size == already_fetched_entry.size, 'Chunk size mismatch'
-                        chunk_idx[id_] = entry
-                    else:
-                        fetch_ids.append(id_)
-            else:
-                fetch_ids = all_missing_ids
-
-            # This is potentially a rather expensive operation, but it's hard to tell at this point
-            # if it's a problem in practice (hence the experimental status of --no-cache-sync).
-            for id_, data in zip(fetch_ids, decrypted_repository.repository.get_many(fetch_ids)):
-                entry = chunk_idx[id_]._replace(csize=len(data))
-                chunk_idx[id_] = entry
-                chunks_fetched_size_index[id_] = entry
-                fetched_chunks_for_csize += 1
-                fetched_bytes_for_csize += len(data)
-
-        def fetch_and_build_idx(archive_id, decrypted_repository, chunk_idx):
-            nonlocal processed_item_metadata_bytes
-            nonlocal processed_item_metadata_chunks
-            csize, data = decrypted_repository.get(archive_id)
-            chunk_idx.add(archive_id, 1, len(data), csize)
-            archive = ArchiveItem(internal_dict=msgpack.unpackb(data))
-            if archive.version != 1:
-                raise Exception('Unknown archive metadata version')
-            sync = CacheSynchronizer(chunk_idx)
-            for item_id, (csize, data) in zip(archive.items, decrypted_repository.get_many(archive.items)):
-                chunk_idx.add(item_id, 1, len(data), csize)
-                processed_item_metadata_bytes += len(data)
-                processed_item_metadata_chunks += 1
-                sync.feed(data)
-            if self.do_cache:
-                fetch_missing_csize(chunk_idx)
-                write_archive_index(archive_id, chunk_idx)
-
-        def write_archive_index(archive_id, chunk_idx):
-            nonlocal compact_chunks_archive_saved_space
-            compact_chunks_archive_saved_space += chunk_idx.compact()
-            fn = mkpath(archive_id, suffix='.compact')
-            fn_tmp = mkpath(archive_id, suffix='.tmp')
-            try:
-                with DetachedIntegrityCheckedFile(path=fn_tmp, write=True,
-                                                  filename=bin_to_hex(archive_id) + '.compact') as fd:
-                    chunk_idx.write(fd)
-            except Exception:
-                truncate_and_unlink(fn_tmp)
-            else:
-                os.rename(fn_tmp, fn)
-
-        def read_archive_index(archive_id, archive_name):
-            archive_chunk_idx_path = mkpath(archive_id)
-            logger.info("Reading cached archive chunk index for %s ...", archive_name)
-            try:
+    def _write_files_cache(self, files):
+        """write files cache to cache directory"""
+        max_time_ns = 2**63 - 1  # nanoseconds, good until y2262
+        # _self._newest_cmtime might be None if it was never set because no files were modified/added.
+        newest_cmtime = self._newest_cmtime if self._newest_cmtime is not None else max_time_ns
+        start_backup_time = self.start_backup - TIME_DIFFERS2_NS if self.start_backup is not None else max_time_ns
+        # we don't want to persist files cache entries of potentially problematic files:
+        discard_after = min(newest_cmtime, start_backup_time)
+        ttl = int(os.environ.get("BORG_FILES_CACHE_TTL", 2))
+        files_cache_logger.debug("FILES-CACHE-SAVE: starting...")
+        cache_path = str(self.path / self.files_cache_name())
+        with SaveFile(cache_path, binary=True) as sync_file:
+            writer = SealedStreamWriter(sync_file, self.key, self._files_cache_context())
+            entries = 0
+            age_discarded = 0
+            race_discarded = 0
+            broken_discarded = 0
+            for path_hash, entry in files.items():
                 try:
-                    # Attempt to load compact index first
-                    with DetachedIntegrityCheckedFile(path=archive_chunk_idx_path + '.compact', write=False) as fd:
-                        archive_chunk_idx = ChunkIndex.read(fd, permit_compact=True)
-                    # In case a non-compact index exists, delete it.
-                    cleanup_cached_archive(archive_id, cleanup_compact=False)
-                    # Compact index read - return index, no conversion necessary (below).
-                    return archive_chunk_idx
-                except FileNotFoundError:
-                    # No compact index found, load non-compact index, and convert below.
-                    with DetachedIntegrityCheckedFile(path=archive_chunk_idx_path, write=False) as fd:
-                        archive_chunk_idx = ChunkIndex.read(fd)
-            except FileIntegrityError as fie:
-                logger.error('Cached archive chunk index of %s is corrupted: %s', archive_name, fie)
-                # Delete corrupted index, set warning. A new index must be build.
-                cleanup_cached_archive(archive_id)
-                set_ec(EXIT_WARNING)
-                return None
-
-            # Convert to compact index. Delete the existing index first.
-            logger.debug('Found non-compact index for %s, converting to compact.', archive_name)
-            cleanup_cached_archive(archive_id)
-            write_archive_index(archive_id, archive_chunk_idx)
-            return archive_chunk_idx
-
-        def get_archive_ids_to_names(archive_ids):
-            # Pass once over all archives and build a mapping from ids to names.
-            # The easier approach, doing a similar loop for each archive, has
-            # square complexity and does about a dozen million functions calls
-            # with 1100 archives (which takes 30s CPU seconds _alone_).
-            archive_names = {}
-            for info in self.manifest.archives.list():
-                if info.id in archive_ids:
-                    archive_names[info.id] = info.name
-            assert len(archive_names) == len(archive_ids)
-            return archive_names
-
-        def create_master_idx(chunk_idx):
-            logger.info('Synchronizing chunks cache...')
-            cached_ids = cached_archives()
-            archive_ids = repo_archives()
-            logger.info('Archives: %d, w/ cached Idx: %d, w/ outdated Idx: %d, w/o cached Idx: %d.',
-                len(archive_ids), len(cached_ids),
-                len(cached_ids - archive_ids), len(archive_ids - cached_ids))
-            # deallocates old hashindex, creates empty hashindex:
-            chunk_idx.clear()
-            cleanup_outdated(cached_ids - archive_ids)
-            # Explicitly set the usable initial hash table capacity to avoid performance issues
-            # due to hash table "resonance".
-            master_index_capacity = len(self.repository)
-            if archive_ids:
-                chunk_idx = None if not self.do_cache else ChunkIndex(usable=master_index_capacity)
-                pi = ProgressIndicatorPercent(total=len(archive_ids), step=0.1,
-                                              msg='%3.0f%% Syncing chunks cache. Processing archive %s',
-                                              msgid='cache.sync')
-                archive_ids_to_names = get_archive_ids_to_names(archive_ids)
-                for archive_id, archive_name in archive_ids_to_names.items():
-                    pi.show(info=[remove_surrogates(archive_name)])
-                    if self.do_cache:
-                        if archive_id in cached_ids:
-                            archive_chunk_idx = read_archive_index(archive_id, archive_name)
-                            if archive_chunk_idx is None:
-                                cached_ids.remove(archive_id)
-                        if archive_id not in cached_ids:
-                            # Do not make this an else branch; the FileIntegrityError exception handler
-                            # above can remove *archive_id* from *cached_ids*.
-                            logger.info('Fetching and building archive index for %s ...', archive_name)
-                            archive_chunk_idx = ChunkIndex()
-                            fetch_and_build_idx(archive_id, decrypted_repository, archive_chunk_idx)
-                        logger.info("Merging into master chunks index ...")
-                        chunk_idx.merge(archive_chunk_idx)
+                    entry = self.decompress_entry(entry)
+                except KeyError:
+                    # the entry references a chunk that is no longer in the chunks index (e.g.
+                    # after an aborted / out-of-space backup rolled back pending chunks). such an
+                    # entry is unusable; drop it rather than crash while saving the cache — the
+                    # file will simply be re-chunked in a future backup. this mirrors the
+                    # compress_entry KeyError handling in _read_files_cache.
+                    broken_discarded += 1
+                    continue
+                if entry.age == 0:  # current entries
+                    if max(timestamp_to_int(entry.ctime), timestamp_to_int(entry.mtime)) < discard_after:
+                        # Only keep files seen in this backup that old enough not to suffer race conditions
+                        # relating to filesystem snapshots and ctime/mtime granularity or being modified
+                        # while we read them.
+                        keep = True
                     else:
-                        chunk_idx = chunk_idx or ChunkIndex(usable=master_index_capacity)
-                        logger.info('Fetching archive index for %s ...', archive_name)
-                        fetch_and_build_idx(archive_id, decrypted_repository, chunk_idx)
-                if not self.do_cache:
-                    fetch_missing_csize(chunk_idx)
-                pi.finish()
-                logger.debug('Cache sync: had to fetch %s (%d chunks) because no archive had a csize set for them '
-                             '(due to --no-cache-sync)',
-                             format_file_size(fetched_bytes_for_csize), fetched_chunks_for_csize)
-                logger.debug('Cache sync: processed %s (%d chunks) of metadata',
-                             format_file_size(processed_item_metadata_bytes), processed_item_metadata_chunks)
-                logger.debug('Cache sync: compact chunks.archive.d storage saved %s bytes',
-                             format_file_size(compact_chunks_archive_saved_space))
-            logger.info('Done.')
-            return chunk_idx
-
-        def legacy_cleanup():
-            """bring old cache dirs into the desired state (cleanup and adapt)"""
-            try:
-                os.unlink(os.path.join(self.path, 'chunks.archive'))
-            except:
-                pass
-            try:
-                os.unlink(os.path.join(self.path, 'chunks.archive.tmp'))
-            except:
-                pass
-            try:
-                os.mkdir(archive_path)
-            except:
-                pass
-
-        # The cache can be used by a command that e.g. only checks against Manifest.Operation.WRITE,
-        # which does not have to include all flags from Manifest.Operation.READ.
-        # Since the sync will attempt to read archives, check compatibility with Manifest.Operation.READ.
-        self.manifest.check_repository_compatibility((Manifest.Operation.READ, ))
-
-        self.begin_txn()
-        with cache_if_remote(self.repository, decrypted_cache=self.key) as decrypted_repository:
-            legacy_cleanup()
-            # TEMPORARY HACK: to avoid archive index caching, create a FILE named ~/.cache/borg/REPOID/chunks.archive.d -
-            # this is only recommended if you have a fast, low latency connection to your repo (e.g. if repo is local disk)
-            self.do_cache = os.path.isdir(archive_path)
-            self.chunks = create_master_idx(self.chunks)
-
-    def check_cache_compatibility(self):
-        my_features = Manifest.SUPPORTED_REPO_FEATURES
-        if self.cache_config.ignored_features & my_features:
-            # The cache might not contain references of chunks that need a feature that is mandatory for some operation
-            # and which this version supports. To avoid corruption while executing that operation force rebuild.
-            return False
-        if not self.cache_config.mandatory_features <= my_features:
-            # The cache was build with consideration to at least one feature that this version does not understand.
-            # This client might misinterpret the cache. Thus force a rebuild.
-            return False
-        return True
-
-    def wipe_cache(self):
-        logger.warning("Discarding incompatible cache and forcing a cache rebuild")
-        archive_path = os.path.join(self.path, 'chunks.archive.d')
-        if os.path.isdir(archive_path):
-            shutil.rmtree(os.path.join(self.path, 'chunks.archive.d'))
-            os.makedirs(os.path.join(self.path, 'chunks.archive.d'))
-        self.chunks = ChunkIndex()
-        with SaveFile(os.path.join(self.path, files_cache_name()), binary=True):
-            pass  # empty file
-        self.cache_config.manifest_id = ''
-        self.cache_config._config.set('cache', 'manifest', '')
-
-        self.cache_config.ignored_features = set()
-        self.cache_config.mandatory_features = set()
-
-    def update_compatibility(self):
-        operation_to_features_map = self.manifest.get_all_mandatory_features()
-        my_features = Manifest.SUPPORTED_REPO_FEATURES
-        repo_features = set()
-        for operation, features in operation_to_features_map.items():
-            repo_features.update(features)
-
-        self.cache_config.ignored_features.update(repo_features - my_features)
-        self.cache_config.mandatory_features.update(repo_features & my_features)
-
-    def add_chunk(self, id, chunk, stats, overwrite=False, wait=True):
-        if not self.txn_active:
-            self.begin_txn()
-        size = len(chunk)
-        refcount = self.seen_chunk(id, size)
-        if refcount and not overwrite:
-            return self.chunk_incref(id, stats)
-        data = self.key.encrypt(chunk)
-        csize = len(data)
-        self.repository.put(id, data, wait=wait)
-        self.chunks.add(id, 1, size, csize)
-        stats.update(size, csize, not refcount)
-        return ChunkListEntry(id, size, csize)
-
-    def seen_chunk(self, id, size=None):
-        refcount, stored_size, _ = self.chunks.get(id, ChunkIndexEntry(0, None, None))
-        if size is not None and stored_size is not None and size != stored_size:
-            # we already have a chunk with that id, but different size.
-            # this is either a hash collision (unlikely) or corruption or a bug.
-            raise Exception("chunk has same id [%r], but different size (stored: %d new: %d)!" % (
-                            id, stored_size, size))
-        return refcount
-
-    def chunk_incref(self, id, stats, size=None, part=False):
-        if not self.txn_active:
-            self.begin_txn()
-        count, _size, csize = self.chunks.incref(id)
-        stats.update(_size, csize, False, part=part)
-        return ChunkListEntry(id, _size, csize)
-
-    def chunk_decref(self, id, stats, wait=True, part=False):
-        if not self.txn_active:
-            self.begin_txn()
-        count, size, csize = self.chunks.decref(id)
-        if count == 0:
-            del self.chunks[id]
-            self.repository.delete(id, wait=wait)
-            stats.update(-size, -csize, True, part=part)
-        else:
-            stats.update(-size, -csize, False, part=part)
+                        keep = False
+                        race_discarded += 1
+                else:  # old entries
+                    if entry.age < ttl:
+                        # Also keep files from older backups that have not reached BORG_FILES_CACHE_TTL yet.
+                        keep = True
+                    else:
+                        keep = False
+                        age_discarded += 1
+                if keep:
+                    msgpack.pack((path_hash, entry), writer)
+                    entries += 1
+            writer.finish()
+        files_cache_logger.debug(f"FILES-CACHE-KILL: removed {age_discarded} entries with age >= TTL [{ttl}]")
+        if broken_discarded:
+            files_cache_logger.debug(f"FILES-CACHE-KILL: removed {broken_discarded} entries referencing missing chunks")
+        t_str = datetime.fromtimestamp(discard_after / 1e9, UTC).isoformat()
+        files_cache_logger.debug(f"FILES-CACHE-KILL: removed {race_discarded} entries with ctime/mtime >= {t_str}")
+        files_cache_logger.debug(f"FILES-CACHE-SAVE: finished, {entries} remaining entries saved.")
 
     def file_known_and_unchanged(self, hashed_path, path_hash, st):
         """
@@ -967,207 +471,933 @@ class LocalCache(CacheStatsMixin):
         :param hashed_path: the file's path as we gave it to hash(hashed_path)
         :param path_hash: hash(hashed_path), to save some memory in the files cache
         :param st: the file's stat() result
-        :return: known, ids (known is True if we have infos about this file in the cache,
-                             ids is the list of chunk ids IF the file has not changed, otherwise None).
+        :return: known, chunks, digests (known is True if we have infos about this file in the cache,
+                               chunks is a list[ChunkListEntry] IF the file has not changed, otherwise None,
+                               digests is the file's digests dict IF the file has not changed and we have
+                               them, otherwise None).
         """
         if not stat.S_ISREG(st.st_mode):
-            return False, None
+            return False, None, None
         cache_mode = self.cache_mode
-        if 'd' in cache_mode:  # d(isabled)
-            files_cache_logger.debug('UNKNOWN: files cache disabled')
-            return False, None
+        if "d" in cache_mode:  # d(isabled)
+            files_cache_logger.debug("UNKNOWN: files cache disabled")
+            return False, None, None
         # note: r(echunk) does not need the files cache in this method, but the files cache will
         # be updated and saved to disk to memorize the files. To preserve previous generations in
         # the cache, this means that it also needs to get loaded from disk first.
-        if 'r' in cache_mode:  # r(echunk)
-            files_cache_logger.debug('UNKNOWN: rechunking enforced')
-            return False, None
+        if "r" in cache_mode:  # r(echunk)
+            files_cache_logger.debug("UNKNOWN: rechunking enforced")
+            return False, None, None
         entry = self.files.get(path_hash)
         if not entry:
-            files_cache_logger.debug('UNKNOWN: no file metadata in cache for: %r', hashed_path)
-            return False, None
+            files_cache_logger.debug("UNKNOWN: no file metadata in cache for: %r", hashed_path)
+            return False, None, None
         # we know the file!
-        entry = FileCacheEntry(*msgpack.unpackb(entry))
-        if 's' in cache_mode and entry.size != st.st_size:
-            files_cache_logger.debug('KNOWN-CHANGED: file size has changed: %r', hashed_path)
-            return True, None
-        if 'i' in cache_mode and entry.inode != st.st_ino:
-            files_cache_logger.debug('KNOWN-CHANGED: file inode number has changed: %r', hashed_path)
-            return True, None
-        if 'c' in cache_mode and bigint_to_int(entry.cmtime) != st.st_ctime_ns:
-            files_cache_logger.debug('KNOWN-CHANGED: file ctime has changed: %r', hashed_path)
-            return True, None
-        elif 'm' in cache_mode and bigint_to_int(entry.cmtime) != st.st_mtime_ns:
-            files_cache_logger.debug('KNOWN-CHANGED: file mtime has changed: %r', hashed_path)
-            return True, None
-        # we ignored the inode number in the comparison above or it is still same.
+        try:
+            entry = self.decompress_entry(entry)
+        except KeyError:
+            # the cached entry references a chunk that is no longer in the chunks index (e.g. after
+            # an aborted / out-of-space backup); treat the file as unknown so it gets re-chunked.
+            files_cache_logger.debug("UNKNOWN: cached entry references a missing chunk: %r", hashed_path)
+            return False, None, None
+        if "s" in cache_mode and entry.size != st.st_size:
+            files_cache_logger.debug("KNOWN-CHANGED: file size has changed: %r", hashed_path)
+            return True, None, None
+        if "i" in cache_mode and entry.inode != st.st_ino:
+            files_cache_logger.debug("KNOWN-CHANGED: file inode number has changed: %r", hashed_path)
+            return True, None, None
+        ctime = int_to_timestamp(safe_ns(st.st_ctime_ns))
+        if "c" in cache_mode and entry.ctime != ctime:
+            files_cache_logger.debug("KNOWN-CHANGED: file ctime has changed: %r", hashed_path)
+            return True, None, None
+        mtime = int_to_timestamp(safe_ns(st.st_mtime_ns))
+        if "m" in cache_mode and entry.mtime != mtime:
+            files_cache_logger.debug("KNOWN-CHANGED: file mtime has changed: %r", hashed_path)
+            return True, None, None
+        # V = any of the inode number, mtime, ctime values.
+        # we ignored V in the comparison above or it is still the same value.
         # if it is still the same, replacing it in the tuple doesn't change it.
-        # if we ignored it, a reason for doing that is that files were moved to a new
-        # disk / new fs (so a one-time change of inode number is expected) and we wanted
-        # to avoid everything getting chunked again. to be able to re-enable the inode
-        # number comparison in a future backup run (and avoid chunking everything
-        # again at that time), we need to update the inode number in the cache with what
-        # we see in the filesystem.
-        self.files[path_hash] = msgpack.packb(entry._replace(inode=st.st_ino, age=0))
-        return True, entry.chunk_ids
+        # if we ignored it, a reason for doing that is that files were moved/copied to
+        # a new disk / new fs (so a one-time change of V is expected) and we wanted
+        # to avoid everything getting chunked again. to be able to re-enable the
+        # V comparison in a future backup run (and avoid chunking everything again at
+        # that time), we need to update V in the cache with what we see in the filesystem.
+        entry = entry._replace(inode=st.st_ino, ctime=ctime, mtime=mtime, age=0)
+        self.files[path_hash] = self.compress_entry(entry)
+        chunks = [ChunkListEntry(*chunk) for chunk in entry.chunks]  # convert to list of namedtuple
+        return True, chunks, entry.digests
 
-    def memorize_file(self, hashed_path, path_hash, st, ids):
+    def memorize_file(self, hashed_path, path_hash, st, chunks, digests=None):
         if not stat.S_ISREG(st.st_mode):
             return
-        cache_mode = self.cache_mode
         # note: r(echunk) modes will update the files cache, d(isabled) mode won't
-        if 'd' in cache_mode:
-            files_cache_logger.debug('FILES-CACHE-NOUPDATE: files cache disabled')
+        if "d" in self.cache_mode:
+            files_cache_logger.debug("FILES-CACHE-NOUPDATE: files cache disabled")
             return
-        if 'c' in cache_mode:
-            cmtime_type = 'ctime'
-            cmtime_ns = safe_ns(st.st_ctime_ns)
-        elif 'm' in cache_mode:
-            cmtime_type = 'mtime'
-            cmtime_ns = safe_ns(st.st_mtime_ns)
-        entry = FileCacheEntry(age=0, inode=st.st_ino, size=st.st_size, cmtime=int_to_bigint(cmtime_ns), chunk_ids=ids)
-        self.files[path_hash] = msgpack.packb(entry)
-        self._newest_cmtime = max(self._newest_cmtime or 0, cmtime_ns)
-        files_cache_logger.debug('FILES-CACHE-UPDATE: put %r [has %s] <- %r',
-                                 entry._replace(chunk_ids='[%d entries]' % len(entry.chunk_ids)),
-                                 cmtime_type, hashed_path)
+        ctime_ns = safe_ns(st.st_ctime_ns)
+        mtime_ns = safe_ns(st.st_mtime_ns)
+        entry = FileCacheEntry(
+            age=0,
+            inode=st.st_ino,
+            size=st.st_size,
+            ctime=int_to_timestamp(ctime_ns),
+            mtime=int_to_timestamp(mtime_ns),
+            chunks=chunks,
+            digests=digests,
+        )
+        self.files[path_hash] = self.compress_entry(entry)
+        self._newest_cmtime = max(self._newest_cmtime or 0, ctime_ns)
+        self._newest_cmtime = max(self._newest_cmtime or 0, mtime_ns)
+        files_cache_logger.debug(
+            "FILES-CACHE-UPDATE: put %r <- %r", entry._replace(chunks="[%d entries]" % len(entry.chunks)), hashed_path
+        )
 
 
-class AdHocCache(CacheStatsMixin):
+def chunkindex_fragment_entry_size():
+    """Approximate on-disk bytes per serialized chunks-index entry.
+
+    Derived from the actual ChunkIndex layout instead of a hardcoded constant, so it tracks any change
+    to the entry format automatically: a fragment stores each entry as its 32-byte key followed by the
+    struct-packed value (ChunkIndexEntryFormat, little-endian as borghash serializes it). Only used to
+    estimate a fragment's entry count from its stored byte size (see list_chunkindex_fragments), so we
+    can classify fragments without loading them; the small fixed header is ignored (negligible for the
+    fragment sizes we care about).
     """
-    Ad-hoc, non-persistent cache.
+    key_size = 32  # a chunk id is a 256bit / 32 byte hash
+    value_size = struct.calcsize("<" + "".join(ChunkIndexEntryFormat))
+    return key_size + value_size
 
-    Compared to the standard LocalCache the AdHocCache does not maintain accurate reference count,
-    nor does it provide a files cache (which would require persistence). Chunks that were not added
-    during the current AdHocCache lifetime won't have correct size/csize set (0 bytes) and will
-    have an infinite reference count (MAX_VALUE).
+
+# TODO: refactor the chunk-index functions below into a dedicated index-management class.
+def list_chunkindex_fragments(repository):
+    """List the index/ fragments, returning each fragment's (name, approximate entry count).
+
+    This is the single primitive that walks the index/ namespace; list_chunkindex_hashes is a thin
+    wrapper over it. In that namespace each object's name is the store hash of its content (the key's
+    envelope around the serialized index). The entry count is estimated from the stored object's byte
+    size (chunkindex_fragment_entry_size() bytes per entry), so we can classify fragments (small vs.
+    sealed) without loading them. The estimate ignores the small fixed header and the envelope overhead
+    (a few dozen bytes), which are negligible for the fragment sizes we care about.
+    Returns a list of (name, approx_entries) tuples, sorted by name.
+    """
+    entry_size = chunkindex_fragment_entry_size()
+    fragments = []
+    for info in repository.store_list("index"):
+        info = ItemInfo(*info)  # RPC does not give namedtuple
+        fragments.append((info.name, info.size // entry_size))
+    fragments.sort()
+    return fragments
+
+
+def list_chunkindex_hashes(repository):
+    hashes = [name for name, _ in list_chunkindex_fragments(repository)]  # already sorted by name
+    logger.debug(f"chunk indexes: {hashes}")
+    return hashes
+
+
+def chunkindex_is_invalid(repository):
+    """Return whether the chunk-index-invalid marker is present.
+
+    store_list() bypasses the borgstore cache, so this stays correct even for a cache-backed namespace.
+    """
+    return any(ItemInfo(*info).name == CHUNKINDEX_INVALID_SENTINEL for info in repository.store_list("cache"))
+
+
+def write_chunkindex_invalid(repository):
+    """Store the invalid marker, cache/chunkindex-invalid.
+
+    Store it before deleting index/ fragments whose entries no other fragment holds, before deleting a pack
+    the fragments point at, and after storing packs the fragments do not record.
+    While it is present, build_chunkindex_from_repo rebuilds the index from the packs instead of merging the
+    fragments.
+    """
+    repository.store_store(f"cache/{CHUNKINDEX_INVALID_SENTINEL}", b"")
+
+
+def delete_chunkindex_invalid(repository):
+    """Delete the invalid marker, if present.
+
+    The index/ fragments, if any, must hold the complete current index and point only at existing packs.
+    """
+    try:
+        repository.store_delete(f"cache/{CHUNKINDEX_INVALID_SENTINEL}")
+    except StoreObjectNotFound:
+        pass
+
+
+def delete_chunkindex_from_repo(repository):
+    hashes = list_chunkindex_hashes(repository)
+    invalid = chunkindex_is_invalid(repository)
+    if hashes:
+        # mark invalid before deleting the first fragment, so an interrupted deletion is detectable.
+        write_chunkindex_invalid(repository)
+    for hash in hashes:
+        index_name = f"index/{hash}"
+        try:
+            repository.store_delete(index_name)
+        except StoreObjectNotFound:
+            pass
+    if hashes or invalid:
+        # clear the marker after every fragment is gone; also clears a marker left behind by an
+        # interrupted operation.
+        delete_chunkindex_invalid(repository)
+    logger.debug(f"chunk indexes deleted: {hashes}")
+    # the in-memory index is now stale; drop it so close() does not write it back into the
+    # index we just deleted. the next .chunks access rebuilds it from actual repo contents.
+    repository.invalidate_chunk_index()
+
+
+def _store_chunkindex_fragment(repository, batch, stored_hashes, *, force_write):
+    """Serialize a temporary ChunkIndex `batch` and store it as an index/<store hash> fragment.
+
+    We don't serialize the flags or the size, so callers pass entries with those zeroed. The serialized
+    index is stored in the repository key's envelope (see Repository.store_encrypt_store), under
+    index/<hash>, where <hash> is the store hash of the stored envelope, so borgstore and borg check can
+    verify it like any other content-addressed object. An incompatible format from a different borg
+    version is rejected by borghash's own versioned header (MAGIC + VERSION) when read back.
+
+    Returns (new_hash, stored) where `stored` is True iff we actually wrote to the repository: unless
+    force_write is set, we skip the write if a fragment with the same content, read in this session (see
+    Repository.chunkindex_fragment_hashes), is still among stored_hashes.
+    """
+    with io.BytesIO() as f:
+        batch.write(f)
+        data = f.getvalue()
+    plaintext_hash = store_hash(data).digest()
+    known_hash = repository.chunkindex_fragment_hashes.get(plaintext_hash)
+    if not force_write and known_hash in stored_hashes:
+        return known_hash, False
+    index_name = repository.store_encrypt_store("index", data, hashed_name=True)
+    logger.debug(f"stored chunks index as {index_name} in repository.")
+    new_hash = index_name.removeprefix("index/")
+    repository.chunkindex_fragment_hashes[plaintext_hash] = new_hash
+    return new_hash, True
+
+
+def write_chunkindex_to_repo(
+    repository, chunks, *, incremental=True, clear=False, force_write=False, delete_other=False, delete_these=None
+):
+    # incremental controls *which* entries we write: only the F_NEW ones (a backup's new chunks) when
+    #   True, else the whole index. borghash cannot serialize just the F_NEW entries, so either way we
+    #   copy the selected entries into temporary table(s).
+    # Regardless of that, we always split the output into fragments of at most
+    #   CHUNKINDEX_FRAGMENT_ENTRIES_MAX entries, so no single fragment gets too large (even the one
+    #   incremental fragment of a huge initial backup). See repack_chunkindex for why we prefer many
+    #   bounded, immutable fragments over one big index.
+    max_entries = CHUNKINDEX_FRAGMENT_ENTRIES_MAX
+    # the fragment set present in the repo before we start writing:
+    stored_hashes = set(list_chunkindex_hashes(repository))
+    new_hashes = set()  # hashes of the fragments that make up the index we are writing now
+    fragments_written = 0
+
+    total = chunks.new_count if incremental else len(chunks)
+    if total > max_entries:
+        # to keep memory usage low, we don't build one huge, sorted list of all selected keys
+        # (~90 bytes per key!), see #9886: as the keys are uniformly distributed hash digests, we can
+        # partition them into 2 ** prefix_bits similarly sized, disjoint sets by their leading key bits
+        # and select / sort / write one partition's keys at a time. selecting a partition is a cheap,
+        # C-level filtering scan of the in-memory hash table, see borghash.HashTable.items.
+        # aim a bit below max_entries: without that headroom, a total of exactly
+        # 2 ** prefix_bits * max_entries would put the expected partition size right AT max_entries,
+        # so about half the partitions would overshoot it by a little.
+        target_entries = max_entries - max_entries // 20  # 5% headroom
+        partitions = -(-total // target_entries)  # == ceil(total / target_entries)
+        prefix_bits = (partitions - 1).bit_length()  # smallest prefix_bits with 2 ** prefix_bits >= partitions
+    else:
+        prefix_bits = 0  # all selected keys are one partition (and no filtering scans are needed)
+
+    def gen_batches():
+        # sort the selected keys per partition, so that an identical set of entries always produces
+        # identical fragments (identical plaintext), no matter in which order the entries were
+        # inserted into the hash table: partition membership and prefix_bits (chosen by entry count)
+        # only depend on the selected entries. this makes writing/repacking idempotent and convergent
+        # across clients: a fragment whose content already exists in the repo is not stored again (see
+        # _store_chunkindex_fragment) and no differently-partitioned duplicates of the same entries
+        # can pile up. as the prefix compares the keys' leading bits, ascending prefixes yield the
+        # same globally sorted key sequence a single all-keys sort would have produced.
+        for prefix in range(2**prefix_bits):
+            keys = sorted(
+                key for key, _ in chunks.iteritems(only_new=incremental, prefix_bits=prefix_bits, prefix=prefix)
+            )
+            # Usually a no-op splitwise: with hash digests as keys, prefix_bits was chosen so that a
+            # partition comes out well below max_entries (>100 sigma of margin), so this yields the
+            # partition as a single batch. It is what makes the "no fragment has more than
+            # max_entries entries" invariant a hard guarantee rather than an assumption about the
+            # key distribution - keys that are not uniformly distributed (e.g. in tests) can put
+            # everything into one partition.
+            yield from chunkit(keys, max_entries)
+
+    if total:
+        batches = gen_batches()
+    elif force_write:
+        # write a single empty fragment (e.g. at repo creation or after delete_chunkindex_from_repo()):
+        batches = [[]]
+    else:
+        # don't persist an empty fragment: if it became the only index/* (e.g. right after
+        # delete_chunkindex_from_repo()), build_chunkindex_from_repo() would return it as-is
+        # instead of rebuilding from the repo. with nothing to write, the repo is already correct.
+        logger.debug("no new chunks to persist; not writing an empty chunk index fragment.")
+        batches = []
+    for batch_keys in batches:
+        # pre-size the temporary table to this batch so filling it does not repeatedly rehash:
+        batch = ChunkIndex(usable=len(batch_keys) or None)
+        for key in batch_keys:
+            entry = chunks[key]
+            # a chunk still buffered in the pack writer has F_PENDING set: its pack location
+            # is not resolved yet. only serialize an entry once its pack is written (#9900).
+            assert not (entry.flags & ChunkIndex.F_PENDING), f"chunk {bin_to_hex(key)} has no pack location yet"
+            # for now, we don't want to serialize the flags or the size:
+            batch[key] = entry._replace(flags=ChunkIndex.F_NONE, size=0)
+        new_hash, stored = _store_chunkindex_fragment(repository, batch, stored_hashes, force_write=force_write)
+        batch.clear()  # free memory of the temporary table
+        new_hashes.add(new_hash)
+        if stored:
+            fragments_written += 1
+
+    logger.debug(f"cached {total} chunks (incremental={incremental}) in {fragments_written} fragment(s).")
+    if clear:
+        # if we don't need the in-memory chunks index anymore:
+        chunks.clear()  # free memory, immediately
+    if fragments_written:
+        # we have successfully stored to the repository, so we can clear all F_NEW flags now:
+        chunks.clear_new()
+
+    # delete some no longer needed index objects, but never the ones we just wrote. we gate this on
+    # new_hashes (the fragments that make up the index we just wrote), not on whether we actually
+    # uploaded them: a fragment can be dedupe-skipped because its content already exists in the repo
+    # (see _store_chunkindex_fragment), and in that case the replacement is verifiably present, so
+    # deleting the superseded fragments is still safe. this also makes repack idempotent -- if a
+    # previous repack crashed after storing but before deleting, the next one re-derives the same
+    # fragments, dedupe-skips the uploads, and still deletes the small sources. in the authenticated-*
+    # modes, a fragment we just wrote can also have the same name as one we are asked to delete (same
+    # entries -> same envelope). when there is nothing to write (new_hashes empty, e.g. an empty
+    # incremental index), we skip deletion so we never leave the repo without an index.
+    if new_hashes and (delete_other or delete_these):
+        if delete_other:
+            delete_these = set(stored_hashes) - new_hashes
+        else:
+            delete_these = set(delete_these) - new_hashes
+        # A delete_other rewrite may drop entries, so leftover fragments after a mid-delete crash must
+        # not be merged back; guard that deletion with the invalid marker. Otherwise the deleted
+        # fragments' entries are already contained in the fragments we just wrote, so leftovers are
+        # harmless.
+        guard = delete_other and bool(delete_these)
+        if guard:
+            write_chunkindex_invalid(repository)
+        for hash in delete_these:
+            index_name = f"index/{hash}"
+            try:
+                repository.store_delete(index_name)
+            except StoreObjectNotFound:
+                pass
+        if guard:
+            delete_chunkindex_invalid(repository)
+        if delete_these:
+            logger.debug(f"chunk indexes deleted: {delete_these}")
+    return new_hashes
+
+
+class CorruptChunkIndexFragment(Error):
+    """Chunk index fragment {} is corrupt. Run "borg check --repair" to rebuild the chunk index."""
+
+    # the fragment fails the authentication of the key's envelope or does not deserialize.
+    exit_mcode = 94
+
+
+class ChunkIndexRebuildInterrupted(Error):
+    """Got Ctrl-C / SIGINT: the chunk index rebuild was interrupted."""
+
+
+def read_chunkindex_from_repo(repository, hash):
+    """Load the chunk index fragment index/<hash>; return it as a ChunkIndex, or None if it is not there.
+
+    Raises CorruptChunkIndexFragment if the fragment fails the authentication of the key's envelope (see
+    Repository.store_load_decrypt) or does not deserialize.
+    """
+    index_name = f"index/{hash}"
+    logger.debug(f"trying to load {index_name} from the repo...")
+    try:
+        chunks_data = repository.store_load_decrypt(index_name, hashed_name=True)
+    except StoreObjectNotFound:
+        logger.debug(f"{index_name} not found in the repository.")
+        return None
+    except IntegrityError as err:
+        raise CorruptChunkIndexFragment(index_name) from err
+    logger.debug(f"{index_name} is valid.")
+    try:
+        with io.BytesIO(chunks_data) as f:
+            chunks = ChunkIndex.read(f)
+    except (ValueError, KeyError, struct.error) as err:
+        # the envelope is authentic, but its content does not deserialize into a ChunkIndex.
+        raise CorruptChunkIndexFragment(index_name) from err
+    repository.chunkindex_fragment_hashes[store_hash(chunks_data).digest()] = hash
+    return chunks
+
+
+def repack_chunkindex(repository):
+    """Consolidate small chunk-index fragments to keep their number and size in a healthy range.
+
+    The chunks index lives in the repo as immutable, content-addressed index/<hash> fragments.
+    Ordinary backups append a small incremental fragment each, so small fragments pile up over time.
+    This merges the small (< CHUNKINDEX_FRAGMENT_ENTRIES_MIN entries) fragments into fragments of up
+    to CHUNKINDEX_FRAGMENT_ENTRIES_MAX entries and deletes the small sources. Fragments already in
+    range are left untouched, so they stay immutable (and, once index/ is cache-backed, stay cached
+    for every client instead of being invalidated by an all-in-one consolidation).
+
+    Merging is deferred: we only act when we can seal at least one full fragment (the small entries
+    sum to >= MIN) or when too many small fragments have piled up (more than
+    CHUNKINDEX_SMALL_FRAGMENT_CAP), so we don't rewrite a slowly growing fragment on every backup.
+    """
+    if chunkindex_is_invalid(repository):
+        # the index is invalid; it will be rebuilt on next load, so there is nothing to consolidate.
+        return
+    small = [
+        (name, approx)
+        for name, approx in list_chunkindex_fragments(repository)
+        if approx < CHUNKINDEX_FRAGMENT_ENTRIES_MIN
+    ]
+    if len(small) < 2:
+        return  # nothing to gain from merging zero or one fragment
+    small_total = sum(approx for _, approx in small)
+    if small_total < CHUNKINDEX_FRAGMENT_ENTRIES_MIN and len(small) <= CHUNKINDEX_SMALL_FRAGMENT_CAP:
+        # can't seal a full fragment yet and not too many have piled up: defer.
+        return
+    logger.debug(f"repacking {len(small)} small chunk index fragments (~{small_total} entries)...")
+    merged = ChunkIndex()
+    merged_hashes = []
+    for name, _ in small:
+        try:
+            fragment = read_chunkindex_from_repo(repository, name)
+        except CorruptChunkIndexFragment:
+            # a corrupt fragment cannot be merged; leave it in place and skip it.
+            continue
+        if fragment is None:
+            # gone or invalid (e.g. deleted by another client); just don't merge it.
+            continue
+        for k, v in fragment.items():
+            merged[k] = v
+        merged_hashes.append(name)
+        fragment.clear()
+    if not merged_hashes:
+        return
+    # write the merged entries split into bounded (<= MAX) fragments and delete the small sources.
+    # force_write=False so a merged fragment whose content already exists in the repo is dedupe-skipped
+    # rather than re-uploaded; write_chunkindex_to_repo still deletes the small sources because deletion
+    # is gated on the fragment set being present, not on a fresh upload (so repack is idempotent and
+    # avoids redundant uploads). write_chunkindex_to_repo also never deletes a hash it just wrote, so a
+    # fragment whose content is unchanged by the merge survives rather than being deleted and re-created.
+    write_chunkindex_to_repo(
+        repository, merged, incremental=False, clear=True, force_write=False, delete_these=merged_hashes
+    )
+
+
+def build_chunkindex_from_repo(
+    repository,
+    *,
+    slow_rebuild=False,
+    fragments_only=False,
+    validate=None,
+    on_drop=None,
+    on_duplicate=None,
+    write_immediately=False,
+    init_flags=ChunkIndex.F_USED,
+    interruptible=False,
+):
+    # fragments_only: build the index from the index/ fragments only, returning None if they cannot be
+    # read completely, and never write to the repo.
+    # write_immediately: store the index (all of it, deleting all other fragments) before returning it. The
+    # callers hold an exclusive lock (borg compact, borg repo-compress, borg check --repair).
+    # a corrupt fragment raises CorruptChunkIndexFragment: a corrupt index aborts the command. Only with
+    # write_immediately (the index is rewritten anyway), the index is rebuilt from the packs instead.
+    # validate: a repo object validator or None, passed to PackReader.iter_headers. With a validator,
+    # the rebuild skips the objects that fail it; without one, a corrupt object header raises CorruptPack.
+    # on_drop: a callable or None, passed to PackReader.iter_headers, called once per byte range the
+    # validating walk skips.
+    # on_duplicate: a callable or None, called with (chunk_id, pack_id) once per object of the slow rebuild
+    # whose chunk id is indexed already. The index then names the object walked last; pack_id is the pack of
+    # the copy it named before.
+    # interruptible: on Ctrl-C / SIGINT, stop the pack walk before the next object, discard the index
+    # built so far (it lacks the chunks of the packs not walked yet) and raise ChunkIndexRebuildInterrupted.
+    assert not (slow_rebuild and fragments_only)
+    assert not (fragments_only and write_immediately)  # fragments_only never writes to the repo
+    assert on_duplicate is None or slow_rebuild  # an index built from the fragments reports no duplicates
+    # first, try to build a fresh, mostly complete chunk index from centrally stored index fragments:
+    if not slow_rebuild:
+        # a concurrent repack_chunkindex (another client, shared lock) deletes the small fragments it
+        # merged - only after storing the merged replacement, so no entries are ever lost, but a
+        # fragment we just listed can vanish before we load it. the index must be built from ALL
+        # fragments or not at all: a partially merged index would miss chunks that exist in the repo
+        # (spurious ObjectNotFound, lost deduplication). so on a failed load, re-list and retry -
+        # the fresh listing contains the replacement fragment. if we cannot get a complete, consistent
+        # set (e.g. fragments keep vanishing), fall through to the slow rebuild instead.
+        for _ in range(CHUNKINDEX_MERGE_ATTEMPTS):
+            if chunkindex_is_invalid(repository):
+                if fragments_only:
+                    return None
+                # the fragments may be missing entries or point at deleted packs. Delete them
+                # (best-effort; a read-only client rebuilds in memory only), then rebuild from packs.
+                logger.warning("chunk index is invalid (interrupted operation), rebuilding it.")
+                try:
+                    delete_chunkindex_from_repo(repository)
+                except Exception as err:
+                    logger.debug(f"could not remove invalid chunk index fragments: {err!r}")
+                break
+            hashes = list_chunkindex_hashes(repository)
+            if not hashes:  # no chunk index fragments available
+                if fragments_only:
+                    return None
+                break
+            chunks = ChunkIndex()  # we'll merge all fragments into this
+            complete = True
+            corrupt_fragment = None
+            msgid = "cache.merge_chunkindex_fragments"
+            show_percent = progress_wanted()
+            if show_percent:
+                pi = ProgressIndicatorPercent(total=len(hashes), msg="Loading chunk index %3.0f%%", msgid=msgid)
+            else:
+                pi = ProgressIndicatorSpinner("Loading chunk index", msgid=msgid)
+            try:
+                for hash in hashes:
+                    pi.show()
+                    try:
+                        chunks_to_merge = read_chunkindex_from_repo(repository, hash)
+                    except CorruptChunkIndexFragment as err:
+                        corrupt_fragment = err
+                        break
+                    if chunks_to_merge is None:
+                        logger.debug(f"chunk index fragment {hash} vanished, restarting the merge...")
+                        complete = False
+                        break
+                    logger.debug(f"chunk index fragment {hash} gets merged...")
+                    for k, v in chunks_to_merge.items():
+                        chunks[k] = v
+                    chunks_to_merge.clear()
+                else:
+                    if show_percent:
+                        pi.show(current=len(hashes))  # finish at 100%
+            finally:
+                pi.finish()
+            if corrupt_fragment is not None:
+                # retrying would re-read the same corrupt fragment. abort, unless the index gets rewritten
+                # anyway: then rebuild the whole index from the packs.
+                chunks.clear()
+                if not write_immediately:
+                    raise corrupt_fragment
+                logger.warning(f"{corrupt_fragment.args[0]} is corrupt, rebuilding the chunk index from the packs.")
+                break
+            if complete:
+                if len(hashes) > 1 and write_immediately:
+                    # consolidate small fragments on the repo so they don't pile up. this is a
+                    # bounded repack: it does not collapse large, already-sealed fragments, so those
+                    # stay immutable (and cache-stable for other clients) rather than being re-uploaded.
+                    repack_chunkindex(repository)
+                # merging set F_NEW on every entry (see ChunkIndex.__setitem__); clear it, the repo
+                # already holds these entries in its fragments.
+                chunks.clear_new()
+                return chunks
+            chunks.clear()  # free the partial merge before retrying
+        else:
+            if fragments_only:
+                return None
+            logger.warning("could not read a complete set of chunk index fragments, rebuilding the index.")
+    # if we didn't get anything from the index fragments, compute the ChunkIndex the slow way:
+    logger.debug("rebuilding the chunk index from the repo the slow way...")
+    chunks = ChunkIndex()
+    t0 = perf_counter()
+    num_chunks = 0
+    # By default we assume the repo's chunks are used; callers that compute usage themselves
+    # (e.g. compact) pass init_flags=F_NONE. Plaintext size is unknown here (!= stored size), so size=0.
+    # Every caller passes a (modern) Repository; legacy borg 1.x repos never reach here (transfer reads
+    # their archives directly and never builds a chunk index for them), so there is no legacy branch.
+    assert isinstance(repository, Repository)
+    # Read each pack's object headers with borgstore range requests: one fixed-size header read per
+    # object, skipping the (much larger) encrypted payloads, or a META_READ_SIZE read per object
+    # with a validator, which needs the metadata slot along with the header. Don't call
+    # Repository.list() here:
+    # it iterates this same index we are building, so it would recurse. The headers also give each
+    # object's real (chunk_id, offset, size), so every object in a pack is indexed individually.
+    pack_infos = repository.store_list("packs")
+    msgid = "cache.build_chunkindex_from_repo"
+    show_percent = progress_wanted()
+    if show_percent:
+        pi = ProgressIndicatorPercent(total=len(pack_infos), msg="Rebuilding chunk index %3.0f%%", msgid=msgid)
+    else:
+        pi = ProgressIndicatorSpinner("Rebuilding chunk index", msgid=msgid)
+    headers_parsed = 0
+
+    def stop_if_interrupted(packs_done):
+        # packs_done: the number of packs indexed completely.
+        if interruptible and sig_int:
+            logger.info(f"Chunk index rebuild interrupted after {packs_done} of {len(pack_infos)} packs.")
+            chunks.clear()
+            raise ChunkIndexRebuildInterrupted
+
+    try:
+        for packs_done, info in enumerate(pack_infos):
+            stop_if_interrupted(packs_done)
+            # PackReader uses the store directly, so refresh the lock here; a full rebuild can be slow.
+            repository._lock_refresh()
+            pi.show()
+            pack_id = hex_to_bin(info.name)
+            reader = PackReader(repository.store, pack_id)
+            try:
+                for chunk_id, obj_offset, obj_size in reader.iter_headers(validate=validate, on_drop=on_drop):
+                    # every object header is a store request, so also stop within a pack.
+                    stop_if_interrupted(packs_done)
+                    if not show_percent:
+                        pi.show()
+                    num_chunks += 1
+                    if on_duplicate is not None:
+                        previous = chunks.get(chunk_id)
+                        if previous is not None:
+                            on_duplicate(chunk_id, previous.pack_id)
+                    chunks[chunk_id] = ChunkIndexEntry(
+                        flags=init_flags, size=0, pack_id=pack_id, obj_offset=obj_offset, obj_size=obj_size
+                    )
+            except IntegrityError as err:
+                # the walk stopped at a corrupt object header, so this index would be incomplete: abort
+                # and point at "borg check --repair", which resyncs past the damage.
+                raise CorruptPack(err) from err
+            headers_parsed += reader.headers_parsed
+        if show_percent and pack_infos:
+            pi.show(current=len(pack_infos))  # finish at 100%
+    finally:
+        pi.finish()
+    if validate is not None and headers_parsed and num_chunks == 0:
+        # the packs hold object headers, yet not one object validated: the key does not belong to
+        # these packs, or the validator is broken. Returning this index would empty the chunk lists
+        # of all archives. A pack overwritten with unrelated data holds no header and keeps
+        # headers_parsed at zero; the walk reports its content through on_drop.
+        raise Error(
+            f"Chunk index rebuild: {headers_parsed} object headers parsed, but not one object passed "
+            "validation. The key does not match these packs, or the validator is broken. "
+            "Refusing to return an index without a single chunk."
+        )
+    duration = perf_counter() - t0 or 0.001
+    # Chunk IDs in a list are encoded in 34 bytes: 1 byte msgpack header, 1 byte length, 32 ID bytes.
+    # Protocol overhead is neglected in this calculation.
+    speed = format_file_size(num_chunks * 34 / duration)
+    logger.debug(f"queried {num_chunks} chunk IDs in {duration} s, ~{speed}/s")
+    if write_immediately:
+        # immediately update the index, so we only rarely have to do it the slow way:
+        write_chunkindex_to_repo(
+            repository, chunks, incremental=False, clear=False, force_write=True, delete_other=True
+        )
+    return chunks
+
+
+# per-archive cache of the objects an archive references, stored in the repo as
+# cache/referenced-by-archive.<archive id hex>. it lets a following compact or analyze skip re-scanning
+# an unchanged archive's items. the blob is: file_count (uint64 LE), content_size (uint64 LE) and a
+# serialized HashTableNT mapping object id (32 bytes) -> plaintext object size (uint32). it is stored in
+# the repository key's envelope, which binds it to its name (see Repository.store_encrypt_store).
+REFERENCED_BY_ARCHIVE = "referenced-by-archive."  # name prefix within the "cache" store namespace
+ArchiveReferenceEntry = namedtuple("ArchiveReferenceEntry", "size")
+ArchiveReferenceEntryFormatT = namedtuple("ArchiveReferenceEntryFormatT", "size")
+ArchiveReferenceEntryFormat = ArchiveReferenceEntryFormatT(size="I")  # uint32 plaintext size
+# what an archive references: the objects to mark used (id -> size) plus the tallies compact reports.
+# file_count and content_size are counted per occurrence (matching a full scan), so they cannot be
+# derived from the deduplicated ids table and are cached alongside it.
+ArchiveReferences = namedtuple("ArchiveReferences", "file_count content_size ids")
+
+
+def archive_reference_cache_name(archive_id: bytes) -> str:
+    """The store name of an archive's reference cache (well within borgstore's name length limit)."""
+    return f"cache/{REFERENCED_BY_ARCHIVE}{bin_to_hex(archive_id)}"
+
+
+def list_archive_reference_caches(repository) -> set:
+    """Return the set of archive ids (hex) that currently have a reference cache in the repo."""
+    hex_ids = set()
+    for info in repository.store_list("cache"):  # store_list yields ItemInfo namedtuples
+        if info.name.startswith(REFERENCED_BY_ARCHIVE):
+            hex_ids.add(info.name[len(REFERENCED_BY_ARCHIVE) :])
+    return hex_ids
+
+
+def load_archive_references(repository, archive_id: bytes):
+    """Load and verify an archive's references cache; return it, or None if it is missing/corrupted."""
+    hex_id = bin_to_hex(archive_id)
+    try:
+        data = repository.store_load_decrypt(archive_reference_cache_name(archive_id))
+    except StoreObjectNotFound:
+        return None
+    except IntegrityError:
+        # the cache is corrupted, or it is not the one of this archive (the envelope binds it to its name,
+        # so a cache copied to another archive's name fails, too). the caller then scans the archive.
+        logger.warning(f"Ignoring corrupted references cache of archive {hex_id}.")
+        return None
+    if len(data) < 16:
+        logger.warning(f"Ignoring corrupted references cache of archive {hex_id}.")
+        return None
+    try:
+        with io.BytesIO(data) as f:
+            file_count = int.from_bytes(f.read(8), "little")
+            content_size = int.from_bytes(f.read(8), "little")
+            ids = HashTableNT.read(f)
+    except ValueError:
+        logger.warning(f"Ignoring unreadable references cache of archive {hex_id}.")
+        return None
+    return ArchiveReferences(file_count=file_count, content_size=content_size, ids=ids)
+
+
+def store_archive_references(repository, archive_id: bytes, references) -> None:
+    """Serialize the references (a small header plus the id->size table) and store them in the key's envelope."""
+    with io.BytesIO() as f:
+        f.write(references.file_count.to_bytes(8, "little"))
+        f.write(references.content_size.to_bytes(8, "little"))
+        references.ids.write(f)
+        data = f.getvalue()
+    repository.store_encrypt_store(archive_reference_cache_name(archive_id), data)
+
+
+def cleanup_archive_reference_caches(repository, stale_hex_ids: set) -> None:
+    """Delete reference caches belonging to archives that are not in the archives list anymore."""
+    for hex_id in stale_hex_ids:
+        try:
+            repository.store_delete(f"cache/{REFERENCED_BY_ARCHIVE}{hex_id}")
+        except StoreObjectNotFound:
+            pass
+    logger.debug(f"Removed {len(stale_hex_ids)} stale archive references caches.")
+
+
+def scan_archive_references(manifest, archive_id: bytes):
+    """Open the archive and scan its items, collecting the objects it references (id -> plaintext
+    size) plus its source file count and content size (both counted per occurrence, like a full
+    scan). Opening the archive fetches and decrypts its metadata and item-metadata objects."""
+    from .archive import Archive  # avoid circular import (archive.py imports from cache.py)
+
+    archive = Archive(manifest, archive_id)
+    ids = HashTableNT(key_size=32, value_type=ArchiveReferenceEntry, value_format=ArchiveReferenceEntryFormat)
+    # archive metadata objects: only their ids matter for GC, their content size is unknown here
+    # and not part of the source data size, so record them with size 0.
+    ids[archive.id] = ArchiveReferenceEntry(size=0)
+    for id in archive.metadata.item_ptrs:
+        ids[id] = ArchiveReferenceEntry(size=0)
+    for id in archive.item_ids:
+        ids[id] = ArchiveReferenceEntry(size=0)
+    file_count, content_size = 0, 0
+    for item in archive.iter_items():
+        file_count += 1  # every fs object counts, not just regular files
+        if "chunks" in item:
+            for id, size in item.chunks:
+                content_size += size  # original, uncompressed content size, counted per occurrence
+                ids[id] = ArchiveReferenceEntry(size=size)
+    return ArchiveReferences(file_count=file_count, content_size=content_size, ids=ids)
+
+
+def get_archive_references(repository, manifest, archive_id: bytes, *, cached: bool, store: bool = True):
+    """Return what the archive references, read from its per-archive cache in the repo if present,
+    else computed by scanning the archive and (when *store*) cached for next time.
+
+    On a cache hit the archive is not opened at all (that is the point of the cache): loading an
+    Archive fetches and decrypts its metadata and item-metadata objects, which is exactly the work
+    we want to skip for an unchanged archive.
+    """
+    references = load_archive_references(repository, archive_id) if cached else None
+    if references is None:
+        references = scan_archive_references(manifest, archive_id)
+        if store:
+            store_archive_references(repository, archive_id, references)
+    return references
+
+
+class ChunksMixin:
+    """
+    Chunks index related code for misc. Cache implementations.
     """
 
-    str_format = """\
-All archives:                unknown              unknown              unknown
+    def __init__(self):
+        self._chunks = None
+        self.last_refresh_dt = datetime.now(UTC)
+        self.refresh_td = timedelta(seconds=60)
+        self.chunks_index_last_write = datetime.now(UTC)
+        self.chunks_index_write_td = timedelta(seconds=600)
 
-                       Unique chunks         Total chunks
-Chunk index:    {0.total_unique_chunks:20d}             unknown"""
+    @property
+    def chunks(self):
+        if self._chunks is None:
+            # the repository owns the one and only chunk index; use it rather than
+            # building a second one and pushing it back into the repository.
+            self._chunks = self.repository.chunks
+            # note: we deliberately do NOT consolidate the chunk index fragments here.
+            # each backup writes a small incremental index/* fragment (only its new chunks),
+            # which is cheap. collapsing them all into one big fragment on every run would re-upload
+            # the whole index and, with delete_other, invalidate every other client's fragments --
+            # a multi-GB churn per run on a shared repo. instead, fragment count is bounded by
+            # repack_chunkindex (a size/threshold-based policy that merges only small fragments and
+            # leaves large, already-sealed ones untouched), run on close() and by `borg compact`.
+        return self._chunks
 
-    def __init__(self, repository, key, manifest, warn_if_unencrypted=True, lock_wait=None, consider_part_files=False):
-        self.repository = repository
-        self.key = key
+    def seen_chunk(self, id, size=None):
+        entry = self.chunks.get(id)
+        entry_exists = entry is not None
+        if entry_exists and size is not None:
+            if entry.size == 0:
+                # AdHocWithFilesCache:
+                # Here *size* is used to update the chunk's size information, which will be zero for existing chunks.
+                self.chunks[id] = entry._replace(size=size)
+            else:
+                # in case we already have a size information in the entry, check consistency:
+                assert size == entry.size
+        return entry_exists
+
+    def reuse_chunk(self, id, size, stats):
+        assert isinstance(size, int) and size > 0
+        stats.update(size, False)
+        return ChunkListEntry(id, size)
+
+    def add_chunk(
+        self, id, meta, data, *, stats, compress=True, size=None, ctype=None, clevel=None, ro_type=ROBJ_FILE_STREAM
+    ):
+        assert ro_type is not None
+        if size is None:
+            if compress:
+                size = len(data)  # data is still uncompressed
+            else:
+                raise ValueError("when giving compressed data for a chunk, the uncompressed size must be given also")
+        now = datetime.now(UTC)
+        self._maybe_write_chunks_index(now)
+        exists = self.seen_chunk(id, size)
+        if exists:
+            # if borg create is processing lots of unchanged files (no content and not metadata changes),
+            # there could be a long time without any repository operations and the repo lock would get stale.
+            self.refresh_lock(now)
+            return self.reuse_chunk(id, size, stats)
+        cdata = self.repo_objs.format(
+            id, meta, data, compress=compress, size=size, ctype=ctype, clevel=clevel, ro_type=ro_type
+        )
+        pack_results = self.repository.put(id, cdata)
+        self.last_refresh_dt = now  # .put also refreshed the lock
+        self.chunks.add(id, size)
+        self.chunks.update_pack_info(pack_results)
+        stats.update(size, not exists)
+        return ChunkListEntry(id, size)
+
+    def _maybe_write_chunks_index(self, now, force=False, clear=False):
+        if force or now > self.chunks_index_last_write + self.chunks_index_write_td:
+            if self._chunks is not None:
+                # flush the pack writer first, so buffered chunks get their real pack location;
+                # until their pack is written they are still F_PENDING with no location (#9900).
+                self.repository.flush()
+                write_chunkindex_to_repo(self.repository, self._chunks, clear=clear)
+            self.chunks_index_last_write = now
+
+    def write_chunks_index(self):
+        """Flush the pack writer and persist the session's new chunks as index fragment(s) now.
+
+        Called before an archive pointer is written (the commit point), so that a committed
+        archive always has complete index coverage, see #10239. Also resets the periodic index
+        write timer.
+        """
+        self._maybe_write_chunks_index(datetime.now(UTC), force=True)
+
+    def refresh_lock(self, now):
+        if now > self.last_refresh_dt + self.refresh_td:
+            # the repository lock needs to get refreshed regularly, or it will be killed as stale.
+            # refreshing the lock is not part of the repository API, so we do it indirectly via repository.info.
+            self.repository.info()
+            self.last_refresh_dt = now
+
+
+class AdHocWithFilesCache(FilesCacheMixin, ChunksMixin):
+    """
+    An ad-hoc chunks and files cache.
+
+    Chunks: Chunks that were not added during the current lifetime won't have correct size set (0 bytes).
+
+    Files: if a previous_archive_id is given, ad-hoc build a in-memory files cache from that archive.
+    """
+
+    def __init__(
+        self,
+        manifest,
+        path=None,
+        warn_if_unencrypted=True,
+        progress=False,
+        cache_mode=FILES_CACHE_MODE_DISABLED,
+        archive_name=None,
+        archive_group_by=(),
+        start_backup=None,
+    ):
+        """
+        :param warn_if_unencrypted: print warning if accessing unknown unencrypted repository
+        :param cache_mode: what shall be compared in the file stat infos vs. cached stat infos comparison
+        """
+        FilesCacheMixin.__init__(self, cache_mode, archive_name, archive_group_by, start_backup)
+        ChunksMixin.__init__(self)
+        assert isinstance(manifest, Manifest)
         self.manifest = manifest
-        self.consider_part_files = consider_part_files
-        self._txn_active = False
+        self.repository = manifest.repository
+        self.key = manifest.key
+        self.repo_objs = manifest.repo_objs
+        self.progress = progress
 
-        self.security_manager = SecurityManager(repository)
-        self.security_manager.assert_secure(manifest, key, lock_wait=lock_wait)
+        self.path = cache_dir(self.repository, path)
+        self.security_manager = SecurityManager(self.repository)
+        self.cache_config = CacheConfig(self.repository, self.path)
 
-        logger.warning('Note: --no-cache-sync is an experimental feature.')
+        # Warn user before sending data to a never seen before unencrypted repository
+        if not self.path.exists():
+            self.security_manager.assert_access_unknown(warn_if_unencrypted, self.key)
+            self.create()
 
-    # Public API
+        self.open()
+        try:
+            self.security_manager.assert_secure(self.key)
+        except:  # noqa
+            self.close()
+            raise
 
     def __enter__(self):
+        self._chunks = None
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
+        self.close()
+        self._chunks = None
 
-    files = None
-    cache_mode = 'd'
+    def create(self):
+        """Create a new empty cache at `self.path`"""
+        self.path.mkdir(parents=True, exist_ok=True)
+        with open(self.path / "README", "w") as fd:
+            fd.write(CACHE_README)
+        self.cache_config.create()
 
-    def file_known_and_unchanged(self, hashed_path, path_hash, st):
-        files_cache_logger.debug("UNKNOWN: files cache not implemented")
-        return False, None
+    def open(self):
+        if not self.path.is_dir():
+            raise Exception("%s Does not look like a Borg cache" % self.path)
+        self.cache_config.open()
+        self.cache_config.load()
 
-    def memorize_file(self, hashed_path, path_hash, st, ids):
-        pass
-
-    def add_chunk(self, id, chunk, stats, overwrite=False, wait=True):
-        assert not overwrite, 'AdHocCache does not permit overwrites — trying to use it for recreate?'
-        if not self._txn_active:
-            self.begin_txn()
-        size = len(chunk)
-        refcount = self.seen_chunk(id, size)
-        if refcount:
-            return self.chunk_incref(id, stats, size=size)
-        data = self.key.encrypt(chunk)
-        csize = len(data)
-        self.repository.put(id, data, wait=wait)
-        self.chunks.add(id, 1, size, csize)
-        stats.update(size, csize, not refcount)
-        return ChunkListEntry(id, size, csize)
-
-    def seen_chunk(self, id, size=None):
-        if not self._txn_active:
-            self.begin_txn()
-        entry = self.chunks.get(id, ChunkIndexEntry(0, None, None))
-        if entry.refcount and size and not entry.size:
-            # The LocalCache has existing size information and uses *size* to make an effort at detecting collisions.
-            # This is of course not possible for the AdHocCache.
-            # Here *size* is used to update the chunk's size information, which will be zero for existing chunks.
-            self.chunks[id] = entry._replace(size=size)
-        return entry.refcount
-
-    def chunk_incref(self, id, stats, size=None, part=False):
-        if not self._txn_active:
-            self.begin_txn()
-        count, _size, csize = self.chunks.incref(id)
-        # When _size is 0 and size is not given, then this chunk has not been locally visited yet (seen_chunk with
-        # size or add_chunk); we can't add references to those (size=0 is invalid) and generally don't try to.
-        size = _size or size
-        assert size
-        stats.update(size, csize, False, part=part)
-        return ChunkListEntry(id, size, csize)
-
-    def chunk_decref(self, id, stats, wait=True, part=False):
-        if not self._txn_active:
-            self.begin_txn()
-        count, size, csize = self.chunks.decref(id)
-        if count == 0:
-            del self.chunks[id]
-            self.repository.delete(id, wait=wait)
-            stats.update(-size, -csize, True, part=part)
-        else:
-            stats.update(-size, -csize, False, part=part)
-
-    def commit(self):
-        if not self._txn_active:
-            return
-        self.security_manager.save(self.manifest, self.key)
-        self._txn_active = False
-
-    def rollback(self):
-        self._txn_active = False
-        del self.chunks
-
-    def begin_txn(self):
-        self._txn_active = True
-        # Explicitly set the initial usable hash table capacity to avoid performance issues
-        # due to hash table "resonance".
-        # Since we're creating an archive, add 10 % from the start.
-        num_chunks = len(self.repository)
-        self.chunks = ChunkIndex(usable=num_chunks * 1.1)
-        pi = ProgressIndicatorPercent(total=num_chunks, msg='Downloading chunk list... %3.0f%%',
-                                      msgid='cache.download_chunks')
-        t0 = perf_counter()
-        num_requests = 0
-        marker = None
-        while True:
-            result = self.repository.list(limit=LIST_SCAN_LIMIT, marker=marker)
-            num_requests += 1
-            if not result:
-                break
-            pi.show(increase=len(result))
-            marker = result[-1]
-            # All chunks from the repository have a refcount of MAX_VALUE, which is sticky,
-            # therefore we can't/won't delete them. Chunks we added ourselves in this transaction
-            # (e.g. checkpoint archives) are tracked correctly.
-            init_entry = ChunkIndexEntry(refcount=ChunkIndex.MAX_VALUE, size=0, csize=0)
-            for id_ in result:
-                self.chunks[id_] = init_entry
-        assert len(self.chunks) == num_chunks
-        # LocalCache does not contain the manifest, either.
-        del self.chunks[self.manifest.MANIFEST_ID]
-        duration = perf_counter() - t0 or 0.01
+    def close(self):
+        self.security_manager.save(self.key)
+        pi = ProgressIndicatorMessage(msgid="cache.close")
+        if self._files is not None:
+            pi.output("Saving files cache")
+            self._write_files_cache(self._files)
+            self._files = None  # release the (potentially large) files cache dict, like _chunks below
+        if self._chunks is not None:
+            for key, value in sorted(self._chunks.stats.items()):
+                logger.debug(f"Chunks index stats: {key}: {value}")
+            pi.output("Saving index")
+            now = datetime.now(UTC)
+            self._maybe_write_chunks_index(now, force=True, clear=True)
+            self._chunks = None  # nothing there (cleared!)
+            # this run just appended a (small) incremental fragment; consolidate accumulated small
+            # fragments so their count/size stays in a healthy range (bounded repack, see the function).
+            # repack works on the repo's index/* fragments, so it is independent of the in-memory index.
+            # the archive and its incremental fragment are already durably stored above, so repack is
+            # optional maintenance: if it fails (e.g. a transient store error), warn and carry on
+            # rather than failing an already-committed backup. the next run will repack again.
+            try:
+                repack_chunkindex(self.repository)
+            except Exception as exc:
+                logger.warning(f"consolidating the chunk index fragments failed (will retry next time): {exc}")
+            # the index we just cleared in-place is the same object the repository holds; drop the
+            # repository's reference too, so a later .chunks access rebuilds it from the repo instead
+            # of seeing a valid-looking but empty index (and so is_chunk_index_loaded reports False).
+            self.repository.invalidate_chunk_index()
+        self.cache_config.close()
         pi.finish()
-        logger.debug('AdHocCache: downloaded %d chunk IDs in %.2f s (%d requests), ~%s/s',
-                     num_chunks, duration, num_requests, format_file_size(num_chunks * 34 / duration))
-        # Chunk IDs in a list are encoded in 34 bytes: 1 byte msgpack header, 1 byte length, 32 ID bytes.
-        # Protocol overhead is neglected in this calculation.
+        self.cache_config = None

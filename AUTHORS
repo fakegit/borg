@@ -1,5 +1,5 @@
-E-mail addresses listed here are not intended for support, please see
-the `support section`_ instead.
+Email addresses listed here are not intended for support.
+Please see the `support section`_ instead.
 
 .. _support section: https://borgbackup.readthedocs.io/en/stable/support.html
 
@@ -17,6 +17,7 @@ Borg authors ("The Borg Collective")
 - Lauri Niskanen <ape@ape3000.com>
 - Abdel-Rahman A. (Abogical)
 - Gu1nness <guinness@crans.org>
+- Andrey Andreyevich Bienkowski <hexagon-recursion@posteo.net>
 
 Retired
 ```````
@@ -43,27 +44,3 @@ Attic Patches and Suggestions
 - Johann Klähn
 - Petros Moisiadis
 - Thomas Waldmann
-
-BLAKE2
-------
-
-Borg includes BLAKE2: Copyright 2012, Samuel Neves <sneves@dei.uc.pt>, licensed under the terms
-of the CC0, the OpenSSL Licence, or the Apache Public License 2.0.
-
-Slicing CRC32
--------------
-
-Borg includes a fast slice-by-8 implementation of CRC32, Copyright 2011-2015 Stephan Brumme,
-licensed under the terms of a zlib license. See http://create.stephan-brumme.com/crc32/
-
-Folding CRC32
--------------
-
-Borg includes an extremely fast folding implementation of CRC32, Copyright 2013 Intel Corporation,
-licensed under the terms of the zlib license.
-
-xxHash
-------
-
-XXH64, a fast non-cryptographic hash algorithm. Copyright 2012-2016 Yann Collet,
-licensed under a BSD 2-clause license.

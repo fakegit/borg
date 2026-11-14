@@ -6,21 +6,17 @@ borg break-lock
 ---------------
 .. code-block:: none
 
-    borg [common options] break-lock [options] [REPOSITORY]
+    borg [common options] break-lock [options]
 
 .. only:: html
 
     .. class:: borg-options-table
 
-    +-------------------------------------------------------+----------------+-----------------------------------------+
-    | **positional arguments**                                                                                         |
-    +-------------------------------------------------------+----------------+-----------------------------------------+
-    |                                                       | ``REPOSITORY`` | repository for which to break the locks |
-    +-------------------------------------------------------+----------------+-----------------------------------------+
-    | .. class:: borg-common-opt-ref                                                                                   |
-    |                                                                                                                  |
-    | :ref:`common_options`                                                                                            |
-    +-------------------------------------------------------+----------------+-----------------------------------------+
+    +-------------------------------------------------------+
+    | .. class:: borg-common-opt-ref                        |
+    |                                                       |
+    | :ref:`common_options`                                 |
+    +-------------------------------------------------------+
 
     .. raw:: html
 
@@ -32,8 +28,6 @@ borg break-lock
 
 .. only:: latex
 
-    REPOSITORY
-        repository for which to break the locks
 
 
     :ref:`common_options`
@@ -43,5 +37,8 @@ Description
 ~~~~~~~~~~~
 
 This command breaks the repository and cache locks.
-Please use carefully and only while no borg process (on any machine) is
-trying to access the Cache or the Repository.
+Use with care and only when no Borg process (on any machine) is
+trying to access the cache or the repository.
+
+The repository lock objects are protected by the repository key, so this
+command needs the key.
